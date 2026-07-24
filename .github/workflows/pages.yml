@@ -88,10 +88,13 @@ jobs:
             --output _site/target/wasm_bg.wasm _site/target/wasm_bg.wasm
           cp client/index.html _site/
           cp -r client/assets _site/assets
-          # Uncompressed wasm size for the loader's progress bar (Pages
-          # compresses on the fly with no Content-Length; the fetch stream
-          # yields decompressed bytes, so this is the honest denominator).
-          echo "{ \"wasm_bytes\": $(stat -c%s _site/target/wasm_bg.wasm) }" > _site/loader-manifest.json
+          # Loader manifest: uncompressed size (honest progress denominator —
+          # the fetch stream yields decompressed bytes) + a gzip estimate of
+          # the wire size (what the download label shows; Pages compresses
+          # on the fly with no usable Content-Length).
+          wasm_bytes=$(stat -c%s _site/target/wasm_bg.wasm)
+          wire_bytes=$(gzip -6 -c _site/target/wasm_bg.wasm | wc -c)
+          echo "{ \"wasm_bytes\": $wasm_bytes, \"wasm_wire_bytes\": $wire_bytes }" > _site/loader-manifest.json
           du -h _site/target/wasm_bg.wasm
 
       - name: Configure GitHub Pages

@@ -94,5 +94,10 @@ fn main() {
         ),
     );
 
+    // Loader handshake: flip <body data-game-ready> once frames are rendering
+    // so the HTML loading screen knows when to fade out (web only).
+    #[cfg(target_arch = "wasm32")]
+    app.add_systems(Update, render::signal_game_ready);
+
     app.run();
 }

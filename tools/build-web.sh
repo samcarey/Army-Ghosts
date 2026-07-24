@@ -50,9 +50,14 @@ mkdir -p _site/target
   "target/wasm32-unknown-unknown/${profile}/army-ghosts-client.wasm"
 cp client/index.html _site/
 cp -r client/assets _site/assets
-# Uncompressed wasm size for the loader's progress bar (compressing servers
-# send no usable Content-Length; the stream yields decompressed bytes).
-echo "{ \"wasm_bytes\": $(stat -f%z _site/target/wasm_bg.wasm 2>/dev/null || stat -c%s _site/target/wasm_bg.wasm) }" > _site/loader-manifest.json
+# Loader manifest: `wasm_bytes` is the uncompressed size (the fetch stream
+# yields decompressed bytes — the honest progress denominator);
+# `wasm_wire_bytes` is a build-time gzip estimate of what actually crosses
+# the network, shown as the download size when the server compresses
+# on-the-fly without a usable Content-Length (Pages, caddy encode).
+wasm_bytes=$(stat -f%z _site/target/wasm_bg.wasm 2>/dev/null || stat -c%s _site/target/wasm_bg.wasm)
+wire_bytes=$(gzip -6 -c _site/target/wasm_bg.wasm | wc -c | tr -d ' ')
+echo "{ \"wasm_bytes\": $wasm_bytes, \"wasm_wire_bytes\": $wire_bytes }" > _site/loader-manifest.json
 
 echo
 echo "done → _site/ ($(du -h _site/target/wasm_bg.wasm | cut -f1) wasm)"

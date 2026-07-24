@@ -113,6 +113,12 @@
       min-height: 1.2em;
     }
 
+    #eta {
+      font-size: 0.8rem;
+      color: #7a8a5e;
+      min-height: 1.1em;
+    }
+
     #room {
       font-size: 0.8rem;
       color: #7a8a5e;
@@ -129,6 +135,7 @@
       <div id="bar-inner"></div>
     </div>
     <div id="status">Loading…</div>
+    <div id="eta">estimating…</div>
     <div id="room"></div>
   </div>
 
@@ -180,40 +187,97 @@
     const loader = document.getElementById('loader');
     const barInner = document.getElementById('bar-inner');
     const statusEl = document.getElementById('status');
+    const etaEl = document.getElementById('eta');
 
     const WASM_URL = './target/wasm_bg.wasm';
 
     const fmtBytes = (n) => {
       if (n >= 1048576) return (n / 1048576).toFixed(1) + ' MB';
       if (n >= 1024) return (n / 1024).toFixed(0) + ' KB';
-      return n + ' B';
+      return Math.round(n) + ' B';
     };
 
-    // Uncompressed wasm size, emitted by the CI build. On-the-fly-compressing
-    // hosts (GitHub Pages, caddy encode) send no usable Content-Length while
-    // the stream below yields DECOMPRESSED bytes — the manifest keeps the
-    // percentage honest. Absent on bare local builds (falls back to
-    // Content-Length / indeterminate).
-    async function manifestBytes() {
+    const fmtTime = (s) => {
+      if (!isFinite(s) || s < 0) return '—';
+      s = Math.ceil(s);
+      if (s < 60) return s + 's';
+      return Math.floor(s / 60) + 'm ' + (s % 60).toString().padStart(2, '0') + 's';
+    };
+
+    // Authoritative sizes from the build (loader-manifest.json). `wasm_bytes`
+    // is the uncompressed size — the honest progress denominator, because the
+    // fetch stream below yields DECOMPRESSED bytes while on-the-fly
+    // compressing hosts (GitHub Pages, caddy encode) send no usable
+    // Content-Length. `wasm_wire_bytes` is a build-time gzip estimate of what
+    // actually crosses the network — the size the labels display. Absent on
+    // bare local builds (falls back to Content-Length / indeterminate).
+    async function loadManifest() {
       try {
         const r = await fetch('./loader-manifest.json', { cache: 'no-cache' });
-        if (!r.ok) return 0;
-        return (await r.json()).wasm_bytes || 0;
+        if (!r.ok) return null;
+        return await r.json();
       } catch (_) {
-        return 0;
+        return null;
       }
     }
 
     async function run() {
-      const [response, mBytes] = await Promise.all([fetch(WASM_URL), manifestBytes()]);
+      // Fetch the manifest and the wasm together — the heavy download starts
+      // streaming immediately instead of waiting a round-trip for the tiny
+      // manifest.
+      const [manifest, response] = await Promise.all([loadManifest(), fetch(WASM_URL)]);
       if (!response.ok) throw new Error(`${WASM_URL} → HTTP ${response.status}`);
 
-      // Stream with progress (decompressed bytes, so prefer the manifest's
-      // uncompressed size; Content-Length is the fallback for plain servers).
       const encoded = !!response.headers.get('content-encoding');
-      const cl = parseInt(response.headers.get('content-length') || '0', 10);
-      const total = mBytes || (encoded ? 0 : cl);
+      const clRaw = response.headers.get('content-length');
+      const cl = clRaw ? parseInt(clRaw, 10) : 0;
+      // Progress fraction denominator: decompressed bytes.
+      const total = (manifest && manifest.wasm_bytes) || (encoded ? 0 : cl);
+      // Displayed download size: Content-Length is the wire size whenever
+      // present (compressed or not); otherwise the manifest's build-time gzip
+      // estimate; otherwise the uncompressed total.
+      const wireTotal =
+        cl || (encoded ? (manifest && manifest.wasm_wire_bytes) || 0 : 0) || total;
+
+      const start = performance.now();
       let loaded = 0;
+
+      const render = () => {
+        const determinate = total > 0;
+        barInner.classList.toggle('indeterminate', !determinate);
+        if (determinate) {
+          const frac = Math.min(loaded / total, 1);
+          const pct = Math.floor(frac * 100);
+          barInner.style.width = pct + '%';
+          // Labels report the wire download scaled by the honest fraction.
+          statusEl.textContent =
+            `Loading… ${pct}%  (${fmtBytes(frac * wireTotal)} / ${fmtBytes(wireTotal)})`;
+          const elapsed = (performance.now() - start) / 1000;
+          if (frac >= 1) {
+            etaEl.textContent = '';
+          } else if (frac > 0.005 && elapsed > 0.3) {
+            etaEl.textContent = `ETA ${fmtTime(elapsed * (1 - frac) / frac)}`;
+          } else {
+            etaEl.textContent = 'estimating…';
+          }
+        } else {
+          statusEl.textContent = `Loading… ${fmtBytes(loaded)}`;
+          etaEl.textContent = '';
+        }
+      };
+
+      // Coalesce per-chunk progress into at most one DOM update per frame.
+      let renderQueued = false;
+      const scheduleRender = () => {
+        if (renderQueued) return;
+        renderQueued = true;
+        requestAnimationFrame(() => {
+          renderQueued = false;
+          render();
+        });
+      };
+      render();
+
       const reader = response.body.getReader();
       const chunks = [];
       for (;;) {
@@ -221,18 +285,15 @@
         if (done) break;
         chunks.push(value);
         loaded += value.byteLength;
-        if (total > 0) {
-          const pct = Math.min(Math.floor((loaded / total) * 100), 100);
-          barInner.classList.remove('indeterminate');
-          barInner.style.width = pct + '%';
-          statusEl.textContent = `Loading… ${pct}% (${fmtBytes(loaded)})`;
-        } else {
-          barInner.classList.add('indeterminate');
-          statusEl.textContent = `Loading… ${fmtBytes(loaded)}`;
-        }
+        scheduleRender();
       }
+      loaded = total || loaded;
+      render();
+      barInner.classList.remove('indeterminate');
+      barInner.style.width = '100%';
 
       statusEl.textContent = 'Starting…';
+      etaEl.textContent = '';
       const wasmModule = await WebAssembly.compile(await new Blob(chunks).arrayBuffer());
       try {
         await init(wasmModule);
@@ -243,9 +304,21 @@
         if (!msg.startsWith('Using exceptions for control flow')) throw e;
       }
 
-      barInner.style.width = '100%';
-      loader.classList.add('hidden');
-      setTimeout(() => loader.remove(), 500);
+      // init() returns as soon as the module starts; Bevy then loads assets
+      // and compiles render pipelines before anything is drawn. Hiding now
+      // would cut to a blank canvas, so wait for the game's ready signal
+      // (<body data-game-ready>, set once frames are actually rendering) with
+      // a timeout so the loader can never get stuck.
+      const readyStart = performance.now();
+      (function hideWhenReady() {
+        const ready = document.body.getAttribute('data-game-ready') === '1';
+        if (ready || performance.now() - readyStart > 15000) {
+          loader.classList.add('hidden');
+          setTimeout(() => loader.remove(), 500);
+        } else {
+          requestAnimationFrame(hideWhenReady);
+        }
+      })();
     }
 
     run().catch((e) => {
@@ -254,6 +327,7 @@
       barInner.style.background = '#c05b4d';
       barInner.style.width = '100%';
       statusEl.textContent = 'Failed to load';
+      etaEl.textContent = '';
       document.getElementById('room').textContent = String((e && e.message) || e);
     });
   </script>

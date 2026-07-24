@@ -10,6 +10,26 @@ use army_ghosts_sim::{
     Bullet, Facing, Player, Pos, Target, ARENA_HALF_H, ARENA_HALF_W, PLAYER_R, TARGET_R,
 };
 
+/// Tell the HTML loader the game is actually drawing frames (it holds its
+/// "Starting..." screen until `<body data-game-ready="1">` so it never cuts
+/// to a blank canvas while pipelines compile / assets decode). A few frames
+/// in is a good-enough proxy for "first real frame presented".
+#[cfg(target_arch = "wasm32")]
+pub fn signal_game_ready(mut frames: Local<u32>) {
+    if *frames > 10 {
+        return;
+    }
+    *frames += 1;
+    if *frames == 10 {
+        if let Some(body) = web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.body())
+        {
+            let _ = body.set_attribute("data-game-ready", "1");
+        }
+    }
+}
+
 /// Per-handle player colors (army-men greens first — you are green).
 const PLAYER_COLORS: [Color; 8] = [
     Color::srgb(0.35, 0.65, 0.25), // green

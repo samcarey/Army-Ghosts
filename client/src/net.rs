@@ -35,6 +35,15 @@ pub struct LaunchConfig {
 
 const DEFAULT_SIGNALING: &str = "ws://127.0.0.1:3536";
 
+/// Room size defaults: 2 for a p2p room, 1 offline (a phantom second pawn in
+/// solo practice reads as "someone else is here"). Explicit `players` wins —
+/// a multi-handle local synctest is still useful for testing.
+fn resolve_players(explicit: Option<usize>, has_room: bool) -> usize {
+    explicit
+        .unwrap_or(if has_room { 2 } else { 1 })
+        .clamp(1, MAX_PLAYERS)
+}
+
 fn parse_ice(raw: Option<String>) -> Option<Vec<String>> {
     let raw = raw?;
     if raw == "none" {
@@ -47,11 +56,10 @@ fn parse_ice(raw: Option<String>) -> Option<Vec<String>> {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn launch_config() -> LaunchConfig {
     let room = std::env::var("AG_ROOM").ok().filter(|r| !r.is_empty());
-    let players = std::env::var("AG_PLAYERS")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(2)
-        .clamp(1, MAX_PLAYERS);
+    let players = resolve_players(
+        std::env::var("AG_PLAYERS").ok().and_then(|p| p.parse().ok()),
+        room.is_some(),
+    );
     let signaling =
         std::env::var("AG_SIGNALING").unwrap_or_else(|_| DEFAULT_SIGNALING.to_string());
     let ice = parse_ice(std::env::var("AG_ICE").ok());
@@ -71,10 +79,10 @@ pub fn launch_config() -> LaunchConfig {
     let window = web_sys::window().expect("no window");
     let net = js_sys::Reflect::get(&window, &"__AG_NET__".into()).unwrap_or_default();
     let room = get(&net, "room");
-    let players = get(&net, "players")
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(2)
-        .clamp(1, MAX_PLAYERS);
+    let players = resolve_players(
+        get(&net, "players").and_then(|p| p.parse().ok()),
+        room.is_some(),
+    );
     let signaling = get(&net, "signaling").unwrap_or_else(|| DEFAULT_SIGNALING.to_string());
     let ice = parse_ice(get(&net, "ice"));
     LaunchConfig { room, players, signaling, ice }

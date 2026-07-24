@@ -6,7 +6,9 @@
 use bevy::prelude::*;
 use bevy_ggrs::LocalPlayers;
 
-use army_ghosts_sim::{Bullet, Player, Pos, Target, ARENA_HALF_H, ARENA_HALF_W, PLAYER_R, TARGET_R};
+use army_ghosts_sim::{
+    Bullet, Facing, Player, Pos, Target, ARENA_HALF_H, ARENA_HALF_W, PLAYER_R, TARGET_R,
+};
 
 /// Per-handle player colors (army-men greens first — you are green).
 const PLAYER_COLORS: [Color; 4] = [
@@ -21,16 +23,21 @@ const Z_TARGET: f32 = 0.0;
 const Z_PLAYER: f32 = 1.0;
 const Z_BULLET: f32 = 2.0;
 
-pub fn setup_scene(mut commands: Commands) {
+pub fn setup_scene(mut commands: Commands, assets: Res<AssetServer>) {
     commands.spawn(Camera2d);
     commands.insert_resource(ClearColor(Color::srgb(0.08, 0.10, 0.06)));
-    // Placeholder ground: a flat dirt-green arena quad. Milestone 1 replaces
-    // this with a tiled texture.
+    // Tiled grass/dirt ground across the arena (texture from tools/gen_assets.py).
     commands.spawn((
-        Sprite::from_color(
-            Color::srgb(0.24, 0.30, 0.16),
-            Vec2::new((ARENA_HALF_W * 2) as f32, (ARENA_HALF_H * 2) as f32),
-        ),
+        Sprite {
+            image: assets.load("ground.png"),
+            custom_size: Some(Vec2::new((ARENA_HALF_W * 2) as f32, (ARENA_HALF_H * 2) as f32)),
+            image_mode: SpriteImageMode::Tiled {
+                tile_x: true,
+                tile_y: true,
+                stretch_value: 1.0,
+            },
+            ..default()
+        },
         Transform::from_xyz(0.0, 0.0, Z_GROUND),
     ));
 }
@@ -49,6 +56,14 @@ pub fn attach_sprites(
             Sprite::from_color(color, Vec2::splat((PLAYER_R * 2) as f32)),
             Transform::from_xyz(0.0, 0.0, Z_PLAYER),
         ));
+        // Gun barrel child: sticks out the facing side (entity rotates via
+        // `orient_players`), so you can see where you'll shoot.
+        commands.entity(entity).with_children(|parent| {
+            parent.spawn((
+                Sprite::from_color(color.darker(0.12), Vec2::new(5.0, 12.0)),
+                Transform::from_xyz(0.0, PLAYER_R as f32 + 4.0, 0.1),
+            ));
+        });
     }
     for entity in &new_bullets {
         commands.entity(entity).insert((
@@ -61,6 +76,18 @@ pub fn attach_sprites(
             Sprite::from_color(Color::srgb(0.55, 0.55, 0.55), Vec2::splat((TARGET_R * 2) as f32)),
             Transform::from_xyz(0.0, 0.0, Z_TARGET),
         ));
+    }
+}
+
+/// Rotate player pawns toward their sim `Facing` (render-only — the sim's
+/// notion of facing stays the raw integer vector).
+pub fn orient_players(mut players: Query<(&Facing, &mut Transform), With<Player>>) {
+    for (facing, mut transform) in &mut players {
+        if facing.x == 0 && facing.y == 0 {
+            continue;
+        }
+        let angle = (facing.y as f32).atan2(facing.x as f32);
+        transform.rotation = Quat::from_rotation_z(angle - std::f32::consts::FRAC_PI_2);
     }
 }
 

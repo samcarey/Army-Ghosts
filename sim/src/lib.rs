@@ -132,7 +132,9 @@ pub struct Target {
 /// peer spawns the identical world before the session starts ticking.
 pub const SPAWN_POINTS: [(i32, i32); MAX_PLAYERS] = [(-150, 0), (150, 0), (0, -150), (0, 150)];
 
-pub const TARGET_POINTS: [(i32, i32); 2] = [(-250, 180), (250, -180)];
+/// Practice dummies sit on the spawn axis: walk straight out from spawn and
+/// they're dead ahead (also makes hit registration trivially testable).
+pub const TARGET_POINTS: [(i32, i32); 2] = [(-300, 0), (300, 0)];
 
 /// Spawn the initial world: one pawn per player plus the practice targets.
 /// Both clients run this identically before the first tick.

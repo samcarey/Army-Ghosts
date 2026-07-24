@@ -9,20 +9,23 @@ use bevy_ggrs::{LocalInputs, LocalPlayers};
 
 use army_ghosts_sim::{PlayerInput, BTN_FIRE};
 
+use crate::touch::TouchControls;
 use crate::SessionConfig;
 
 pub fn read_local_inputs(
     mut commands: Commands,
     keys: Res<ButtonInput<KeyCode>>,
+    touch: Res<TouchControls>,
     local_players: Res<LocalPlayers>,
 ) {
     let mut local_inputs = HashMap::new();
-    // The keyboard drives the *first* local handle; any additional local
-    // handles (synctest mode simulates every player locally) stay idle.
+    // Inputs drive the *first* local handle; any additional local handles
+    // (synctest mode simulates every player locally) stay idle.
     let mut first = true;
     for handle in &local_players.0 {
         let mut input = PlayerInput::default();
         if first {
+            // Keyboard (desktop) …
             let mut x: i32 = 0;
             let mut y: i32 = 0;
             if keys.pressed(KeyCode::KeyA) || keys.pressed(KeyCode::ArrowLeft) {
@@ -37,9 +40,14 @@ pub fn read_local_inputs(
             if keys.pressed(KeyCode::KeyW) || keys.pressed(KeyCode::ArrowUp) {
                 y += 127;
             }
-            input.move_x = x as i8;
-            input.move_y = y as i8;
-            if keys.pressed(KeyCode::Space) {
+            // … merged with the touch joystick (analog; wins when active).
+            if touch.move_vec != Vec2::ZERO {
+                x = (touch.move_vec.x * 127.0) as i32;
+                y = (touch.move_vec.y * 127.0) as i32;
+            }
+            input.move_x = x.clamp(-127, 127) as i8;
+            input.move_y = y.clamp(-127, 127) as i8;
+            if keys.pressed(KeyCode::Space) || touch.firing {
                 input.buttons |= BTN_FIRE;
             }
             first = false;

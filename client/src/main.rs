@@ -5,6 +5,7 @@
 mod input;
 mod net;
 mod render;
+mod touch;
 
 use bevy::prelude::*;
 use bevy_ggrs::{GgrsPlugin, ReadInputs};
@@ -52,14 +53,25 @@ fn main() {
     .add_plugins(SimPlugin::<SessionConfig>::default())
     .add_systems(ReadInputs, input::read_local_inputs)
     .insert_resource(launch)
+    .init_resource::<touch::TouchControls>()
     .init_state::<AppState>()
-    .add_systems(Startup, (render::setup_scene, net::begin_session_setup))
+    .add_systems(
+        Startup,
+        (render::setup_scene, net::begin_session_setup, touch::setup_overlay).chain(),
+    )
     .add_systems(
         Update,
         (
             net::wait_for_players.run_if(in_state(AppState::Connecting)),
             net::log_ggrs_events.run_if(in_state(AppState::InGame)),
-            (render::attach_sprites, render::sync_transforms, render::camera_follow).chain(),
+            (touch::read_touches, touch::update_overlay).chain(),
+            (
+                render::attach_sprites,
+                render::orient_players,
+                render::sync_transforms,
+                render::camera_follow,
+            )
+                .chain(),
         ),
     );
 

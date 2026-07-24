@@ -49,6 +49,7 @@ mkdir -p _site/target
 "$wb" --out-dir _site/target --out-name wasm --target web --no-typescript \
   "target/wasm32-unknown-unknown/${profile}/army-ghosts-client.wasm"
 cp client/index.html _site/
+cp -r client/assets _site/assets
 
 echo
 echo "done → _site/ ($(du -h _site/target/wasm_bg.wasm | cut -f1) wasm)"

@@ -24,8 +24,9 @@ use serde::{Deserialize, Serialize};
 pub const FP: i32 = 256;
 /// Simulation tick rate (GGRS rollback schedule fps).
 pub const TICK_HZ: usize = 60;
-/// Sessions are built for up to this many players; milestone 1 plays with 2.
-pub const MAX_PLAYERS: usize = 4;
+/// Sessions are built for up to this many players (`?players=N` picks the
+/// actual room size, default 2).
+pub const MAX_PLAYERS: usize = 8;
 
 /// Arena half-extents in world units (pixels).
 pub const ARENA_HALF_W: i32 = 400;
@@ -130,7 +131,17 @@ pub struct Target {
 
 /// Fixed spawn points (world units), one per handle. Deterministic — every
 /// peer spawns the identical world before the session starts ticking.
-pub const SPAWN_POINTS: [(i32, i32); MAX_PLAYERS] = [(-150, 0), (150, 0), (0, -150), (0, 150)];
+/// Cardinals first, then corners, all inside the arena walls.
+pub const SPAWN_POINTS: [(i32, i32); MAX_PLAYERS] = [
+    (-150, 0),
+    (150, 0),
+    (0, -150),
+    (0, 150),
+    (-150, -150),
+    (150, 150),
+    (-150, 150),
+    (150, -150),
+];
 
 /// Practice dummies sit on the spawn axis: walk straight out from spawn and
 /// they're dead ahead (also makes hit registration trivially testable).

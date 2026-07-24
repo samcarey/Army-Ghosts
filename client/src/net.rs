@@ -211,8 +211,9 @@ pub fn finalize_p2p_session(
 }
 
 /// Log GGRS session events — desyncs especially. A desync means the integer
-/// sim broke determinism somewhere; treat it as a bug, always.
-pub fn log_ggrs_events(mut session: ResMut<Session<SessionConfig>>) {
+/// sim broke determinism somewhere; treat it as a bug, always. Also logs each
+/// remote peer's ping periodically (same stats the HUD player list shows).
+pub fn log_ggrs_events(mut session: ResMut<Session<SessionConfig>>, mut frames: Local<u32>) {
     if let Session::P2P(session) = session.as_mut() {
         for event in session.events() {
             match event {
@@ -222,6 +223,14 @@ pub fn log_ggrs_events(mut session: ResMut<Session<SessionConfig>>) {
                     error!("DESYNC at frame {frame}: local {local_checksum:#x} vs remote {remote_checksum:#x}");
                 }
                 other => info!("ggrs event: {other:?}"),
+            }
+        }
+        *frames += 1;
+        if *frames % 300 == 0 {
+            for handle in session.remote_player_handles() {
+                if let Ok(stats) = session.network_stats(handle) {
+                    info!("net: player {} ping {}ms", handle + 1, stats.ping);
+                }
             }
         }
     }

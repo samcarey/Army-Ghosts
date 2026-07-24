@@ -11,11 +11,15 @@ use army_ghosts_sim::{
 };
 
 /// Per-handle player colors (army-men greens first — you are green).
-const PLAYER_COLORS: [Color; 4] = [
+const PLAYER_COLORS: [Color; 8] = [
     Color::srgb(0.35, 0.65, 0.25), // green
     Color::srgb(0.75, 0.65, 0.30), // tan
     Color::srgb(0.55, 0.60, 0.75), // blue-gray
     Color::srgb(0.70, 0.40, 0.30), // rust
+    Color::srgb(0.80, 0.75, 0.60), // sand
+    Color::srgb(0.45, 0.30, 0.55), // purple
+    Color::srgb(0.30, 0.60, 0.60), // teal
+    Color::srgb(0.85, 0.55, 0.20), // orange
 ];
 
 const Z_GROUND: f32 = -10.0;

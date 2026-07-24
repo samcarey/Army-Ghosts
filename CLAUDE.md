@@ -92,8 +92,8 @@ Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_SIGNALING` env vars.
 - **Matchmaking**: matchbox room string from `?room=`; the socket URL is
   `{signaling}/{room}?next={players}` (`next_N` closes the room at N peers).
   Handle order = matchbox's sorted `players()` list, identical on all peers.
-- 2 players for milestone 1; `MAX_PLAYERS = 4` designed in (spawn points,
-  session builder loops — grow by changing constants).
+- Default room size 2 (`?players=N` up to `MAX_PLAYERS = 8`); spawn points,
+  colors, and session builder loops all key off the constants.
 
 ## Gotchas already hit (don't rediscover)
 

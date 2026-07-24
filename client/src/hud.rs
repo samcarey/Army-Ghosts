@@ -1,6 +1,6 @@
 //! HUD overlays (bevy_ui). Currently just the player list, upper right:
-//! auto-numbered players, "(you)" on the local one, and a waiting line while
-//! the matchbox room fills.
+//! auto-numbered players, "(you)" on the local one, per-peer ping in a p2p
+//! session, and a waiting line while the matchbox room fills.
 
 use bevy::prelude::*;
 use bevy_ggrs::{LocalPlayers, Session};
@@ -63,7 +63,16 @@ pub fn update_player_list(
             let local = local_players.map(|l| l.0.clone()).unwrap_or_default();
             for handle in 0..num_players {
                 let you = if local.contains(&handle) { " (you)" } else { "" };
-                lines.push(format!("Player {}{}", handle + 1, you));
+                // GGRS-measured roundtrip time to each remote peer. Errors
+                // (local handles, or a peer still synchronizing) → no ping.
+                let ping = match session.as_deref() {
+                    Some(Session::P2P(s)) => s
+                        .network_stats(handle)
+                        .map(|stats| format!(" {}ms", stats.ping))
+                        .unwrap_or_default(),
+                    _ => String::new(),
+                };
+                lines.push(format!("Player {}{}{}", handle + 1, you, ping));
             }
         }
     }

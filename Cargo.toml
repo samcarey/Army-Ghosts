@@ -48,6 +48,7 @@ inherits = "release"
 opt-level = "z"
 lto = "fat"
 codegen-units = 1
+strip = true
 
 # Vendored matchbox_socket 0.14.0 with ONE local patch: true trickle ICE on the
 # wasm path (send offer/answer immediately + trickle candidates, instead of

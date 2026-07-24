@@ -155,13 +155,16 @@
       // Tailscale-served dev builds: the signaling server rides the same
       // MagicDNS host on HTTPS port 9451 (tailscale serve → 127.0.0.1:3536).
       const isTailnet = /\.ts\.net$/.test(location.hostname);
-      // Any other host (the public caddy vhost, later GitHub Pages fronted by
-      // it): same-origin path-based signaling at /ws/<room> (caddy
-      // handle_path strips the prefix before matchbox_server sees it).
+      // The Mac's caddy vhost: same-origin path-based signaling at /ws/<room>
+      // (caddy handle_path strips the prefix before matchbox_server sees it).
+      const isCaddy = /whoeverwants\.com$/.test(location.hostname);
+      // Anywhere else (GitHub Pages): the page is static-hosted far from the
+      // signaling server, so point at the Mac's public endpoint directly.
       const signaling = p.get('signaling') ||
         (isPlainWs ? 'ws://' + location.hostname + ':3536'
          : isTailnet ? 'wss://' + location.hostname + ':9451'
-                     : 'wss://' + location.host + '/ws');
+         : isCaddy ? 'wss://' + location.host + '/ws'
+                   : 'wss://army-ghosts.dev.whoeverwants.com:7443/ws');
       window.__AG_NET__ = { room, players, signaling, ice };
       if (room) {
         document.getElementById('room').textContent =
@@ -185,13 +188,30 @@
       return n + ' B';
     };
 
+    // Uncompressed wasm size, emitted by the CI build. On-the-fly-compressing
+    // hosts (GitHub Pages, caddy encode) send no usable Content-Length while
+    // the stream below yields DECOMPRESSED bytes — the manifest keeps the
+    // percentage honest. Absent on bare local builds (falls back to
+    // Content-Length / indeterminate).
+    async function manifestBytes() {
+      try {
+        const r = await fetch('./loader-manifest.json', { cache: 'no-cache' });
+        if (!r.ok) return 0;
+        return (await r.json()).wasm_bytes || 0;
+      } catch (_) {
+        return 0;
+      }
+    }
+
     async function run() {
-      const response = await fetch(WASM_URL);
+      const [response, mBytes] = await Promise.all([fetch(WASM_URL), manifestBytes()]);
       if (!response.ok) throw new Error(`${WASM_URL} → HTTP ${response.status}`);
 
-      // Stream with progress. Content-Length is the compressed size when the
-      // server compresses on the fly; treat the bar as approximate.
-      const total = parseInt(response.headers.get('content-length') || '0', 10);
+      // Stream with progress (decompressed bytes, so prefer the manifest's
+      // uncompressed size; Content-Length is the fallback for plain servers).
+      const encoded = !!response.headers.get('content-encoding');
+      const cl = parseInt(response.headers.get('content-length') || '0', 10);
+      const total = mBytes || (encoded ? 0 : cl);
       let loaded = 0;
       const reader = response.body.getReader();
       const chunks = [];

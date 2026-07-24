@@ -1,0 +1,120 @@
+name: Deploy web build to GitHub Pages
+
+# Builds the WASM client and publishes the playable web build on every push
+# to main. Pattern ported from bad-spaceship's pages.yml (see its CLAUDE.md
+# "Deployment" section for the Pages-source gotcha: the repo's Pages source
+# must be "GitHub Actions", never "Deploy from a branch").
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  # Keep in lockstep with rust-toolchain.toml.
+  RUST_TOOLCHAIN: "1.97.1"
+  # Must match the `wasm-bindgen` crate pinned in client/Cargo.toml (=0.2.126)
+  # and the version in tools/build-web.sh — the CLI rejects a mismatched module.
+  WASM_BINDGEN_VERSION: "0.2.126"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --no-self-update
+          rustup target add wasm32-unknown-unknown --toolchain "$RUST_TOOLCHAIN"
+          rustup override set "$RUST_TOOLCHAIN"
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install wasm-bindgen-cli (prebuilt, version-matched)
+        run: |
+          set -euo pipefail
+          url="https://github.com/rustwasm/wasm-bindgen/releases/download/${WASM_BINDGEN_VERSION}/wasm-bindgen-${WASM_BINDGEN_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          curl -fsSL "$url" -o /tmp/wasm-bindgen.tar.gz
+          tar -xzf /tmp/wasm-bindgen.tar.gz -C /tmp
+          sudo install -m755 "/tmp/wasm-bindgen-${WASM_BINDGEN_VERSION}-x86_64-unknown-linux-musl/wasm-bindgen" /usr/local/bin/wasm-bindgen
+          wasm-bindgen --version
+
+      # Size-optimized wasm-release profile (fat LTO, opt-level z, strip) —
+      # shrunk further with wasm-opt in the assemble step.
+      - name: Build WASM client (wasm-release)
+        run: >-
+          cargo build --locked -p army-ghosts-client
+          --target wasm32-unknown-unknown
+          --no-default-features --features default,web
+          --profile wasm-release
+
+      - name: Install binaryen (wasm-opt)
+        run: |
+          set -euo pipefail
+          url="https://github.com/WebAssembly/binaryen/releases/download/version_130/binaryen-version_130-x86_64-linux.tar.gz"
+          curl -fsSL "$url" -o /tmp/binaryen.tar.gz
+          tar -xzf /tmp/binaryen.tar.gz -C /tmp
+          sudo install -m755 /tmp/binaryen-version_130/bin/wasm-opt /usr/local/bin/wasm-opt
+          wasm-opt --version
+
+      - name: Assemble site
+        run: |
+          set -euo pipefail
+          rm -rf _site
+          mkdir -p _site/target
+          wasm-bindgen --out-dir _site/target --out-name wasm --target web --no-typescript \
+            target/wasm32-unknown-unknown/wasm-release/army-ghosts-client.wasm
+          # Binaryen size pass. Flag list per bad-spaceship's hard-won notes:
+          # exactly rustc's post-MVP ops + gc + tail-call; NEVER --all-features
+          # (emits experimental heap types no browser compiles) and never
+          # --low-memory-unused (Rust's shadow stack lives at low memory).
+          wasm-opt -Oz --converge --generate-global-effects \
+            --enable-mutable-globals --enable-sign-ext --enable-bulk-memory \
+            --enable-nontrapping-float-to-int --enable-multivalue \
+            --enable-reference-types --enable-extended-const \
+            --enable-tail-call --enable-gc \
+            --strip-producers --strip-target-features \
+            --output _site/target/wasm_bg.wasm _site/target/wasm_bg.wasm
+          cp client/index.html _site/
+          cp -r client/assets _site/assets
+          # Uncompressed wasm size for the loader's progress bar (Pages
+          # compresses on the fly with no Content-Length; the fetch stream
+          # yields decompressed bytes, so this is the honest denominator).
+          echo "{ \"wasm_bytes\": $(stat -c%s _site/target/wasm_bg.wasm) }" > _site/loader-manifest.json
+          du -h _site/target/wasm_bg.wasm
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+        with:
+          # GitHub's Pages queue sometimes drains slower than the action's
+          # 10-min default; don't cancel deployments that would land anyway.
+          timeout: 1800000

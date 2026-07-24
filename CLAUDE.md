@@ -89,11 +89,17 @@ Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_SIGNALING` env vars.
 
 - **bevy_ggrs rollback**: peers exchange only `PlayerInput` (3 bytes:
   quantized i8 move x/y + button bitflags), each peer simulates everything.
-- **Matchmaking**: matchbox room string from `?room=`; the socket URL is
-  `{signaling}/{room}?next={players}` (`next_N` closes the room at N peers).
-  Handle order = matchbox's sorted `players()` list, identical on all peers.
-- Default room size 2 (`?players=N` up to `MAX_PLAYERS = 8`); spawn points,
-  colors, and session builder loops all key off the constants.
+- **Lobby (open rooms)**: matchbox room string from `?room=`; socket URL is
+  plain `{signaling}/{room}` (no `?next=` — everyone in the room meshes as
+  they join). Two channels in builder order: 0 reliable (lobby control),
+  1 unreliable (GGRS). Host = lowest sorted PeerId (identical on all peers).
+  Host taps START (or the room hits the `?players=` cap, default
+  `MAX_PLAYERS = 8`) → broadcasts `start:<uuid>,...` (sorted roster) on
+  channel 0; every peer builds the session from that roster (Local for self;
+  sorted order = handle order), waiting until its own mesh contains all
+  members. Late joiners after start idle in warmup. Offline (no room)
+  defaults to 1 player; explicit `?players=N` offline forces an N-handle
+  synctest.
 
 ## Gotchas already hit (don't rediscover)
 
@@ -148,10 +154,10 @@ Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_SIGNALING` env vars.
 - **A long-running `matchbox_server` can wedge** after many abandoned test
   rooms — new pairings then stall even at the signaling stage. When p2p
   "mysteriously stops working": `pkill matchbox_server` and restart it, and
-  always use FRESH room codes per test (`next_2` rooms remember dead peers).
+  always use FRESH room codes per test (rooms remember dead peers).
 - **Warmup → p2p session swap** (`client/src/net.rs`): with a `room`, the
   client starts a 1-player synctest immediately (playable while waiting).
-  When the room fills, `wait_for_players` despawns all `Rollback` entities,
+  When the match starts, `run_lobby` despawns all `Rollback` entities,
   removes the `Session` resource, and stashes the channel in
   `PendingSession`; `finalize_p2p_session` builds the real session **one
   frame later** (bevy_ggrs needs a no-session tick to reset frame/snapshot
@@ -195,8 +201,11 @@ need a TURN server eventually.
   `cargo install matchbox_server --version 0.14.0`, listens on `0.0.0.0:3536`),
   open two browser tabs with `?room=X` (or two native instances with
   `AG_ROOM=X`; native connects in ~1s and is the fast way to test session
-  logic). Fastest full check: two native instances, staggered by a few
-  seconds; assert "starting p2p session" + no DESYNC lines in both logs.
+  logic). Fastest full check: two native instances with `AG_PLAYERS=2`
+  (cap 2 → the lobby auto-starts, exercising the whole start-roster
+  handshake headlessly), staggered by a few seconds; assert "starting p2p
+  session" + no DESYNC lines in both logs. The default cap (8) needs a
+  START trigger: Enter on the host instance, or tap/click bottom-center.
 
 ## Deployment (planned; mirrors bad-spaceship)
 

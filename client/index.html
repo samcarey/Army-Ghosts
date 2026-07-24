@@ -136,7 +136,8 @@
     // Connection info, parsed from the join link BEFORE wasm init so the
     // client can read it synchronously on boot:
     //   ?room=CODE      join/create this matchbox room (absent → local mode)
-    //   ?players=N      session size (default 2)
+    //   ?players=N      seat cap, max 8 (default 8) — the host starts the
+    //                   match with whoever's present; a full room auto-starts
     //   ?signaling=URL  override the signaling server (testing)
     //   ?ice=none       host-candidates-only (fast local/LAN testing; some
     //                   networks stall browser STUN for ~40s per handshake);

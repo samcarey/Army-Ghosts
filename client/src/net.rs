@@ -1,9 +1,11 @@
 //! Session bring-up: launch-config parsing (URL params on web, env vars on
-//! native), matchbox signaling, and GGRS session construction.
+//! native), matchbox signaling, the lobby, and GGRS session construction.
 //!
 //! Modes:
-//! - `room` set → p2p: connect to the signaling server, wait for `players`
-//!   peers, start a GGRS p2p session over the matchbox WebRTC channel.
+//! - `room` set → p2p lobby: the room stays open and peers accumulate (up to
+//!   `players`, default all `MAX_PLAYERS` seats). The host — lowest sorted
+//!   peer id, identical on every peer's view — starts the match for whoever
+//!   is present (START button / Enter), or it auto-starts at the cap.
 //! - no `room` → local synctest: all handles local, GGRS re-simulates every
 //!   frame (`check_distance`) — the determinism canary AND the offline mode.
 
@@ -35,12 +37,14 @@ pub struct LaunchConfig {
 
 const DEFAULT_SIGNALING: &str = "ws://127.0.0.1:3536";
 
-/// Room size defaults: 2 for a p2p room, 1 offline (a phantom second pawn in
-/// solo practice reads as "someone else is here"). Explicit `players` wins —
-/// a multi-handle local synctest is still useful for testing.
+/// Room size defaults: with a room, `players` is the seat CAP — default all 8
+/// (the match starts with whoever's present when the host taps START, and
+/// auto-starts if the room actually fills). Offline defaults to 1 (a phantom
+/// second pawn in solo practice reads as "someone else is here"); an explicit
+/// `players` still forces a multi-handle local synctest for testing.
 fn resolve_players(explicit: Option<usize>, has_room: bool) -> usize {
     explicit
-        .unwrap_or(if has_room { 2 } else { 1 })
+        .unwrap_or(if has_room { MAX_PLAYERS } else { 1 })
         .clamp(1, MAX_PLAYERS)
 }
 
@@ -88,7 +92,7 @@ pub fn launch_config() -> LaunchConfig {
     LaunchConfig { room, players, signaling, ice }
 }
 
-/// Handoff between `wait_for_players` (which tears the warmup world down) and
+/// Handoff between `run_lobby` (which tears the warmup world down) and
 /// `finalize_p2p_session` (which builds the real session one frame later).
 /// The one-frame gap matters: bevy_ggrs's driver sees "no session" for a tick
 /// and resets its frame counter / time accumulator / snapshot bookkeeping.
@@ -96,6 +100,32 @@ pub fn launch_config() -> LaunchConfig {
 pub struct PendingSession {
     pub players: Vec<PlayerType<PeerId>>,
     pub channel: Option<WebRtcChannel>,
+}
+
+/// Matchbox channel indices, in builder order: 0 reliable (lobby control),
+/// 1 unreliable (the GGRS transport).
+pub const LOBBY_CHANNEL: usize = 0;
+pub const GGRS_CHANNEL: usize = 1;
+/// The one lobby message: `start:<uuid>,<uuid>,...` — the roster in sorted
+/// order, broadcast by the host on the reliable channel.
+const START_PREFIX: &[u8] = b"start:";
+
+/// Live lobby view + start handshake state, updated every frame by
+/// [`run_lobby`] and read by the HUD (player list, START button visibility).
+#[derive(Resource, Default)]
+pub struct Lobby {
+    /// All peers in the room including us, sorted by id — the order the
+    /// match will use for player handles. Empty until signaling assigns us
+    /// an id.
+    pub ids: Vec<PeerId>,
+    pub my_id: Option<PeerId>,
+    /// Whether we're the host (lowest sorted id) — the peer allowed to start.
+    pub is_host: bool,
+    /// The agreed player set once start is triggered; held until our WebRTC
+    /// mesh actually includes every member.
+    pub roster: Option<Vec<PeerId>>,
+    /// Set by the UI (tap/click/Enter), consumed by `run_lobby`.
+    pub start_requested: bool,
 }
 
 fn start_local_session(commands: &mut Commands, players: usize) {
@@ -122,12 +152,11 @@ pub fn begin_session_setup(
 ) {
     match &launch.room {
         Some(room) => {
-            // `next_N` waits until N peers are in the room, then pairs exactly
-            // those N — the signaling server closes the room to further joins.
-            let url = format!("{}/{}?next={}", launch.signaling, room, launch.players);
+            // Plain open room (no `?next=` — that closed-at-N matchmaking is
+            // gone): everyone joining connects to everyone present, and the
+            // lobby decides when to start.
+            let url = format!("{}/{}", launch.signaling, room);
             info!("connecting to matchbox room {url} (ice: {:?})", launch.ice);
-            // Single unreliable (UDP-like) channel — exactly what GGRS wants;
-            // matchbox's `ggrs` feature impls NonBlockingSocket on it.
             let mut builder = WebRtcSocketBuilder::new(url);
             if let Some(urls) = &launch.ice {
                 builder = builder.ice_server(RtcIceServerConfig {
@@ -135,7 +164,12 @@ pub fn begin_session_setup(
                     ..default()
                 });
             }
-            commands.insert_resource(MatchboxSocket::from(builder.add_unreliable_channel()));
+            // Channel order defines the indices: reliable lobby control
+            // first, then the unreliable (UDP-like) channel GGRS wants
+            // (matchbox's `ggrs` feature impls NonBlockingSocket on it).
+            commands.insert_resource(MatchboxSocket::from(
+                builder.add_reliable_channel().add_unreliable_channel(),
+            ));
             // Warmup: run around and shoot while waiting for the room to fill.
             start_local_session(&mut commands, 1);
         }
@@ -147,31 +181,94 @@ pub fn begin_session_setup(
     }
 }
 
-/// Poll the signaling connection until everyone's here, then tear down the
-/// warmup world and stash the channel + roster for `finalize_p2p_session`
-/// (which runs next frame — see [`PendingSession`]).
-pub fn wait_for_players(
+/// The open-room lobby. Every frame: refresh the peer view, adopt a start
+/// roster if the host broadcast one, decide to start if WE are the host
+/// (START button, or the room hit the `players` cap), and once the agreed
+/// roster is fully connected, tear down the warmup world and stash the GGRS
+/// channel + roster for `finalize_p2p_session` (next frame — see
+/// [`PendingSession`]). Peers who join after the start idle in warmup.
+pub fn run_lobby(
     mut commands: Commands,
     socket: Option<ResMut<MatchboxSocket>>,
     pending: Option<Res<PendingSession>>,
+    mut lobby: ResMut<Lobby>,
     launch: Res<LaunchConfig>,
     rollback_entities: Query<Entity, With<Rollback>>,
 ) {
+    let start_requested = std::mem::take(&mut lobby.start_requested);
     if pending.is_some() {
         return; // teardown already done, finalize runs next frame
     }
     let Some(mut socket) = socket else {
         return; // local mode: no socket
     };
-    if socket.get_channel(0).is_err() {
+    if socket.get_channel(GGRS_CHANNEL).is_err() {
         return; // channel already taken (session started)
     }
     socket.update_peers();
-    let players = socket.players();
-    if players.len() < launch.players {
+    let Some(my_id) = socket.id() else {
+        return; // signaling handshake hasn't assigned us an id yet
+    };
+
+    // The canonical room view: sorted ids, self included — identical on every
+    // peer, so everyone agrees who the host (first entry) is.
+    let mut ids: Vec<PeerId> = socket.connected_peers().collect();
+    ids.push(my_id);
+    ids.sort();
+    let is_host = ids.first() == Some(&my_id);
+    lobby.my_id = Some(my_id);
+    lobby.is_host = is_host;
+    lobby.ids = ids.clone();
+
+    // Adopt a roster broadcast by the host.
+    for (_, packet) in socket.channel_mut(LOBBY_CHANNEL).receive() {
+        let Some(rest) = packet.strip_prefix(START_PREFIX) else { continue };
+        let parsed: Option<Vec<PeerId>> = std::str::from_utf8(rest).ok().and_then(|s| {
+            s.split(',')
+                .map(|u| uuid::Uuid::parse_str(u).ok().map(PeerId))
+                .collect()
+        });
+        match parsed {
+            Some(roster) => {
+                info!("lobby: received start roster ({} players)", roster.len());
+                lobby.roster = Some(roster);
+            }
+            None => warn!("lobby: ignoring malformed start message"),
+        }
+    }
+
+    // Host: start on request, or automatically when the room hits the cap.
+    if lobby.roster.is_none()
+        && is_host
+        && ids.len() >= 2
+        && (start_requested || ids.len() >= launch.players)
+    {
+        let mut roster = ids;
+        roster.truncate(launch.players); // host is index 0, always included
+        let msg = format!(
+            "start:{}",
+            roster.iter().map(ToString::to_string).collect::<Vec<_>>().join(",")
+        );
+        info!("lobby: hosting — starting match with {} players", roster.len());
+        for peer in roster.iter().copied().filter(|p| *p != my_id) {
+            socket
+                .channel_mut(LOBBY_CHANNEL)
+                .send(msg.clone().into_bytes().into(), peer);
+        }
+        lobby.roster = Some(roster);
+    }
+
+    // Launch once our own mesh includes every roster member (the host's does
+    // by construction; a non-host may still be mid-handshake with a third
+    // peer, and GGRS must not send to a peer matchbox doesn't know yet).
+    let Some(roster) = lobby.roster.clone() else { return };
+    if !roster.contains(&my_id) {
+        return; // match started without us (beyond the cap) — stay in warmup
+    }
+    if !roster.iter().all(|p| lobby.ids.contains(p)) {
         return;
     }
-    info!("all {} players connected — restarting into p2p session", launch.players);
+    info!("all {} players connected — restarting into p2p session", roster.len());
 
     // Tear down the warmup world; the Session's absence next frame makes
     // bevy_ggrs reset its frame counter and snapshot state.
@@ -179,25 +276,29 @@ pub fn wait_for_players(
         commands.entity(entity).despawn();
     }
     commands.remove_resource::<Session<SessionConfig>>();
-    let channel = socket.take_channel(0).expect("take ggrs channel");
+    let channel = socket.take_channel(GGRS_CHANNEL).expect("take ggrs channel");
+    let players = roster
+        .iter()
+        .map(|p| if *p == my_id { PlayerType::Local } else { PlayerType::Remote(*p) })
+        .collect();
     commands.insert_resource(PendingSession { players, channel: Some(channel) });
 }
 
 /// One frame after teardown: build the real p2p session and the fresh world.
-/// Handle order comes from matchbox's sorted `players()` list, so every peer
-/// agrees on who is which handle. Ordered BEFORE `wait_for_players` in the
-/// schedule so the bevy_ggrs no-session reset tick happens in between.
+/// Handle order comes from the roster's sorted peer-id order, so every peer
+/// agrees on who is which handle. Ordered BEFORE `run_lobby` in the schedule
+/// so the bevy_ggrs no-session reset tick happens in between.
 pub fn finalize_p2p_session(
     mut commands: Commands,
     pending: Option<ResMut<PendingSession>>,
-    launch: Res<LaunchConfig>,
     mut next_state: ResMut<NextState<AppState>>,
 ) {
     let Some(mut pending) = pending else { return };
     let Some(channel) = pending.channel.take() else { return };
+    let num_players = pending.players.len();
 
     let mut builder = SessionBuilder::<SessionConfig>::new()
-        .with_num_players(launch.players)
+        .with_num_players(num_players)
         .with_input_delay(2)
         // Surface any nondeterminism as an explicit desync event instead of
         // silently diverged worlds (pairs with the sim's Pos checksums).
@@ -214,7 +315,7 @@ pub fn finalize_p2p_session(
     // EARLIER moment and panic ("tried to move time backwards"). Fresh clock.
     commands.insert_resource(Time::new_with(bevy_ggrs::GgrsTime));
     commands.remove_resource::<PendingSession>();
-    spawn_world(&mut commands, launch.players);
+    spawn_world(&mut commands, num_players);
     next_state.set(AppState::InGame);
 }
 

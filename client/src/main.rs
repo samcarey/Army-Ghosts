@@ -57,6 +57,7 @@ fn main() {
     .add_systems(ReadInputs, input::read_local_inputs)
     .insert_resource(launch)
     .init_resource::<touch::TouchControls>()
+    .init_resource::<net::Lobby>()
     .init_state::<AppState>()
     .add_systems(
         Startup,
@@ -71,13 +72,13 @@ fn main() {
     .add_systems(
         Update,
         (
-            // finalize BEFORE wait: the two run a frame apart so bevy_ggrs
-            // gets its no-session reset tick between warmup and p2p.
-            (net::finalize_p2p_session, net::wait_for_players)
+            // finalize BEFORE the lobby: the two run a frame apart so
+            // bevy_ggrs gets its no-session reset tick between warmup and p2p.
+            (hud::read_start_input, net::finalize_p2p_session, net::run_lobby)
                 .chain()
                 .run_if(in_state(AppState::Connecting)),
             net::log_ggrs_events.run_if(in_state(AppState::InGame)),
-            hud::update_player_list,
+            (hud::update_player_list, hud::update_start_button),
             (touch::read_touches, touch::update_overlay).chain(),
             (
                 render::attach_sprites,

@@ -11,6 +11,9 @@ bevy = { workspace = true }
 bevy_ggrs = { workspace = true }
 bevy_matchbox = { workspace = true }
 army-ghosts-sim = { workspace = true }
+# Parse PeerIds out of the lobby start message (matchbox PeerId wraps a Uuid).
+# default-features off: no v4 generation, so no extra getrandom coupling.
+uuid = { version = "1", default-features = false }
 
 # Read `window.__AG_NET__` (room/players/synctest config parsed by index.html
 # before WASM init) on the web build.

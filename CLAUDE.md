@@ -99,7 +99,9 @@ Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_SIGNALING` env vars.
   sorted order = handle order), waiting until its own mesh contains all
   members. Late joiners after start idle in warmup. Offline (no room)
   defaults to 1 player; explicit `?players=N` offline forces an N-handle
-  synctest.
+  synctest. UI on top: upper-left MENU → NEW ROOM (generated 5-char code,
+  web navigates to `?room=`), COPY LINK beside the lobby roster (clipboard;
+  both are bevy_ui `Button`+`Interaction`, which handles touch natively).
 
 ## Gotchas already hit (don't rediscover)
 

@@ -21,7 +21,13 @@ js-sys = { version = "0.3", optional = true }
 # Pinned exactly so the wasm-bindgen CLI (which must match the crate version
 # byte-for-byte or it rejects the module) stays stable; bump both together.
 wasm-bindgen = { version = "=0.2.126", optional = true }
-web-sys = { version = "0.3", optional = true, features = ["Window"] }
+web-sys = { version = "0.3", optional = true, features = [
+    "Window",
+    # Menu "new room" navigation + the share-link clipboard button.
+    "Location",
+    "Navigator",
+    "Clipboard",
+] }
 
 # getrandom backends for wasm. The graph pulls getrandom 0.2 (via matchbox's
 # uuid/rand deps) and possibly 0.3; each major line needs its wasm backend

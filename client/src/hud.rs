@@ -6,13 +6,23 @@ use bevy::prelude::*;
 use bevy_ggrs::{LocalPlayers, Session};
 
 use crate::net::Lobby;
-use crate::{AppState, SessionConfig};
+use crate::{AppState, LaunchConfig, SessionConfig};
 
 #[derive(Component)]
 pub struct PlayerListText;
 
 #[derive(Component)]
 pub struct StartButton;
+
+#[derive(Component)]
+pub struct CopyLinkButton;
+
+#[derive(Component)]
+pub struct CopyLinkLabel;
+
+/// Reverts the copy button's "COPIED!" flash back to "COPY LINK".
+#[derive(Resource)]
+pub struct CopiedFlash(pub Timer);
 
 /// The tappable START band: bottom-center of the screen, in 0-1 window
 /// fractions (window coords, y-down). The visual button sits inside it; the
@@ -21,19 +31,45 @@ const START_BAND_X: (f32, f32) = (0.25, 0.75);
 const START_BAND_Y: f32 = 0.72;
 
 pub fn setup_hud(mut commands: Commands) {
-    commands.spawn((
-        PlayerListText,
-        Text::new(""),
-        TextFont { font_size: 14.0, ..default() },
-        TextColor(Color::srgba(0.92, 0.96, 0.85, 0.9)),
-        TextLayout::new_with_justify(Justify::Right),
-        Node {
+    // Top-right row: [COPY LINK] beside the roster text (top-aligned; the
+    // roster grows downward as players join).
+    commands
+        .spawn(Node {
             position_type: PositionType::Absolute,
             top: Val::Px(8.0),
             right: Val::Px(10.0),
+            column_gap: Val::Px(10.0),
+            align_items: AlignItems::FlexStart,
             ..default()
-        },
-    ));
+        })
+        .with_children(|row| {
+            row.spawn((
+                CopyLinkButton,
+                Button,
+                Node {
+                    padding: UiRect::axes(Val::Px(10.0), Val::Px(4.0)),
+                    border_radius: BorderRadius::all(Val::Px(6.0)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.16, 0.22, 0.10, 0.85)),
+                Visibility::Hidden,
+            ))
+            .with_children(|pill| {
+                pill.spawn((
+                    CopyLinkLabel,
+                    Text::new("COPY LINK"),
+                    TextFont { font_size: 12.0, ..default() },
+                    TextColor(Color::srgb(0.85, 0.92, 0.75)),
+                ));
+            });
+            row.spawn((
+                PlayerListText,
+                Text::new(""),
+                TextFont { font_size: 14.0, ..default() },
+                TextColor(Color::srgba(0.92, 0.96, 0.85, 0.9)),
+                TextLayout::new_with_justify(Justify::Right),
+            ));
+        });
 
     // Host-only START button (full-width row centers the pill).
     commands
@@ -82,6 +118,77 @@ pub fn update_start_button(
     for mut visibility in &mut buttons {
         *visibility = if show { Visibility::Visible } else { Visibility::Hidden };
     }
+}
+
+/// Show the COPY LINK pill beside the roster whenever we're in a room's
+/// lobby (that's when you're recruiting).
+pub fn update_copy_button(
+    state: Res<State<AppState>>,
+    launch: Res<LaunchConfig>,
+    mut buttons: Query<&mut Visibility, With<CopyLinkButton>>,
+) {
+    let show = matches!(state.get(), AppState::Connecting) && launch.room.is_some();
+    for mut visibility in &mut buttons {
+        *visibility = if show { Visibility::Inherited } else { Visibility::Hidden };
+    }
+}
+
+/// Put the join URL on the clipboard and flash "COPIED!" on the button.
+pub fn copy_link_pressed(
+    mut commands: Commands,
+    interactions: Query<&Interaction, (Changed<Interaction>, With<CopyLinkButton>)>,
+    launch: Res<LaunchConfig>,
+    mut labels: Query<&mut Text, With<CopyLinkLabel>>,
+) {
+    for interaction in &interactions {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        let Some(room) = &launch.room else { continue };
+        let url = copy_share_url(room);
+        info!("share url: {url}");
+        for mut label in &mut labels {
+            label.0 = "COPIED!".into();
+        }
+        commands.insert_resource(CopiedFlash(Timer::from_seconds(1.5, TimerMode::Once)));
+    }
+}
+
+pub fn tick_copied_flash(
+    mut commands: Commands,
+    flash: Option<ResMut<CopiedFlash>>,
+    time: Res<Time>,
+    mut labels: Query<&mut Text, With<CopyLinkLabel>>,
+) {
+    let Some(mut flash) = flash else { return };
+    if flash.0.tick(time.delta()).is_finished() {
+        for mut label in &mut labels {
+            label.0 = "COPY LINK".into();
+        }
+        commands.remove_resource::<CopiedFlash>();
+    }
+}
+
+/// Web: write the full join URL to the clipboard (async fire-and-forget —
+/// the promise runs on its own; localhost and https are secure contexts, so
+/// this works everywhere we serve from). Native: nothing to share a browser
+/// URL from — log it. Both return the URL for the log line.
+#[cfg(target_arch = "wasm32")]
+fn copy_share_url(room: &str) -> String {
+    let mut url = format!("?room={room}");
+    if let Some(window) = web_sys::window() {
+        let location = window.location();
+        if let (Ok(origin), Ok(path)) = (location.origin(), location.pathname()) {
+            url = format!("{origin}{path}?room={room}");
+        }
+        let _ = window.navigator().clipboard().write_text(&url);
+    }
+    url
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn copy_share_url(room: &str) -> String {
+    format!("?room={room}")
 }
 
 /// Start-trigger input: Enter anywhere, or a tap/click in the bottom-center

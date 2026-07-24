@@ -4,6 +4,7 @@
 
 mod hud;
 mod input;
+mod menu;
 mod net;
 mod render;
 mod touch;
@@ -66,6 +67,7 @@ fn main() {
             net::begin_session_setup,
             touch::setup_overlay,
             hud::setup_hud,
+            menu::setup_menu,
         )
             .chain(),
     )
@@ -78,7 +80,9 @@ fn main() {
                 .chain()
                 .run_if(in_state(AppState::Connecting)),
             net::log_ggrs_events.run_if(in_state(AppState::InGame)),
-            (hud::update_player_list, hud::update_start_button),
+            (hud::update_player_list, hud::update_start_button, hud::update_copy_button),
+            (hud::copy_link_pressed, hud::tick_copied_flash).chain(),
+            menu::menu_interactions,
             (touch::read_touches, touch::update_overlay).chain(),
             (
                 render::attach_sprites,

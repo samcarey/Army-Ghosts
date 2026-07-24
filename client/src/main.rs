@@ -33,13 +33,20 @@ fn main() {
 
     let mut app = App::new();
     app.add_plugins(
-        DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "Army Ghosts".into(),
+        DefaultPlugins
+            .set(WindowPlugin {
+                primary_window: Some(Window {
+                    title: "Army Ghosts".into(),
+                    ..default()
+                }),
+                ..default()
+            })
+            // matchbox at debug is invaluable when p2p bring-up misbehaves —
+            // it traces the whole signaling + ICE handshake.
+            .set(bevy::log::LogPlugin {
+                filter: "info,wgpu=error,naga=warn".into(),
                 ..default()
             }),
-            ..default()
-        }),
     )
     .add_plugins(GgrsPlugin::<SessionConfig>::default())
     .add_plugins(SimPlugin::<SessionConfig>::default())

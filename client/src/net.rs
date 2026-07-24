@@ -10,6 +10,7 @@
 use bevy::prelude::*;
 use bevy_ggrs::ggrs::{DesyncDetection, SessionBuilder};
 use bevy_ggrs::Session;
+use bevy_matchbox::matchbox_socket::{RtcIceServerConfig, WebRtcSocketBuilder};
 use bevy_matchbox::prelude::*;
 
 use army_ghosts_sim::{spawn_world, MAX_PLAYERS, TICK_HZ};
@@ -24,9 +25,23 @@ pub struct LaunchConfig {
     pub players: usize,
     /// Signaling server base URL, e.g. `ws://127.0.0.1:3536`.
     pub signaling: String,
+    /// ICE (STUN) server URLs. `None` → matchbox's default Google STUN pair.
+    /// `Some(vec![])` (from `ice=none`) → host candidates only — required for
+    /// fast local/LAN testing on networks that eat STUN (this Mac's firewall
+    /// drops the responses, and browsers then stall ICE gathering for ~40s
+    /// per handshake leg, which reads as "p2p is broken").
+    pub ice: Option<Vec<String>>,
 }
 
 const DEFAULT_SIGNALING: &str = "ws://127.0.0.1:3536";
+
+fn parse_ice(raw: Option<String>) -> Option<Vec<String>> {
+    let raw = raw?;
+    if raw == "none" {
+        return Some(vec![]);
+    }
+    Some(raw.split(',').map(str::to_string).collect())
+}
 
 /// Native: env vars (`AG_ROOM`, `AG_PLAYERS`, `AG_SIGNALING`).
 #[cfg(not(target_arch = "wasm32"))]
@@ -39,7 +54,8 @@ pub fn launch_config() -> LaunchConfig {
         .clamp(1, MAX_PLAYERS);
     let signaling =
         std::env::var("AG_SIGNALING").unwrap_or_else(|_| DEFAULT_SIGNALING.to_string());
-    LaunchConfig { room, players, signaling }
+    let ice = parse_ice(std::env::var("AG_ICE").ok());
+    LaunchConfig { room, players, signaling, ice }
 }
 
 /// Web: `window.__AG_NET__ = { room, players, signaling }`, set by index.html
@@ -60,7 +76,8 @@ pub fn launch_config() -> LaunchConfig {
         .unwrap_or(2)
         .clamp(1, MAX_PLAYERS);
     let signaling = get(&net, "signaling").unwrap_or_else(|| DEFAULT_SIGNALING.to_string());
-    LaunchConfig { room, players, signaling }
+    let ice = parse_ice(get(&net, "ice"));
+    LaunchConfig { room, players, signaling, ice }
 }
 
 /// Startup: either open the matchbox socket (p2p) or start the synctest
@@ -75,10 +92,19 @@ pub fn begin_session_setup(
             // `next_N` waits until N peers are in the room, then pairs exactly
             // those N — the signaling server closes the room to further joins.
             let url = format!("{}/{}?next={}", launch.signaling, room, launch.players);
-            info!("connecting to matchbox room {url}");
+            info!("connecting to matchbox room {url} (ice: {:?})", launch.ice);
             // Single unreliable (UDP-like) channel — exactly what GGRS wants;
             // matchbox's `ggrs` feature impls NonBlockingSocket on it.
-            commands.insert_resource(MatchboxSocket::new_unreliable(url));
+            let mut builder = WebRtcSocketBuilder::new(url);
+            if let Some(urls) = &launch.ice {
+                builder = builder.ice_server(RtcIceServerConfig {
+                    urls: urls.clone(),
+                    ..default()
+                });
+            }
+            commands.insert_resource(MatchboxSocket::from(
+                builder.add_unreliable_channel(),
+            ));
         }
         None => {
             info!("no room — starting local synctest session ({} players)", launch.players);

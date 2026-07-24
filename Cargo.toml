@@ -1,5 +1,6 @@
 [workspace]
 members = ["sim", "client"]
+exclude = ["vendor/matchbox_socket"]
 resolver = "2"
 
 [workspace.package]
@@ -47,3 +48,12 @@ inherits = "release"
 opt-level = "z"
 lto = "fat"
 codegen-units = 1
+
+# Vendored matchbox_socket 0.14.0 with ONE local patch: true trickle ICE on the
+# wasm path (send offer/answer immediately + trickle candidates, instead of
+# stalling on ICE-gathering-complete — a ~40s STUN timeout per handshake leg on
+# multi-interface machines, e.g. anything running Tailscale). See the
+# "ARMY-GHOSTS PATCH" comments in vendor/matchbox_socket/src/webrtc_socket/wasm.rs.
+# Drop the vendor dir + this patch if upstream ships trickle ICE.
+[patch.crates-io]
+matchbox_socket = { path = "vendor/matchbox_socket" }

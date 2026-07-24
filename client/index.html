@@ -138,6 +138,9 @@
     //   ?room=CODE      join/create this matchbox room (absent → local mode)
     //   ?players=N      session size (default 2)
     //   ?signaling=URL  override the signaling server (testing)
+    //   ?ice=none       host-candidates-only (fast local/LAN testing; some
+    //                   networks stall browser STUN for ~40s per handshake);
+    //                   or ?ice=stun:host:port,... for custom servers
     // Default signaling: same host as the page over wss on port 3536 for
     // localhost dev, or the standard tailscale-served port for phones —
     // refined when the Mac serving setup lands; ?signaling= always wins.
@@ -145,11 +148,12 @@
       const p = new URLSearchParams(location.search);
       const room = p.get('room') || '';
       const players = p.get('players') || '';
+      const ice = p.get('ice') || '';
       const isLocal = /^(localhost|127\.)/.test(location.hostname);
       const signaling = p.get('signaling') ||
         (isLocal ? 'ws://' + location.hostname + ':3536'
                  : 'wss://' + location.hostname + ':3536');
-      window.__AG_NET__ = { room, players, signaling };
+      window.__AG_NET__ = { room, players, signaling, ice };
       if (room) {
         document.getElementById('room').textContent =
           'multiplayer · room ' + room + (players ? ' · ' + players + ' players' : '');

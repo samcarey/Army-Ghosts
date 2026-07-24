@@ -119,6 +119,24 @@ Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_SIGNALING` env vars.
   `--use-gl=swiftshader --enable-unsafe-swiftshader --no-sandbox`. Chrome's
   `--virtual-time-budget` screenshots are unreliable for wasm games — drive
   with playwright and real waits instead.
+- **Headless-to-headless WebRTC additionally needs
+  `--disable-features=WebRtcHideLocalIpsWithMdns`** — headless Chrome can't
+  resolve the mDNS-obfuscated host candidates, and the srflx fallback needs
+  NAT hairpinning, so data channels never open without it. Sessions in the
+  headless swiftshader environment take 60-90s to reach "starting p2p
+  session" (huge debug wasm + software rendering) — poll patiently.
+- **The vendored matchbox trickle-ICE patch** (`vendor/matchbox_socket/`, see
+  `[patch.crates-io]` in the root Cargo.toml): upstream matchbox waits for
+  ICE gathering to COMPLETE before sending the offer/answer. On
+  multi-interface machines (Tailscale utuns!) browsers hit the full ~40s
+  STUN transaction timeout per handshake leg → 80s+ connects that read as
+  "p2p is broken". The patch sends offer/answer immediately and trickles
+  candidates (both matchbox signal loops already buffer early candidates).
+  Native (webrtc-rs) never had the wait — that's why native p2p worked while
+  web stalled. Diagnose future regressions by diffing the two.
+- **STUN itself is fine on this network** (verified: 28-47ms responses via
+  python/node UDP probes) — do not blame the router when browser ICE is slow;
+  it's the per-interface STUN timeout above.
 
 ## Testing
 
@@ -127,8 +145,12 @@ Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_SIGNALING` env vars.
 - Web smoke: `tools/build-web.sh` + local http.server + headless chromium
   screenshot (see scratchpad pattern; keyboard works via playwright's
   `page.keyboard`).
-- Two-peer local test: run `matchbox_server`, open two browser tabs with
-  `?room=X` (or two native instances with `AG_ROOM=X`).
+- Two-peer local test: run `matchbox_server` (installed via
+  `cargo install matchbox_server --version 0.14.0`, listens on `0.0.0.0:3536`),
+  open two browser tabs with `?room=X` (or two native instances with
+  `AG_ROOM=X`; native connects in ~1s and is the fast way to test session
+  logic). Fastest full check: two native instances, staggered by a few
+  seconds; assert "starting p2p session" + no DESYNC lines in both logs.
 
 ## Deployment (planned; mirrors bad-spaceship)
 

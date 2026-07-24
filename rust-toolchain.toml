@@ -1,0 +1,7 @@
+# Pinned toolchain for reproducible builds (bad-spaceship discipline: build with
+# --locked, bump deliberately). 1.97.1 is current stable at project start and
+# comfortably above Bevy 0.18's MSRV (1.89). Keep this and RUST_TOOLCHAIN in the
+# Pages CI workflow (when it lands) in lockstep.
+[toolchain]
+channel = "1.97.1"
+targets = ["wasm32-unknown-unknown"]

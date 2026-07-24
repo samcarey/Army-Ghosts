@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8" />
+  <script>
+    // Cap the WebGL render resolution on high-DPR (mobile) displays, BEFORE wasm
+    // boots. winit-web sizes the canvas backing store to CSS-size × devicePixelRatio,
+    // so an iPhone (dpr ~3) renders ~9× the CSS pixels and iOS Safari's GPU governor
+    // throttles hard (measured on bad-spaceship). Spoofing devicePixelRatio is what
+    // winit actually reads; Bevy's scale_factor_override is a no-op on web. For a 2D
+    // sprite game 1.5 is plenty sharp; tune down if phones still throttle.
+    (function () {
+      var MAX_DPR = 1.5;
+      var real = window.devicePixelRatio || 1;
+      if (real > MAX_DPR) {
+        try {
+          Object.defineProperty(window, 'devicePixelRatio',
+            { get: function () { return MAX_DPR; }, configurable: true });
+        } catch (e) {}
+      }
+    })();
+  </script>
+  <meta name="viewport"
+    content="width=device-width, user-scalable=no, minimum-scale=1.0, maximum-scale=1.0, viewport-fit=cover" />
+  <title>Army Ghosts</title>
+  <style>
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      padding: 0;
+      background: #101408;
+      overflow: hidden;
+      /* No pull-to-refresh / overscroll bounce while dragging the joystick. */
+      overscroll-behavior: none;
+    }
+
+    /* Size the canvas to fill the viewport via CSS (the renderer tracks the
+       canvas's CSS size). touch-action:none so drags drive the game, not the
+       browser. */
+    canvas {
+      display: block;
+      touch-action: none;
+      width: 100% !important;
+      height: 100% !important;
+      outline: none;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+
+    /* Lightweight loading overlay shown instantly while the WASM binary
+       streams in. Pure inline CSS, no external requests. */
+    #loader {
+      position: fixed;
+      inset: 0;
+      z-index: 10;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 1.1rem;
+      background: #101408;
+      color: #d8e6c0;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      transition: opacity 0.45s ease;
+    }
+
+    #loader.hidden {
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    #title {
+      font-size: 1.5rem;
+      letter-spacing: 0.32em;
+      text-transform: uppercase;
+      color: #9fc06a;
+    }
+
+    #bar-outer {
+      width: min(70vw, 440px);
+      height: 14px;
+      border: 1px solid #4a5a2e;
+      border-radius: 8px;
+      background: #1a2210;
+      overflow: hidden;
+    }
+
+    #bar-inner {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, #5a7a30, #9fc06a);
+      transition: width 0.15s linear;
+    }
+
+    /* Used when the total size is unknown (no content-length): sweep the bar
+       instead of reporting a bogus percentage. */
+    #bar-inner.indeterminate {
+      width: 35% !important;
+      transition: none;
+      animation: sweep 1.1s ease-in-out infinite alternate;
+    }
+
+    @keyframes sweep {
+      from { margin-left: 0%; }
+      to { margin-left: 65%; }
+    }
+
+    #status {
+      font-size: 0.95rem;
+      min-height: 1.2em;
+    }
+
+    #room {
+      font-size: 0.8rem;
+      color: #7a8a5e;
+      min-height: 1.1em;
+      letter-spacing: 0.08em;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="loader">
+    <div id="title">Army Ghosts</div>
+    <div id="bar-outer">
+      <div id="bar-inner"></div>
+    </div>
+    <div id="status">Loading…</div>
+    <div id="room"></div>
+  </div>
+
+  <script>
+    // Connection info, parsed from the join link BEFORE wasm init so the
+    // client can read it synchronously on boot:
+    //   ?room=CODE      join/create this matchbox room (absent → local mode)
+    //   ?players=N      session size (default 2)
+    //   ?signaling=URL  override the signaling server (testing)
+    // Default signaling: same host as the page over wss on port 3536 for
+    // localhost dev, or the standard tailscale-served port for phones —
+    // refined when the Mac serving setup lands; ?signaling= always wins.
+    (function () {
+      const p = new URLSearchParams(location.search);
+      const room = p.get('room') || '';
+      const players = p.get('players') || '';
+      const isLocal = /^(localhost|127\.)/.test(location.hostname);
+      const signaling = p.get('signaling') ||
+        (isLocal ? 'ws://' + location.hostname + ':3536'
+                 : 'wss://' + location.hostname + ':3536');
+      window.__AG_NET__ = { room, players, signaling };
+      if (room) {
+        document.getElementById('room').textContent =
+          'multiplayer · room ' + room + (players ? ' · ' + players + ' players' : '');
+      }
+    })();
+  </script>
+
+  <script type="module">
+    import init from './target/wasm.js';
+
+    const loader = document.getElementById('loader');
+    const barInner = document.getElementById('bar-inner');
+    const statusEl = document.getElementById('status');
+
+    const WASM_URL = './target/wasm_bg.wasm';
+
+    const fmtBytes = (n) => {
+      if (n >= 1048576) return (n / 1048576).toFixed(1) + ' MB';
+      if (n >= 1024) return (n / 1024).toFixed(0) + ' KB';
+      return n + ' B';
+    };
+
+    async function run() {
+      const response = await fetch(WASM_URL);
+      if (!response.ok) throw new Error(`${WASM_URL} → HTTP ${response.status}`);
+
+      // Stream with progress. Content-Length is the compressed size when the
+      // server compresses on the fly; treat the bar as approximate.
+      const total = parseInt(response.headers.get('content-length') || '0', 10);
+      let loaded = 0;
+      const reader = response.body.getReader();
+      const chunks = [];
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        loaded += value.byteLength;
+        if (total > 0) {
+          const pct = Math.min(Math.floor((loaded / total) * 100), 100);
+          barInner.classList.remove('indeterminate');
+          barInner.style.width = pct + '%';
+          statusEl.textContent = `Loading… ${pct}% (${fmtBytes(loaded)})`;
+        } else {
+          barInner.classList.add('indeterminate');
+          statusEl.textContent = `Loading… ${fmtBytes(loaded)}`;
+        }
+      }
+
+      statusEl.textContent = 'Starting…';
+      const wasmModule = await WebAssembly.compile(await new Blob(chunks).arrayBuffer());
+      try {
+        await init(wasmModule);
+      } catch (e) {
+        // Bevy's winit loop exits init() by throwing a sentinel exception to
+        // unwind the Rust stack while the app keeps running. Not a real error.
+        const msg = (e && e.message) || '';
+        if (!msg.startsWith('Using exceptions for control flow')) throw e;
+      }
+
+      barInner.style.width = '100%';
+      loader.classList.add('hidden');
+      setTimeout(() => loader.remove(), 500);
+    }
+
+    run().catch((e) => {
+      console.error(e);
+      barInner.classList.remove('indeterminate');
+      barInner.style.background = '#c05b4d';
+      barInner.style.width = '100%';
+      statusEl.textContent = 'Failed to load';
+      document.getElementById('room').textContent = String((e && e.message) || e);
+    });
+  </script>
+
+  <script>
+    // iOS tab-suspension recovery (bad-spaceship lesson): a heavy wasm/WebGL
+    // tab backgrounded on iOS almost always has its loop or GPU context torn
+    // down and cannot be revived in place — reload instead. With rollback p2p
+    // there is no server to resume from yet; the reload simply rejoins.
+    (function () {
+      let hiddenAt = 0;
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'hidden') {
+          hiddenAt = performance.now();
+        } else if (hiddenAt && performance.now() - hiddenAt > 3000) {
+          location.reload();
+        }
+      });
+    })();
+  </script>
+</body>
+
+</html>

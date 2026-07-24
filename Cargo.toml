@@ -1,0 +1,49 @@
+[workspace]
+members = ["sim", "client"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+authors = ["Sam Carey <sam@samcarey.com>"]
+edition = "2021"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Centralized engine version pins (the "easy upgrade" knob, same pattern as
+# bad-spaceship). Every engine-coupled crate's version is declared ONCE here and
+# inherited by member crates via `{ workspace = true }`; per-crate *feature*
+# selection lives in each member's Cargo.toml.
+#
+# ENGINE VERSION: Bevy 0.18 (deliberately NOT 0.19).
+# The P2P netcode stack has no 0.19-compatible release yet: bevy_matchbox 0.14
+# (and matchbox git main, checked 2026-07-24) targets Bevy 0.18 / ggrs 0.11,
+# while bevy_ggrs 0.22 already targets 0.19 / ggrs 0.13. The only fully
+# released, mutually compatible set is:
+#   bevy 0.18 + bevy_matchbox 0.14 + matchbox_socket 0.14 (ggrs feature)
+#            + bevy_ggrs 0.20 + ggrs 0.11.1
+# Bump to Bevy 0.19+ when matchbox ships support: raise bevy + bevy_matchbox +
+# bevy_ggrs together here, `rm Cargo.lock && cargo generate-lockfile`, fix, and
+# re-check the wasm-bindgen CLI pin against the regenerated lock.
+# ─────────────────────────────────────────────────────────────────────────────
+[workspace.dependencies]
+bevy = { version = "0.18", default-features = false }
+# GGRS rollback netcode for bevy. 0.20 is the bevy 0.18 release that pairs with
+# ggrs 0.11 (0.21 moved to ggrs 0.12, which matchbox_socket 0.14's `ggrs`
+# feature — the NonBlockingSocket impl — does not support).
+bevy_ggrs = { version = "0.20", default-features = false }
+ggrs = { version = "0.11.1", default-features = false }
+# Matchbox WebRTC (unreliable, unordered data channels) + signaling client.
+# The `ggrs` feature provides the ggrs::NonBlockingSocket impl over the socket.
+bevy_matchbox = { version = "0.14", features = ["ggrs"] }
+# ggrs 0.11 serializes session inputs with serde (not bytemuck).
+serde = { version = "1", features = ["derive"] }
+army-ghosts-sim = { path = "sim" }
+
+# Web-release profile tuning: the wasm binary is the game's download size.
+[profile.release]
+lto = "thin"
+
+[profile.wasm-release]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1

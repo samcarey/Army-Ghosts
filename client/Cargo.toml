@@ -1,0 +1,69 @@
+[package]
+name = "army-ghosts-client"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+[dependencies]
+# Versions inherited from `[workspace.dependencies]` (root Cargo.toml — the
+# single place engine versions are pinned); features selected here.
+bevy = { workspace = true }
+bevy_ggrs = { workspace = true }
+bevy_matchbox = { workspace = true }
+army-ghosts-sim = { workspace = true }
+
+# Read `window.__AG_NET__` (room/players/synctest config parsed by index.html
+# before WASM init) on the web build.
+js-sys = { version = "0.3", optional = true }
+# Pinned exactly so the wasm-bindgen CLI (which must match the crate version
+# byte-for-byte or it rejects the module) stays stable; bump both together.
+wasm-bindgen = { version = "=0.2.126", optional = true }
+web-sys = { version = "0.3", optional = true, features = ["Window"] }
+
+# getrandom backends for wasm. The graph pulls getrandom 0.2 (via matchbox's
+# uuid/rand deps) and possibly 0.3; each major line needs its wasm backend
+# feature explicitly on wasm (plus the `getrandom_backend="wasm_js"` cfg in
+# .cargo/config.toml for 0.3+). Trim whichever line drops out of Cargo.lock.
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"], optional = true }
+getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"], optional = true }
+
+[features]
+# Bevy has no umbrella `render` feature: pull in the 2D renderer + winit +
+# supporting pieces explicitly (bevy is `default-features = false` workspace-wide).
+default = [
+    "bevy/bevy_winit",
+    "bevy/bevy_window",
+    "bevy/bevy_sprite",
+    # Bevy 0.17+ split sprite *rendering* out of bevy_sprite (render-crate
+    # split); without this, sprites exist and pass visibility checks but
+    # nothing draws — no error, just an empty clear-colored screen.
+    "bevy/bevy_sprite_render",
+    "bevy/bevy_core_pipeline",
+    "bevy/bevy_asset",
+    "bevy/bevy_state",
+    "bevy/bevy_log",
+    "bevy/png",
+    # Bevy 0.18 split bevy_input sources behind features; keyboard/mouse are
+    # auto-enabled by bevy_winit but `touch` is not — without it the `Touches`
+    # resource never exists and the mobile controls silently read nothing.
+    "bevy/touch",
+]
+
+native = [
+    "bevy/multi_threaded",
+    "bevy/x11",
+]
+
+web = [
+    # Broad-support renderer for browsers (WebGPU needs unstable cfg + newer
+    # browsers; WebGL2 is what phones reliably have).
+    "bevy/webgl2",
+    # ggrs uses `instant`/web-time internally; this routes its clock through
+    # performance.now() on wasm.
+    "bevy_ggrs/wasm-bindgen",
+    "js-sys",
+    "wasm-bindgen",
+    "web-sys",
+    "getrandom_02",
+    "getrandom_03",
+]

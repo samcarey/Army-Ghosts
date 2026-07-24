@@ -1,0 +1,7 @@
+# getrandom 0.3+ does not auto-select a backend on `wasm32-unknown-unknown`; it
+# must be told to use the `wasm_js` (Web Crypto) backend at compile time. Scoped
+# to the wasm target so native builds are unaffected. The matching
+# `getrandom/wasm_js` Cargo feature is enabled by the client's `web` feature.
+# Keeping this in-repo means local, CI, and remote wasm builds all agree.
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']

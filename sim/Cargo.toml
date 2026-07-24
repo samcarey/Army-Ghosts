@@ -1,0 +1,16 @@
+[package]
+name = "army-ghosts-sim"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+# The deterministic game core. RULES (see CLAUDE.md "Determinism"):
+#   - NO floats anywhere in this crate. Positions/velocities are i32 fixed-point.
+#   - No randomness, no time reads, no HashMap iteration order dependence.
+#   - Everything that evolves over ticks lives in rollback-registered components.
+# It is generic over the ggrs Config so it never depends on matchbox (the client
+# picks the address type: PeerId for p2p, String for synctest).
+[dependencies]
+bevy = { workspace = true }
+bevy_ggrs = { workspace = true }
+serde = { workspace = true }

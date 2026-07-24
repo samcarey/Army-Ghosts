@@ -80,7 +80,12 @@ fn main() {
                 .chain()
                 .run_if(in_state(AppState::Connecting)),
             net::log_ggrs_events.run_if(in_state(AppState::InGame)),
-            (hud::update_player_list, hud::update_start_button, hud::update_copy_button),
+            (
+                hud::update_player_list,
+                hud::update_status_text,
+                hud::update_start_button,
+                hud::update_copy_button,
+            ),
             (hud::copy_link_pressed, hud::tick_copied_flash).chain(),
             menu::menu_interactions,
             (touch::read_touches, touch::update_overlay).chain(),

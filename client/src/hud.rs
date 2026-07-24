@@ -14,6 +14,11 @@ pub struct PlayerListText;
 #[derive(Component)]
 pub struct StartButton;
 
+/// Lobby status line, centered at the bottom of the screen (below the START
+/// button's row): share hint, waiting-for-host, connecting, starting.
+#[derive(Component)]
+pub struct StatusText;
+
 #[derive(Component)]
 pub struct CopyLinkButton;
 
@@ -71,6 +76,26 @@ pub fn setup_hud(mut commands: Commands) {
             ));
         });
 
+    // Bottom-center status line.
+    commands
+        .spawn(Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(0.0),
+            right: Val::Px(0.0),
+            bottom: Val::Percent(5.0),
+            justify_content: JustifyContent::Center,
+            ..default()
+        })
+        .with_children(|row| {
+            row.spawn((
+                StatusText,
+                Text::new(""),
+                TextFont { font_size: 14.0, ..default() },
+                TextColor(Color::srgba(0.85, 0.92, 0.75, 0.85)),
+                TextLayout::new_with_justify(Justify::Center),
+            ));
+        });
+
     // Host-only START button (full-width row centers the pill).
     commands
         .spawn((
@@ -102,6 +127,37 @@ pub fn setup_hud(mut commands: Commands) {
                 ));
             });
         });
+}
+
+/// The bottom-center lobby status. The host with company gets no line — the
+/// START button right above it IS the message.
+pub fn update_status_text(
+    state: Res<State<AppState>>,
+    launch: Res<LaunchConfig>,
+    lobby: Res<Lobby>,
+    mut texts: Query<&mut Text, With<StatusText>>,
+) {
+    let Ok(mut text) = texts.single_mut() else { return };
+    // ASCII dots — the embedded default font has no "…" glyph.
+    let status = match state.get() {
+        AppState::Connecting if launch.room.is_some() => {
+            if lobby.roster.is_some() {
+                "starting..."
+            } else if lobby.ids.is_empty() {
+                "connecting..."
+            } else if lobby.ids.len() == 1 {
+                "share the link to invite others"
+            } else if lobby.is_host {
+                ""
+            } else {
+                "waiting for host to start..."
+            }
+        }
+        _ => "",
+    };
+    if text.0 != status {
+        text.0 = status.into();
+    }
 }
 
 /// Show the START button only to the host, once there's someone to play with
@@ -236,25 +292,12 @@ pub fn update_player_list(
     let mut lines: Vec<String> = Vec::new();
     match state.get() {
         // Lobby: the sorted room roster IS the future handle order, so the
-        // numbering here matches the in-game one.
+        // numbering here matches the in-game one. Status lives in the
+        // bottom-center [`StatusText`], not here.
         AppState::Connecting => {
-            if lobby.ids.is_empty() {
-                // ASCII dots — the embedded default font has no "…" glyph.
-                lines.push("connecting...".into());
-            } else {
-                for (i, id) in lobby.ids.iter().enumerate() {
-                    let you = if Some(*id) == lobby.my_id { " (you)" } else { "" };
-                    lines.push(format!("Player {}{}", i + 1, you));
-                }
-                if lobby.roster.is_some() {
-                    lines.push("starting...".into());
-                } else if lobby.ids.len() == 1 {
-                    // Solo lobby: just your own row; COPY LINK sits beside it.
-                } else if lobby.is_host {
-                    lines.push("tap START when ready".into());
-                } else {
-                    lines.push("waiting for host to start...".into());
-                }
+            for (i, id) in lobby.ids.iter().enumerate() {
+                let you = if Some(*id) == lobby.my_id { " (you)" } else { "" };
+                lines.push(format!("Player {}{}", i + 1, you));
             }
         }
         AppState::InGame => {

@@ -7,7 +7,7 @@ use bevy::prelude::*;
 use bevy_ggrs::LocalPlayers;
 
 use army_ghosts_sim::{
-    Bullet, Facing, Player, Pos, Target, ARENA_HALF_H, ARENA_HALF_W, PLAYER_R, TARGET_R,
+    Bullet, Facing, Player, Pos, Target, ARENA_HALF_H, ARENA_HALF_W, TARGET_R,
 };
 
 /// Tell the HTML loader the game is actually drawing frames (it holds its
@@ -30,6 +30,41 @@ pub fn signal_game_ready(mut frames: Local<u32>) {
     }
 }
 
+/// The soldier sprite sheet (tools/gen_assets.py): 64px frames in one row,
+/// drawn facing UP so `orient_players`' rotation convention works unchanged.
+/// Frame 0 idle, 1-6 walk cycle, 7-12 run cycle.
+#[derive(Resource)]
+pub struct SoldierSheet {
+    image: Handle<Image>,
+    layout: Handle<TextureAtlasLayout>,
+}
+
+const SOLDIER_FRAME_PX: u32 = 64;
+const SOLDIER_FRAMES: u32 = 13;
+const IDLE_FRAME: usize = 0;
+const WALK_START: usize = 1;
+const RUN_START: usize = 7;
+const CYCLE_FRAMES: usize = 6;
+/// Rendered size (world px). 64 tex px map to 44 world px, which puts the
+/// drawn shoulders at ~22 px against the 24 px collision diameter and the
+/// muzzle right at the bullet spawn offset.
+const SOLDIER_SIZE: f32 = 44.0;
+
+/// Animation thresholds/cadence, world px/s. Full stick = 120 px/s (run);
+/// partial thumbstick deflection walks. One stride cycle per 36 px walked
+/// keeps footfalls glued to the ground speed.
+const IDLE_BELOW: f32 = 6.0;
+const RUN_ABOVE: f32 = 78.0;
+const CYCLE_LEN_PX: f32 = 36.0;
+
+/// Render-only walk-cycle state (deliberately NOT rollback-registered:
+/// cosmetic, so rollbacks never touch it and determinism is untouched).
+#[derive(Component, Default)]
+pub struct WalkAnim {
+    phase: f32,
+    last_pos: Option<Vec2>,
+}
+
 /// Per-handle player colors (army-men greens first — you are green).
 const PLAYER_COLORS: [Color; 8] = [
     Color::srgb(0.35, 0.65, 0.25), // green
@@ -47,8 +82,22 @@ const Z_TARGET: f32 = 0.0;
 const Z_PLAYER: f32 = 1.0;
 const Z_BULLET: f32 = 2.0;
 
-pub fn setup_scene(mut commands: Commands, assets: Res<AssetServer>) {
+pub fn setup_scene(
+    mut commands: Commands,
+    assets: Res<AssetServer>,
+    mut layouts: ResMut<Assets<TextureAtlasLayout>>,
+) {
     commands.spawn(Camera2d);
+    commands.insert_resource(SoldierSheet {
+        image: assets.load("soldier.png"),
+        layout: layouts.add(TextureAtlasLayout::from_grid(
+            UVec2::splat(SOLDIER_FRAME_PX),
+            SOLDIER_FRAMES,
+            1,
+            None,
+            None,
+        )),
+    });
     commands.insert_resource(ClearColor(Color::srgb(0.08, 0.10, 0.06)));
     // Tiled grass/dirt ground across the arena (texture from tools/gen_assets.py).
     commands.spawn((
@@ -70,24 +119,30 @@ pub fn setup_scene(mut commands: Commands, assets: Res<AssetServer>) {
 /// rollback-respawned entities (bullets especially) get sprites too.
 pub fn attach_sprites(
     mut commands: Commands,
+    soldier: Res<SoldierSheet>,
     new_players: Query<(Entity, &Player), Added<Player>>,
     new_bullets: Query<Entity, Added<Bullet>>,
     new_targets: Query<Entity, Added<Target>>,
 ) {
     for (entity, player) in &new_players {
-        let color = PLAYER_COLORS[player.handle % PLAYER_COLORS.len()];
+        // Grayscale soldier sheet x per-player tint = one-color plastic
+        // figure. Rifle direction comes from `orient_players` rotation;
+        // walk/run frames from `animate_players`.
+        let sprite = Sprite {
+            image: soldier.image.clone(),
+            texture_atlas: Some(TextureAtlas {
+                layout: soldier.layout.clone(),
+                index: IDLE_FRAME,
+            }),
+            color: PLAYER_COLORS[player.handle % PLAYER_COLORS.len()],
+            custom_size: Some(Vec2::splat(SOLDIER_SIZE)),
+            ..default()
+        };
         commands.entity(entity).insert((
-            Sprite::from_color(color, Vec2::splat((PLAYER_R * 2) as f32)),
+            sprite,
+            WalkAnim::default(),
             Transform::from_xyz(0.0, 0.0, Z_PLAYER),
         ));
-        // Gun barrel child: sticks out the facing side (entity rotates via
-        // `orient_players`), so you can see where you'll shoot.
-        commands.entity(entity).with_children(|parent| {
-            parent.spawn((
-                Sprite::from_color(color.darker(0.12), Vec2::new(5.0, 12.0)),
-                Transform::from_xyz(0.0, PLAYER_R as f32 + 4.0, 0.1),
-            ));
-        });
     }
     for entity in &new_bullets {
         commands.entity(entity).insert((
@@ -112,6 +167,43 @@ pub fn orient_players(mut players: Query<(&Facing, &mut Transform), With<Player>
         }
         let angle = (facing.y as f32).atan2(facing.x as f32);
         transform.rotation = Quat::from_rotation_z(angle - std::f32::consts::FRAC_PI_2);
+    }
+}
+
+/// Advance each soldier's walk/run cycle from their *rendered* speed (Pos
+/// delta per frame — works for remote players too, and rollback corrections
+/// just read as a brief stutter). Stationary → idle frame; sub-max analog
+/// deflection → walk cycle; near-full speed → run cycle.
+pub fn animate_players(
+    time: Res<Time>,
+    mut players: Query<(&Pos, &mut WalkAnim, &mut Sprite), With<Player>>,
+) {
+    let dt = time.delta_secs();
+    if dt <= 0.0 {
+        return;
+    }
+    for (pos, mut anim, mut sprite) in &mut players {
+        let (x, y) = pos.to_f32();
+        let p = Vec2::new(x, y);
+        let speed = match anim.last_pos {
+            // Cap: a rollback correction or respawn can jump Pos; don't let
+            // one frame's teleport read as supersonic legs.
+            Some(last) => (p - last).length().min(6.0) / dt,
+            None => 0.0,
+        };
+        anim.last_pos = Some(p);
+        let Some(atlas) = sprite.texture_atlas.as_mut() else { continue };
+        let index = if speed < IDLE_BELOW {
+            anim.phase = 0.0;
+            IDLE_FRAME
+        } else {
+            anim.phase = (anim.phase + speed * dt / CYCLE_LEN_PX).fract();
+            let start = if speed > RUN_ABOVE { RUN_START } else { WALK_START };
+            start + ((anim.phase * CYCLE_FRAMES as f32) as usize).min(CYCLE_FRAMES - 1)
+        };
+        if atlas.index != index {
+            atlas.index = index;
+        }
     }
 }
 

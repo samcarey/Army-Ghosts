@@ -5,10 +5,14 @@ Outputs to client/assets/:
   ground.png  - 128x128 tileable grass/dirt noise tile (RGB)
   disc.png    - 128x128 white disc with soft edge (RGBA, tint via sprite color)
   ring.png    - 128x128 white ring outline (RGBA, joystick base)
+  soldier.png - 13x1 grid of 64x64 frames: top-down soldier facing UP,
+                grayscale (engine tints per player). Frame 0 idle,
+                1-6 walk cycle, 7-12 run cycle (longer stride + lean).
 
 Run from anywhere: python3 tools/gen_assets.py
 Committed outputs are canonical; rerun only when tweaking the look.
 """
+import math
 import os
 import random
 import struct
@@ -81,9 +85,121 @@ def gen_disc(path, size=128, inner=None):
     write_png(path, size, size, rows, color_type=6)  # RGBA
 
 
+# ── Soldier sprite sheet ─────────────────────────────────────────────────────
+# Shapes are analytic (ellipses + capsules) rasterized with 3x3 subsampling;
+# grayscale shades multiply against the per-player sprite tint in the engine,
+# so the whole figure reads as one plastic color — the army-men look.
+
+
+def _seg_dist2(px, py, ax, ay, bx, by):
+    vx, vy = bx - ax, by - ay
+    wx, wy = px - ax, py - ay
+    denom = vx * vx + vy * vy
+    t = 0.0 if denom == 0 else max(0.0, min(1.0, (wx * vx + wy * vy) / denom))
+    dx, dy = px - (ax + vx * t), py - (ay + vy * t)
+    return dx * dx + dy * dy
+
+
+def _hit(shape, x, y):
+    if shape[0] == 'ellipse':
+        _, cx, cy, rx, ry, _ = shape
+        dx, dy = (x - cx) / rx, (y - cy) / ry
+        return dx * dx + dy * dy <= 1.0
+    _, ax, ay, bx, by, r, _ = shape  # capsule
+    return _seg_dist2(x, y, ax, ay, bx, by) <= r * r
+
+
+def _render(shapes, size):
+    """Rasterize shapes (painter's order, last on top) to an RGBA pixel grid."""
+    sub = (1 / 6, 3 / 6, 5 / 6)
+    grid = []
+    for y in range(size):
+        row = []
+        for x in range(size):
+            cover, shade_sum = 0, 0.0
+            for oy in sub:
+                for ox in sub:
+                    shade = None
+                    for sh in shapes:
+                        if _hit(sh, x + ox, y + oy):
+                            shade = sh[-1]
+                    if shade is not None:
+                        cover += 1
+                        shade_sum += shade
+            if cover:
+                v = int(round(shade_sum / cover * 255))
+                row.append((v, v, v, int(round(cover / 9 * 255))))
+            else:
+                row.append((0, 0, 0, 0))
+        grid.append(row)
+    return grid
+
+
+def _soldier_pose(size, stride_amp, sway_amp, lean, t):
+    """One frame's shape list. Texture y is DOWN; the soldier faces UP.
+
+    stride_amp: leg swing amplitude (px). sway_amp: torso/helmet lateral sway.
+    lean: forward body shift (run frames). t: 0..1 phase through the cycle.
+    """
+    stride = math.sin(2 * math.pi * t) * stride_amp
+    sway = math.sin(2 * math.pi * t) * sway_amp
+    cx, cy = size / 2, size / 2 + 3 - lean
+    shapes = []
+
+    def add(shape, outline=True):
+        # A dark rim under each part separates it from what it overlaps
+        # (helmet from shoulders, boots from ground) — the toy-figure read.
+        if outline:
+            grow, rim = 1.6, 0.14
+            if shape[0] == 'ellipse':
+                _, ex, ey, rx, ry, _ = shape
+                shapes.append(('ellipse', ex, ey, rx + grow, ry + grow, rim))
+            else:
+                _, ax, ay, bx, by, r, _ = shape
+                shapes.append(('capsule', ax, ay, bx, by, r + grow, rim))
+        shapes.append(shape)
+
+    # Boots: swing fore/aft in opposite phase; visible past the torso mid-stride.
+    for side, s in ((-1, -stride), (1, stride)):
+        bx, by = cx + side * 7.0, cy + 6 + s
+        add(('capsule', bx, by - 3.5, bx, by + 3.5, 4.2, 0.38))
+    # Torso (shoulders wide across x).
+    add(('ellipse', cx + sway * 0.5, cy, 16, 8.5, 0.62))
+    # Arms reaching to the rifle (left hand on foregrip, right on the stock).
+    add(('capsule', cx - 13, cy - 1, cx - 4, cy - 12, 3.0, 0.50))
+    add(('capsule', cx + 13, cy, cx + 4, cy - 7, 3.0, 0.50))
+    # Rifle: dark barrel pointing up (slightly right of center, right-handed).
+    add(('capsule', cx + 1.5, cy - 5, cx + 1.5, cy - 26, 2.0, 0.22))
+    # Hands on top of the rifle.
+    add(('ellipse', cx - 4, cy - 12, 2.8, 2.8, 0.55), outline=False)
+    add(('ellipse', cx + 4, cy - 7, 2.8, 2.8, 0.55), outline=False)
+    # Helmet with an off-center highlight.
+    add(('ellipse', cx + sway, cy - 2, 8.5, 8.5, 0.90))
+    add(('ellipse', cx + sway - 2.2, cy - 4.2, 4.2, 4.2, 1.0), outline=False)
+    return shapes
+
+
+def gen_soldier(path, size=64):
+    poses = [_soldier_pose(size, 0, 0, 0, 0)]  # frame 0: idle, legs together
+    for i in range(6):  # frames 1-6: walk
+        poses.append(_soldier_pose(size, 6.5, 1.0, 0, i / 6))
+    for i in range(6):  # frames 7-12: run (longer stride, forward lean)
+        poses.append(_soldier_pose(size, 9.5, 2.0, 3, i / 6))
+    grids = [_render(shapes, size) for shapes in poses]
+    rows = []
+    for y in range(size):
+        row = bytearray()
+        for g in grids:
+            for px in g[y]:
+                row += bytes(px)
+        rows.append(row)
+    write_png(path, size * len(grids), size, rows, color_type=6)  # RGBA
+
+
 if __name__ == '__main__':
     out = os.path.join(os.path.dirname(__file__), '..', 'client', 'assets')
     os.makedirs(out, exist_ok=True)
     gen_ground(os.path.join(out, 'ground.png'))
     gen_disc(os.path.join(out, 'disc.png'))
     gen_disc(os.path.join(out, 'ring.png'), inner=0.82)
+    gen_soldier(os.path.join(out, 'soldier.png'))

@@ -126,7 +126,10 @@ Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_SIGNALING` env vars.
   `~/Library/Caches/ms-playwright/`; launch with
   `--use-gl=swiftshader --enable-unsafe-swiftshader --no-sandbox`. Chrome's
   `--virtual-time-budget` screenshots are unreliable for wasm games — drive
-  with playwright and real waits instead.
+  with playwright and real waits instead. Keep playwright's
+  `deviceScaleFactor` at 1: any other value panics winit-web in headless
+  ("created media query doesn't match, 1.5 != 1.5") and the page dies before
+  `data-game-ready`. Zoom by cropping + `sips -z` afterwards instead.
 - **Headless-to-headless WebRTC additionally needs
   `--disable-features=WebRtcHideLocalIpsWithMdns`** — headless Chrome can't
   resolve the mDNS-obfuscated host candidates, and the srflx fallback needs

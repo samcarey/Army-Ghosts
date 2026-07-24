@@ -164,12 +164,18 @@ Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_SIGNALING` env vars.
 
 ## Public dev serving (caddy vhost on this Mac)
 
-`https://army-ghosts.dev.whoeverwants.com` — publicly reachable (wildcard
-Route 53 DNS → home IP, router forwards 443 to this Mac's root caddy). The
-vhost is a fragment at `/Users/sccarey/devbox/caddy.d/army-ghosts.caddy`,
-imported by the `*.dev.whoeverwants.com` block in `/opt/homebrew/etc/Caddyfile`:
-`/ws/*` → matchbox_server :3536 (prefix stripped), everything else →
-python http.server :8098 serving `_site/`. Apply changes with
+**`https://army-ghosts.dev.whoeverwants.com:7443`** — the public URL. The
+router forwards ONLY public **:7443** to this Mac (verified externally via
+check-host.net: 7443 open, 443/80 filtered) — every `:443` caddy site
+(cmd-api, the `*.dev` wildcard block) is LAN/loopback-reachable only. The
+:7443 site is a dedicated block appended to `/opt/homebrew/etc/Caddyfile`
+(own Route 53 DNS-01 cert); a twin fragment for :443 lives at
+`/Users/sccarey/devbox/caddy.d/army-ghosts.caddy` (useful for loopback
+tests). Both: `/ws/*` → matchbox_server :3536 (prefix stripped), everything
+else → `file_server` on `_site/` with zstd/gzip encode (the ~50MB dev wasm
+→ ~11MB on the wire). index.html derives signaling as
+`wss://<host:port>/ws` from `location.host`, so the port rides along
+automatically. Apply changes with
 `caddy reload --config /opt/homebrew/etc/Caddyfile` (admin API is open on
 localhost:2019, no sudo needed). index.html auto-selects same-origin `/ws`
 signaling on any non-localhost, non-ts.net host. NOTE: public URLs are NOT

@@ -126,8 +126,11 @@ pub fn setup_menu(mut commands: Commands) {
 }
 
 pub fn menu_interactions(
+    mouse: Res<ButtonInput<MouseButton>>,
+    touches: Res<Touches>,
     toggles: Query<&Interaction, (Changed<Interaction>, With<MenuToggle>)>,
     new_rooms: Query<&Interaction, (Changed<Interaction>, With<NewRoomButton>)>,
+    menu_buttons: Query<&Interaction, Or<(With<MenuToggle>, With<NewRoomButton>)>>,
     mut panels: Query<&mut Visibility, With<MenuPanel>>,
 ) {
     for interaction in &toggles {
@@ -146,6 +149,15 @@ pub fn menu_interactions(
             let code = generate_room_code();
             info!("menu: new room {code}");
             open_room(&code);
+        }
+    }
+    // Any press that didn't land on a menu button dismisses the panel
+    // (ui_focus_system has already stamped this frame's Interaction states
+    // by the time Update systems run).
+    let pressed_somewhere = mouse.just_pressed(MouseButton::Left) || touches.any_just_pressed();
+    if pressed_somewhere && menu_buttons.iter().all(|i| *i != Interaction::Pressed) {
+        for mut visibility in &mut panels {
+            *visibility = Visibility::Hidden;
         }
     }
 }

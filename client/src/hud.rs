@@ -249,7 +249,7 @@ pub fn update_player_list(
                 if lobby.roster.is_some() {
                     lines.push("starting...".into());
                 } else if lobby.ids.len() == 1 {
-                    lines.push("share the link to invite...".into());
+                    // Solo lobby: just your own row; COPY LINK sits beside it.
                 } else if lobby.is_host {
                     lines.push("tap START when ready".into());
                 } else {

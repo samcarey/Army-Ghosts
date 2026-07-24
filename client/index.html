@@ -150,9 +150,13 @@
       const players = p.get('players') || '';
       const ice = p.get('ice') || '';
       const isLocal = /^(localhost|127\.)/.test(location.hostname);
+      // Tailscale-served dev builds: the signaling server rides the same
+      // MagicDNS host on HTTPS port 9451 (tailscale serve → 127.0.0.1:3536).
+      const isTailnet = /\.ts\.net$/.test(location.hostname);
       const signaling = p.get('signaling') ||
         (isLocal ? 'ws://' + location.hostname + ':3536'
-                 : 'wss://' + location.hostname + ':3536');
+         : isTailnet ? 'wss://' + location.hostname + ':9451'
+                     : 'wss://' + location.hostname + ':3536');
       window.__AG_NET__ = { room, players, signaling, ice };
       if (room) {
         document.getElementById('room').textContent =

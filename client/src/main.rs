@@ -2,10 +2,13 @@
 //! deterministic `army-ghosts-sim` core. Runs native (dev loop) and as WASM in
 //! the browser (the real target — mobile Safari/Chrome).
 
+mod hud;
 mod input;
 mod net;
 mod render;
 mod touch;
+
+pub use net::LaunchConfig;
 
 use bevy::prelude::*;
 use bevy_ggrs::{GgrsPlugin, ReadInputs};
@@ -57,13 +60,24 @@ fn main() {
     .init_state::<AppState>()
     .add_systems(
         Startup,
-        (render::setup_scene, net::begin_session_setup, touch::setup_overlay).chain(),
+        (
+            render::setup_scene,
+            net::begin_session_setup,
+            touch::setup_overlay,
+            hud::setup_hud,
+        )
+            .chain(),
     )
     .add_systems(
         Update,
         (
-            net::wait_for_players.run_if(in_state(AppState::Connecting)),
+            // finalize BEFORE wait: the two run a frame apart so bevy_ggrs
+            // gets its no-session reset tick between warmup and p2p.
+            (net::finalize_p2p_session, net::wait_for_players)
+                .chain()
+                .run_if(in_state(AppState::Connecting)),
             net::log_ggrs_events.run_if(in_state(AppState::InGame)),
+            hud::update_player_list,
             (touch::read_touches, touch::update_overlay).chain(),
             (
                 render::attach_sprites,

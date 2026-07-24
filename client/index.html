@@ -153,10 +153,13 @@
       // Tailscale-served dev builds: the signaling server rides the same
       // MagicDNS host on HTTPS port 9451 (tailscale serve → 127.0.0.1:3536).
       const isTailnet = /\.ts\.net$/.test(location.hostname);
+      // Any other host (the public caddy vhost, later GitHub Pages fronted by
+      // it): same-origin path-based signaling at /ws/<room> (caddy
+      // handle_path strips the prefix before matchbox_server sees it).
       const signaling = p.get('signaling') ||
         (isLocal ? 'ws://' + location.hostname + ':3536'
          : isTailnet ? 'wss://' + location.hostname + ':9451'
-                     : 'wss://' + location.hostname + ':3536');
+                     : 'wss://' + location.host + '/ws');
       window.__AG_NET__ = { room, players, signaling, ice };
       if (room) {
         document.getElementById('room').textContent =

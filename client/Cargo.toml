@@ -47,6 +47,12 @@ default = [
     # auto-enabled by bevy_winit but `touch` is not — without it the `Touches`
     # resource never exists and the mobile controls silently read nothing.
     "bevy/touch",
+    # HUD (player list). Note the same render-split gotcha as sprites:
+    # bevy_ui without bevy_ui_render lays out but never draws.
+    "bevy/bevy_ui",
+    "bevy/bevy_ui_render",
+    "bevy/bevy_text",
+    "bevy/default_font",
 ]
 
 native = [

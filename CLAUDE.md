@@ -137,6 +137,46 @@ Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_SIGNALING` env vars.
 - **STUN itself is fine on this network** (verified: 28-47ms responses via
   python/node UDP probes) — do not blame the router when browser ICE is slow;
   it's the per-interface STUN timeout above.
+- **Local same-Mac p2p tests are flaky because macOS firewall STEALTH MODE is
+  on** (`socketfilterfw --getstealthmode`): unsolicited inbound UDP (ICE
+  connectivity checks) is silently dropped, so browser-involved pairs
+  sometimes stall at ICE `checking` → `failed` (~30s). Native↔native usually
+  survives; anything involving the Playwright Chrome binary is a coin flip.
+  Real phones talking to each other are unaffected. Fix for reliable local
+  automation (needs sudo, ask the user): allowlist the browser in the app
+  firewall or turn stealth mode off.
+- **A long-running `matchbox_server` can wedge** after many abandoned test
+  rooms — new pairings then stall even at the signaling stage. When p2p
+  "mysteriously stops working": `pkill matchbox_server` and restart it, and
+  always use FRESH room codes per test (`next_2` rooms remember dead peers).
+- **Warmup → p2p session swap** (`client/src/net.rs`): with a `room`, the
+  client starts a 1-player synctest immediately (playable while waiting).
+  When the room fills, `wait_for_players` despawns all `Rollback` entities,
+  removes the `Session` resource, and stashes the channel in
+  `PendingSession`; `finalize_p2p_session` builds the real session **one
+  frame later** (bevy_ggrs needs a no-session tick to reset frame/snapshot
+  state) and must also insert a fresh `Time<GgrsTime>` — otherwise
+  bevy_ggrs `advance_to`s an earlier moment and panics ("tried to move time
+  backwards").
+- **HUD**: bevy_ui needs `bevy_ui_render` (same render-split trap as
+  sprites) + `bevy_text` + `default_font`. The embedded default font has no
+  `…` glyph (renders as a box) — use ASCII `...`.
+
+## Public dev serving (caddy vhost on this Mac)
+
+`https://army-ghosts.dev.whoeverwants.com` — publicly reachable (wildcard
+Route 53 DNS → home IP, router forwards 443 to this Mac's root caddy). The
+vhost is a fragment at `/Users/sccarey/devbox/caddy.d/army-ghosts.caddy`,
+imported by the `*.dev.whoeverwants.com` block in `/opt/homebrew/etc/Caddyfile`:
+`/ws/*` → matchbox_server :3536 (prefix stripped), everything else →
+python http.server :8098 serving `_site/`. Apply changes with
+`caddy reload --config /opt/homebrew/etc/Caddyfile` (admin API is open on
+localhost:2019, no sudo needed). index.html auto-selects same-origin `/ws`
+signaling on any non-localhost, non-ts.net host. NOTE: public URLs are NOT
+testable from inside this LAN (no NAT hairpin — curl gives 000); test via
+`--resolve <host>:443:127.0.0.1` locally or from a cellular device.
+Cross-network play relies on plain STUN; symmetric/CGNAT cellular pairs may
+need a TURN server eventually.
 
 ## Testing
 

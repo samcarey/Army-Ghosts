@@ -8,9 +8,9 @@
 //!   frame (`check_distance`) — the determinism canary AND the offline mode.
 
 use bevy::prelude::*;
-use bevy_ggrs::ggrs::{DesyncDetection, SessionBuilder};
-use bevy_ggrs::Session;
-use bevy_matchbox::matchbox_socket::{RtcIceServerConfig, WebRtcSocketBuilder};
+use bevy_ggrs::ggrs::{DesyncDetection, PlayerType, SessionBuilder};
+use bevy_ggrs::{Rollback, Session};
+use bevy_matchbox::matchbox_socket::{RtcIceServerConfig, WebRtcChannel, WebRtcSocketBuilder};
 use bevy_matchbox::prelude::*;
 
 use army_ghosts_sim::{spawn_world, MAX_PLAYERS, TICK_HZ};
@@ -80,8 +80,33 @@ pub fn launch_config() -> LaunchConfig {
     LaunchConfig { room, players, signaling, ice }
 }
 
-/// Startup: either open the matchbox socket (p2p) or start the synctest
-/// session immediately (local).
+/// Handoff between `wait_for_players` (which tears the warmup world down) and
+/// `finalize_p2p_session` (which builds the real session one frame later).
+/// The one-frame gap matters: bevy_ggrs's driver sees "no session" for a tick
+/// and resets its frame counter / time accumulator / snapshot bookkeeping.
+#[derive(Resource)]
+pub struct PendingSession {
+    pub players: Vec<PlayerType<PeerId>>,
+    pub channel: Option<WebRtcChannel>,
+}
+
+fn start_local_session(commands: &mut Commands, players: usize) {
+    let mut builder = SessionBuilder::<SessionConfig>::new()
+        .with_num_players(players)
+        .with_check_distance(2);
+    for handle in 0..players {
+        builder = builder
+            .add_player(PlayerType::Local, handle)
+            .expect("add local player");
+    }
+    let session = builder.start_synctest_session().expect("start synctest");
+    commands.insert_resource(Session::SyncTest(session));
+    spawn_world(commands, players);
+}
+
+/// Startup: always start playing immediately. With a room, that's a 1-player
+/// "warmup" session while matchbox gathers peers (torn down and replaced by
+/// the p2p session when everyone's in); without one it's plain local mode.
 pub fn begin_session_setup(
     mut commands: Commands,
     launch: Res<LaunchConfig>,
@@ -102,37 +127,31 @@ pub fn begin_session_setup(
                     ..default()
                 });
             }
-            commands.insert_resource(MatchboxSocket::from(
-                builder.add_unreliable_channel(),
-            ));
+            commands.insert_resource(MatchboxSocket::from(builder.add_unreliable_channel()));
+            // Warmup: run around and shoot while waiting for the room to fill.
+            start_local_session(&mut commands, 1);
         }
         None => {
             info!("no room — starting local synctest session ({} players)", launch.players);
-            let mut builder = SessionBuilder::<SessionConfig>::new()
-                .with_num_players(launch.players)
-                .with_check_distance(2);
-            for handle in 0..launch.players {
-                builder = builder
-                    .add_player(bevy_ggrs::ggrs::PlayerType::Local, handle)
-                    .expect("add local player");
-            }
-            let session = builder.start_synctest_session().expect("start synctest");
-            commands.insert_resource(Session::SyncTest(session));
-            spawn_world(&mut commands, launch.players);
+            start_local_session(&mut commands, launch.players);
             next_state.set(AppState::InGame);
         }
     }
 }
 
-/// Poll the signaling connection until everyone's here, then hand the WebRTC
-/// channel to GGRS. Handle order comes from matchbox's sorted `players()`
-/// list, so every peer agrees on who is which handle.
+/// Poll the signaling connection until everyone's here, then tear down the
+/// warmup world and stash the channel + roster for `finalize_p2p_session`
+/// (which runs next frame — see [`PendingSession`]).
 pub fn wait_for_players(
     mut commands: Commands,
     socket: Option<ResMut<MatchboxSocket>>,
+    pending: Option<Res<PendingSession>>,
     launch: Res<LaunchConfig>,
-    mut next_state: ResMut<NextState<AppState>>,
+    rollback_entities: Query<Entity, With<Rollback>>,
 ) {
+    if pending.is_some() {
+        return; // teardown already done, finalize runs next frame
+    }
     let Some(mut socket) = socket else {
         return; // local mode: no socket
     };
@@ -144,7 +163,30 @@ pub fn wait_for_players(
     if players.len() < launch.players {
         return;
     }
-    info!("all {} players connected — starting p2p session", launch.players);
+    info!("all {} players connected — restarting into p2p session", launch.players);
+
+    // Tear down the warmup world; the Session's absence next frame makes
+    // bevy_ggrs reset its frame counter and snapshot state.
+    for entity in &rollback_entities {
+        commands.entity(entity).despawn();
+    }
+    commands.remove_resource::<Session<SessionConfig>>();
+    let channel = socket.take_channel(0).expect("take ggrs channel");
+    commands.insert_resource(PendingSession { players, channel: Some(channel) });
+}
+
+/// One frame after teardown: build the real p2p session and the fresh world.
+/// Handle order comes from matchbox's sorted `players()` list, so every peer
+/// agrees on who is which handle. Ordered BEFORE `wait_for_players` in the
+/// schedule so the bevy_ggrs no-session reset tick happens in between.
+pub fn finalize_p2p_session(
+    mut commands: Commands,
+    pending: Option<ResMut<PendingSession>>,
+    launch: Res<LaunchConfig>,
+    mut next_state: ResMut<NextState<AppState>>,
+) {
+    let Some(mut pending) = pending else { return };
+    let Some(channel) = pending.channel.take() else { return };
 
     let mut builder = SessionBuilder::<SessionConfig>::new()
         .with_num_players(launch.players)
@@ -154,12 +196,16 @@ pub fn wait_for_players(
         .with_desync_detection_mode(DesyncDetection::On { interval: 10 })
         .with_fps(TICK_HZ)
         .expect("valid fps");
-    for (handle, player) in players.into_iter().enumerate() {
-        builder = builder.add_player(player, handle).expect("add player");
+    for (handle, player) in pending.players.iter().enumerate() {
+        builder = builder.add_player(*player, handle).expect("add player");
     }
-    let channel = socket.take_channel(0).expect("take ggrs channel");
     let session = builder.start_p2p_session(channel).expect("start p2p session");
     commands.insert_resource(Session::P2P(session));
+    // The frame counter reset to 0 with the session gone, but Time<GgrsTime>
+    // kept the warmup's elapsed time — bevy_ggrs would then `advance_to` an
+    // EARLIER moment and panic ("tried to move time backwards"). Fresh clock.
+    commands.insert_resource(Time::new_with(bevy_ggrs::GgrsTime));
+    commands.remove_resource::<PendingSession>();
     spawn_world(&mut commands, launch.players);
     next_state.set(AppState::InGame);
 }

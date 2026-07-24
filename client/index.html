@@ -149,7 +149,9 @@
       const room = p.get('room') || '';
       const players = p.get('players') || '';
       const ice = p.get('ice') || '';
-      const isLocal = /^(localhost|127\.)/.test(location.hostname);
+      // Plain-http origins (localhost dev, or a LAN IP for same-wifi phones
+      // that can't hairpin to the public URL): direct ws:// to matchbox.
+      const isPlainWs = /^(localhost|127\.|192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)/.test(location.hostname);
       // Tailscale-served dev builds: the signaling server rides the same
       // MagicDNS host on HTTPS port 9451 (tailscale serve → 127.0.0.1:3536).
       const isTailnet = /\.ts\.net$/.test(location.hostname);
@@ -157,7 +159,7 @@
       // it): same-origin path-based signaling at /ws/<room> (caddy
       // handle_path strips the prefix before matchbox_server sees it).
       const signaling = p.get('signaling') ||
-        (isLocal ? 'ws://' + location.hostname + ':3536'
+        (isPlainWs ? 'ws://' + location.hostname + ':3536'
          : isTailnet ? 'wss://' + location.hostname + ':9451'
                      : 'wss://' + location.host + '/ws');
       window.__AG_NET__ = { room, players, signaling, ice };

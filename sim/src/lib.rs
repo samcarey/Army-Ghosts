@@ -58,10 +58,15 @@ pub struct PlayerInput {
 }
 
 pub const BTN_FIRE: u8 = 1 << 0;
+/// Aiming down sights: the shooter plants their feet (stick only turns them).
+pub const BTN_ADS: u8 = 1 << 1;
 
 impl PlayerInput {
     pub fn fire(&self) -> bool {
         self.buttons & BTN_FIRE != 0
+    }
+    pub fn ads(&self) -> bool {
+        self.buttons & BTN_ADS != 0
     }
 }
 
@@ -245,6 +250,14 @@ fn move_players<C: Config<Input = PlayerInput>>(
         if mx == 0 && my == 0 {
             continue;
         }
+        facing.x = mx;
+        facing.y = my;
+        // Aiming down sights roots the shooter in place — the stick still
+        // turns them (that's the aim), it just doesn't carry them anywhere.
+        // The bit rides in the input stream, so every peer agrees.
+        if input.ads() {
+            continue;
+        }
         // Scale the joystick vector to at most PLAYER_SPEED, preserving
         // direction: v = m * SPEED / max(len, 127). Dividing by the *longer*
         // of len/127 keeps sub-max joystick deflections proportional while
@@ -254,8 +267,6 @@ fn move_players<C: Config<Input = PlayerInput>>(
         pos.y += my * PLAYER_SPEED / len;
         pos.x = pos.x.clamp(-(ARENA_HALF_W - PLAYER_R) * FP, (ARENA_HALF_W - PLAYER_R) * FP);
         pos.y = pos.y.clamp(-(ARENA_HALF_H - PLAYER_R) * FP, (ARENA_HALF_H - PLAYER_R) * FP);
-        facing.x = mx;
-        facing.y = my;
     }
 }
 

@@ -102,6 +102,16 @@ Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_SIGNALING` env vars.
   synctest. UI on top: upper-left MENU → NEW ROOM (generated 5-char code,
   web navigates to `?room=`), COPY LINK beside the lobby roster (clipboard;
   both are bevy_ui `Button`+`Interaction`, which handles touch natively).
+- **Aim down sights** (`client/src/ads.rs`): bottom-center crosshair toggle
+  (also Shift on a keyboard). The toggle is local UI state; it reaches the sim
+  only as the `BTN_ADS` input bit, which roots the pawn in place (the stick
+  still turns it) so every peer applies the lock from the same input stream.
+  Everything else is render-only: the camera slides `ADS_SHIFT` (200 world
+  units — half a "normal" mobile screen, deliberately fixed rather than
+  window-relative) along the facing, smoothstepped over 500 ms, and a thin
+  white line traces the shot to the first target it would hit, else the arena
+  wall. The shift rides on `render::CameraFocus` (the follow target) so the
+  camera's own lerp doesn't fight the aim ease.
 
 ## Gotchas already hit (don't rediscover)
 

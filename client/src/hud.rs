@@ -5,6 +5,7 @@
 use bevy::prelude::*;
 use bevy_ggrs::{LocalPlayers, Session};
 
+use crate::ads::AdsButton;
 use crate::net::Lobby;
 use crate::{AppState, LaunchConfig, SessionConfig};
 
@@ -31,9 +32,11 @@ pub struct CopiedFlash(pub Timer);
 
 /// The tappable START band: bottom-center of the screen, in 0-1 window
 /// fractions (window coords, y-down). The visual button sits inside it; the
-/// hit zone is deliberately larger for thumbs.
+/// hit zone is deliberately larger for thumbs. (Taps that land on the ADS
+/// button — which lives in the same corner of the screen — are excluded in
+/// [`read_start_input`].)
 const START_BAND_X: (f32, f32) = (0.25, 0.75);
-const START_BAND_Y: f32 = 0.72;
+const START_BAND_Y: f32 = 0.62;
 
 pub fn setup_hud(mut commands: Commands) {
     // Top-right row: [COPY LINK] beside the roster text (top-aligned; the
@@ -76,13 +79,13 @@ pub fn setup_hud(mut commands: Commands) {
             ));
         });
 
-    // Bottom-center status line.
+    // Bottom-center status line, stacked above the ADS button.
     commands
         .spawn(Node {
             position_type: PositionType::Absolute,
             left: Val::Px(0.0),
             right: Val::Px(0.0),
-            bottom: Val::Percent(5.0),
+            bottom: Val::Px(112.0),
             justify_content: JustifyContent::Center,
             ..default()
         })
@@ -104,7 +107,7 @@ pub fn setup_hud(mut commands: Commands) {
                 position_type: PositionType::Absolute,
                 left: Val::Px(0.0),
                 right: Val::Px(0.0),
-                bottom: Val::Percent(12.0),
+                bottom: Val::Px(150.0),
                 justify_content: JustifyContent::Center,
                 ..default()
             },
@@ -255,10 +258,16 @@ pub fn read_start_input(
     mouse: Res<ButtonInput<MouseButton>>,
     touches: Res<Touches>,
     windows: Query<&Window>,
+    ads_buttons: Query<&Interaction, With<AdsButton>>,
     mut lobby: ResMut<Lobby>,
 ) {
     if keys.just_pressed(KeyCode::Enter) {
         lobby.start_requested = true;
+        return;
+    }
+    // The ADS button sits inside the band; toggling sights must not start the
+    // match. (`ui_focus_system` has already stamped this frame's Interaction.)
+    if ads_buttons.iter().any(|i| *i == Interaction::Pressed) {
         return;
     }
     let Ok(window) = windows.single() else { return };

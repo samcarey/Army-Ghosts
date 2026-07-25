@@ -45,6 +45,11 @@ pub fn read_touches(
         controls.touch_seen = true;
         let start = touch.start_position();
         let pos = touch.position();
+        if crate::ads::over_ads_button(start, size) {
+            // bevy_ui already handles the sights toggle; don't also read the
+            // tap as fire (the fire zone below is deliberately generous).
+            continue;
+        }
         if start.x < size.x * 0.45 {
             // Movement stick: anchor at the touch-down point, direction =
             // drag vector (y flipped to world-up), clamped to JOY_RADIUS.

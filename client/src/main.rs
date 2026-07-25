@@ -2,6 +2,7 @@
 //! deterministic `army-ghosts-sim` core. Runs native (dev loop) and as WASM in
 //! the browser (the real target — mobile Safari/Chrome).
 
+mod ads;
 mod hud;
 mod input;
 mod menu;
@@ -58,6 +59,8 @@ fn main() {
     .add_systems(ReadInputs, input::read_local_inputs)
     .insert_resource(launch)
     .init_resource::<touch::TouchControls>()
+    .init_resource::<ads::Ads>()
+    .init_resource::<render::CameraFocus>()
     .init_resource::<net::Lobby>()
     .init_state::<AppState>()
     .add_systems(
@@ -68,6 +71,7 @@ fn main() {
             touch::setup_overlay,
             hud::setup_hud,
             menu::setup_menu,
+            ads::setup_ads,
         )
             .chain(),
     )
@@ -89,12 +93,18 @@ fn main() {
             (hud::copy_link_pressed, hud::tick_copied_flash).chain(),
             menu::menu_interactions,
             (touch::read_touches, touch::update_overlay).chain(),
+            // advance_ads owns the aim transition; the aim line and the camera
+            // shift both read it, so they follow it in the same frame.
             (
+                ads::toggle_ads,
+                ads::advance_ads,
+                ads::update_ads_button,
                 render::attach_sprites,
                 render::orient_players,
                 render::animate_players,
                 render::bullet_trails,
                 render::sync_transforms,
+                ads::update_aim_line,
                 render::camera_follow,
             )
                 .chain(),

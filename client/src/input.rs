@@ -7,8 +7,9 @@ use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
 use bevy_ggrs::{LocalInputs, LocalPlayers};
 
-use army_ghosts_sim::{PlayerInput, BTN_FIRE};
+use army_ghosts_sim::{PlayerInput, BTN_ADS, BTN_FIRE};
 
+use crate::ads::Ads;
 use crate::touch::TouchControls;
 use crate::SessionConfig;
 
@@ -16,6 +17,7 @@ pub fn read_local_inputs(
     mut commands: Commands,
     keys: Res<ButtonInput<KeyCode>>,
     touch: Res<TouchControls>,
+    ads: Res<Ads>,
     local_players: Res<LocalPlayers>,
 ) {
     let mut local_inputs = HashMap::new();
@@ -49,6 +51,11 @@ pub fn read_local_inputs(
             input.move_y = y.clamp(-127, 127) as i8;
             if keys.pressed(KeyCode::Space) || touch.firing {
                 input.buttons |= BTN_FIRE;
+            }
+            // ADS is a local toggle (`ads.rs`); the sim reads it off this bit
+            // so the movement lock is identical on every peer.
+            if ads.active {
+                input.buttons |= BTN_ADS;
             }
             first = false;
         }

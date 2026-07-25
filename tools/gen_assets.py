@@ -11,6 +11,8 @@ Outputs to client/assets/:
   tracer.png  - 32x8 white tracer streak pointing RIGHT (+x): soft capsule
                 with a bright head and a tail fading to transparent. The
                 engine tints it and rotates it to the bullet's flight angle.
+  crosshair.png - 128x128 white ring with four inward ticks and a center dot
+                (RGBA); the aim-down-sights button icon.
 
 Run from anywhere: python3 tools/gen_assets.py
 Committed outputs are canonical; rerun only when tweaking the look.
@@ -217,6 +219,32 @@ def gen_tracer(path, w=32, h=8):
     write_png(path, w, h, rows, color_type=6)  # RGBA
 
 
+def gen_crosshair(path, size=128):
+    """ADS icon: thin ring, four ticks reaching inward, small center dot."""
+    c = size / 2
+    r_out = size / 2 - 5
+    t = 2.6  # half-stroke width
+    rows = []
+    for y in range(size):
+        row = bytearray()
+        for x in range(size):
+            px, py = x + 0.5, y + 0.5
+            d = ((px - c) ** 2 + (py - c) ** 2) ** 0.5
+            a = max(0.0, min(1.0, t - abs(d - r_out) + 0.5))  # ring
+            for dx, dy in ((0, 1), (0, -1), (1, 0), (-1, 0)):
+                # Tick from just inside the ring toward (but short of) center.
+                seg = _seg_dist2(
+                    px, py,
+                    c + dx * (r_out - 4), c + dy * (r_out - 4),
+                    c + dx * 16, c + dy * 16,
+                ) ** 0.5
+                a = max(a, max(0.0, min(1.0, t - seg + 0.5)))
+            a = max(a, max(0.0, min(1.0, 3.5 - d + 0.5)))  # center dot
+            row += bytes((255, 255, 255, int(a * 255)))
+        rows.append(row)
+    write_png(path, size, size, rows, color_type=6)  # RGBA
+
+
 if __name__ == '__main__':
     out = os.path.join(os.path.dirname(__file__), '..', 'client', 'assets')
     os.makedirs(out, exist_ok=True)
@@ -225,3 +253,4 @@ if __name__ == '__main__':
     gen_disc(os.path.join(out, 'ring.png'), inner=0.82)
     gen_soldier(os.path.join(out, 'soldier.png'))
     gen_tracer(os.path.join(out, 'tracer.png'))
+    gen_crosshair(os.path.join(out, 'crosshair.png'))

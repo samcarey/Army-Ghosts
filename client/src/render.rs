@@ -10,6 +10,8 @@ use army_ghosts_sim::{
     Bullet, Facing, Player, Pos, Target, ARENA_HALF_H, ARENA_HALF_W, TARGET_R,
 };
 
+use crate::ads::Ads;
+
 /// Tell the HTML loader the game is actually drawing frames (it holds its
 /// "Starting..." screen until `<body data-game-ready="1">` so it never cuts
 /// to a blank canvas while pipelines compile / assets decode). A few frames
@@ -315,12 +317,21 @@ pub fn sync_transforms(
     }
 }
 
-/// Keep the local player centered-ish: the camera eases toward them. (Uses
-/// floats freely — camera position is render-only state.)
+/// Where the camera is easing to, before the aim shift. Tracked separately
+/// from the camera transform so the follow lerp and the ADS ease don't fight
+/// over the same value (the shift rides on top of the focus point).
+#[derive(Resource, Default)]
+pub struct CameraFocus(Vec2);
+
+/// Keep the local player centered-ish: the camera eases toward them, offset by
+/// however far sights are raised. (Uses floats freely — camera position is
+/// render-only state.)
 pub fn camera_follow(
     local_players: Option<Res<LocalPlayers>>,
     players: Query<(&Player, &Pos)>,
     mut cameras: Query<&mut Transform, (With<Camera2d>, Without<Player>)>,
+    mut focus: ResMut<CameraFocus>,
+    ads: Res<Ads>,
     time: Res<Time>,
 ) {
     let Some(local) = local_players else { return };
@@ -330,7 +341,9 @@ pub fn camera_follow(
     };
     let Ok(mut camera) = cameras.single_mut() else { return };
     let (x, y) = pos.to_f32();
-    let target = Vec3::new(x, y, camera.translation.z);
     let t = (time.delta_secs() * 5.0).min(1.0);
-    camera.translation = camera.translation.lerp(target, t);
+    focus.0 = focus.0.lerp(Vec2::new(x, y), t);
+    let aim = focus.0 + ads.camera_offset();
+    camera.translation.x = aim.x;
+    camera.translation.y = aim.y;
 }

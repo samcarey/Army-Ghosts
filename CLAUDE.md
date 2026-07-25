@@ -127,28 +127,45 @@ Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_SIGNALING` env vars.
 - **Line of sight** (`client/src/vision.rs` + `client/assets/fog.wgsl`):
   render-only — the sim never computes visibility (it can't; every peer
   simulates every pawn). Each piece of cover casts a soft shadow away from the
-  local player into ONE `Mesh2d` triangle mesh rebuilt every frame.
-  `push_caster` sweeps rays across the angle the cover subtends and ramps alpha
-  from nothing where a ray *enters* the circle to full where it *leaves*, so
-  every rock and bush is lit on the player's side and rolls into darkness over
-  its back like a sphere lit from one side — and a thicket darkens bush by bush
-  from the inside instead of going flat at its front. Cover sprites therefore
-  draw UNDER the fog (rocks z 0.5, bushes 2.5, fog 5.0): the fog is what shades
-  them. Both flanks get a penumbra skirt fading to zero alpha, narrow at the
-  silhouette and widening with distance *past the caster* (an area-light
-  stand-in) — measuring that from the eye instead makes the skirt balloon
-  around the near side and halo over the lit flanks of its own rock. Bushes
-  blur ~1.8x wider than rocks, and `RIM_FEATHER` gives grazing rays a minimum
-  terminator so rocks don't get a hard rim where the ramp would otherwise
-  collapse to zero width. `BLUR_NEAR` (the floor) is the knob that controls the
-  softness you actually see, since most on-screen shadow edges sit close to
-  their caster; raising `BLUR_PER_UNIT` past ~0.3 instead just merges every
-  distant penumbra into mush. Rocks are opaque grey (anything in it is
-  genuinely hidden, not dimmed); bushes are 0.34 alpha and *stack*, since
-  overlapping triangles in one alpha-blended draw each multiply what gets
-  through. Bush shadows are emitted first so opaque rock shadows paint over
-  them. `NoFrustumCulling` is required: the Aabb is computed once when `Mesh2d`
-  is added, and the stale box blinks the fog out as the camera moves.
+  local player into ONE `Mesh2d` rebuilt each frame.
+- **The camera model.** Sight lines start `VIEW_PULLBACK` (50) *behind* the
+  pawn, at TWO points `SHOULDER_OFFSET` (30) either side — a third-person
+  camera looking over either shoulder, so you can peek around cover you're
+  hugging. The pullback is per-caster, always along that caster's own bearing,
+  so it behaves the same whichever way you face, and nothing between the
+  cameras and the pawn can occlude (each caster is swept independently; there
+  is no occlusion chain). Ground is dark only where BOTH shoulders are blocked.
+  Sight lines are parameterised by a shared lateral fraction `t`: line `t`
+  leaves the camera pair at `t * offset` and crosses the cover at `t * r`, so
+  t = ±1 are exactly the two umbra boundaries. Umbra half width is therefore
+  `offset + (r - offset) * x / dist`, which WIDENS when cover is broader than
+  the camera pair and CONVERGES TO A POINT when it isn't — with offset 30 most
+  cover is narrower, so most shadows are finite cones (a 16-radius rock at
+  range 60 closes ~126 units behind it). The "am I inside it?" test is on the
+  pawn, never the cameras, so standing in a bush hides you without blinding
+  you.
+- **Two effects, one number.** `Cast::coverage()` evaluates the same shadow the
+  mesh and shader produce, so what hides an enemy always matches the ground.
+  Full strength drives *player opacity* (`fade_hidden` — sampled at 5 points
+  across the body so someone edging out of cover fades in rather than pops, and
+  the local pawn never fades); terrain only gets `TERRAIN_SHADOW_SCALE` (0.5)
+  of it. Cover is therefore total against players while the ground behind it
+  merely dims, so you keep a sense of terrain you can't see into. NOTE bullets
+  and tracers are NOT faded — a hidden enemy's shots still show.
+- **Why it's shaped the way it is** (each of these was a visible bug once):
+  each shadow starts INSIDE its caster and ramps from nothing where a sight
+  line enters the circle to full where it leaves, so cover is lit on the
+  player's side and rolls into darkness over its back like a sphere lit from
+  one side — which is why cover draws UNDER the fog (rocks z 0.5, bushes 2.5,
+  fog 5.0). `RIM_FEATHER` gives grazing lines a minimum ramp, else every rock
+  gets a hard rim. The sideways falloff runs INWARD from the umbra boundary
+  (zero exactly on it), never outward, or the shadow bleeds onto lit ground; it
+  lives in `fog.wgsl` and rides in UV, evaluated per pixel, so the edge can be
+  tighter than the ray spacing without a denser mesh. It is a FRACTION of the
+  local half width (floored by `EDGE_MIN_FRACTION`) — an absolute width fights
+  a converging cone and nothing ever reaches full strength.
+  `NoFrustumCulling` is required: the Aabb is computed once when `Mesh2d` is
+  added, and the stale box blinks the fog out as the camera moves.
 
 ## Gotchas already hit (don't rediscover)
 

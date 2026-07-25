@@ -109,6 +109,7 @@ fn main() {
                 render::sync_transforms,
                 ads::update_aim_line,
                 vision::update_fog,
+                vision::fade_hidden,
                 render::camera_follow,
             )
                 .chain(),

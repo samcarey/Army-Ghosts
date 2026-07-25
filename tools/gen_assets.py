@@ -22,6 +22,21 @@ Outputs to client/assets/:
   rocks.png   - 4x1 grid of 96x96 boulder variants (RGBA, grayscale): irregular
                 harmonic outlines, lit from the top-left, faceted + grainy. The
                 engine picks the variant/rotation/tint from each rock's seed.
+  grass.png   - 128x128 tileable sward seen from above (RGB): soil under a mess
+                of short blade strokes, every stroke wrapped so the tile is
+                seamless. The ground mesh repeats it in WORLD space and tints it
+                per area from the sim's grass depth.
+  tufts.png   - 8x1 grid of 48x48 grass clumps (RGBA, COLOUR), modelled in 3D
+                and projected at the same 40 degrees as everything else, ground
+                line GRASS_BASE_FRAC up from the bottom edge. Scattered over the
+                arena and scaled to the local depth; drawn UNDER everything.
+  skirt.png   - 3x1 grid of 128x64 bands of the same blades (RGBA, COLOUR), same
+                frame layout. Drawn OVER whatever stands in the grass — this is
+                what actually hides a soldier's legs, so it is dense near the
+                ground line.
+  shade.png   - 64x64 white vertical gradient (RGBA), full at the bottom: the
+                shadow the grass throws up the front of whatever is standing in
+                it. Tinted dark green at draw time.
   bushes.png  - 6x1 grid of 96x96 bush variants (RGBA, COLOUR): fractal
                 branches with leaf capsules, modelled in 3D and projected at the
                 same 40 degrees off top-down as the soldier, so cover is seen
@@ -736,6 +751,281 @@ def gen_bushes(path, frame=96, variants=6):
     write_png(path, frame * variants, frame, rows, color_type=6)  # RGBA
 
 
+# ── Grass ────────────────────────────────────────────────────────────────────
+# Grass is three assets that have to agree with each other, because the engine
+# scales all of them off ONE number: the sim's `grass_height` in world units.
+#
+#   grass.png  the sward seen from above — the detail texture on the ground mesh
+#   tufts.png  clumps standing in it, scattered over the arena
+#   skirt.png  a wide band of the same blades, drawn OVER whatever is standing
+#              in the grass, which is what actually hides a soldier's legs
+#
+# The two 3D sheets are modelled and projected exactly like the soldier and the
+# bushes (x right, y forward, z up, `SOLDIER_TILT` off straight-down), so a
+# blade, a bush and a rifle all lean the same way. They share a frame layout so
+# the engine can size them with one formula: the clump's ground point sits
+# `GRASS_BASE_FRAC` up from the bottom edge (there is room below it for blades
+# drooping toward the camera) and a blade of model height 1.0 rises
+# `GRASS_RISE_FRAC` of the frame. So drawing grass of world height H means a
+# sprite `H * sin(TILT) / GRASS_RISE_FRAC` tall, anchored `GRASS_BASE_FRAC` up
+# from its bottom — see `client/src/grass.rs`.
+#
+# Colour is in the sheets (like the bushes, unlike the rocks); the engine's tint
+# is near-white and only drifts the hue from area to area.
+
+GRASS_BASE_FRAC = 0.15   # ground line, up from the bottom edge
+GRASS_RISE_FRAC = 0.82   # screen rise of a 1.0-unit blade, as a frame fraction
+
+# Blade colours: green through olive to dry straw. Real grass is never one
+# colour, and a lawn-green field reads as felt.
+_GRASS_GREENS = [
+    (0.21, 0.33, 0.13),
+    (0.27, 0.40, 0.15),
+    (0.33, 0.45, 0.17),
+    (0.38, 0.47, 0.20),
+    (0.45, 0.48, 0.23),
+    (0.51, 0.50, 0.27),  # dry
+]
+# Bare earth showing between the blades, and the light the tips catch.
+_GRASS_SOIL = (0.16, 0.17, 0.11)
+_GRASS_SUN = (0.70, 0.74, 0.48)
+
+
+def _blade(parts, base, azim, height, bend, rng):
+    """One blade of grass: a chain of tapering capsules arcing over.
+
+    Straight blades read as bristles, so the lateral offset grows with the
+    square of the height — the blade leaves the ground vertical and tips over
+    near the top, which is what makes a patch look soft.
+    """
+    ux, uy = math.cos(azim), math.sin(azim)
+    # Weighted toward the green end. A standing blade is seen whole, unlike the
+    # strokes in the ground tile that average against the soil between them, so
+    # an even draw from the palette makes every clump read as straw.
+    colour = _GRASS_GREENS[rng.choice((0, 0, 1, 1, 1, 2, 2, 3, 4, 5))]
+    pale = rng.uniform(0.03, 0.14)
+    segs = 3
+    nodes = []
+    for i in range(segs + 1):
+        t = i / segs
+        lat = bend * t * t * height
+        nodes.append((base[0] + ux * lat, base[1] + uy * lat, height * t * (1.06 - 0.06 * t)))
+    for i in range(segs):
+        t = (i + 0.5) / segs
+        z = nodes[i][2]
+        # Dark at the roots, lit at the tips: the sward shades itself, and that
+        # vertical ramp does more for depth than any per-blade trick.
+        dome = 0.52 + 0.40 * min(1.0, z / 0.85)
+        lit = tuple(max(0.0, min(1.0, c * dome)) for c in _mix(colour, _GRASS_SUN, pale * t))
+        parts.append((
+            nodes[i], nodes[i + 1],
+            0.050 * max(0.5, height) * (1.0 - 0.72 * t),
+            lit, 1.0,
+        ))
+
+
+def _render_grass_frame(parts, w, h, scale):
+    """Project, depth sort and composite blades into (premultiplied rgb, alpha).
+
+    Same projection as the bushes; the frame is `w x h` with the ground line at
+    `GRASS_BASE_FRAC` up from the bottom.
+    """
+    cos_t, sin_t = math.cos(SOLDIER_TILT), math.sin(SOLDIER_TILT)
+    base_py = h * (1.0 - GRASS_BASE_FRAC)
+
+    def place(p):
+        return (
+            w / 2 + p[0] * scale,
+            base_py - (p[1] * cos_t + p[2] * sin_t) * scale,
+            p[1] * sin_t - p[2] * cos_t,          # bigger = further away
+        )
+
+    flat = []
+    for a, b, r, colour, alpha in parts:
+        pax, pay, da = place(a)
+        pbx, pby, db = place(b)
+        flat.append((max(da, db), pax, pay, pbx, pby, r * scale, colour, alpha))
+    flat.sort(key=lambda p: -p[0])
+
+    prem = [[[0.0, 0.0, 0.0] for _ in range(w)] for _ in range(h)]
+    acc = [[0.0] * w for _ in range(h)]
+    light = (-0.42, -0.50, 0.76)
+
+    for idx, (_, ax, ay, bx, by, r, colour, alpha) in enumerate(flat):
+        x0 = max(0, int(min(ax, bx) - r - 2))
+        x1 = min(w - 1, int(max(ax, bx) + r + 2))
+        y0 = max(0, int(min(ay, by) - r - 2))
+        y1 = min(h - 1, int(max(ay, by) + r + 2))
+        seed = idx * 5.0
+        wobble = min(1.1, r * 0.7)
+        for py in range(y0, y1 + 1):
+            for px in range(x0, x1 + 1):
+                fx, fy = px + 0.5, py + 0.5
+                d2, along = _seg_nearest(fx, fy, ax, ay, bx, by)
+                d = math.sqrt(d2)
+                jitter = (_sample(_JITTER, fx * 0.7 + seed, fy * 0.7) - 0.5) * wobble
+                geom = max(0.0, min(1.0, r + jitter - d + 0.5))
+                if geom <= 0.0:
+                    continue
+                nx = (fx - (ax + (bx - ax) * along)) / r
+                ny = (fy - (ay + (by - ay) * along)) / r
+                nz = math.sqrt(max(0.0, 1.0 - nx * nx - ny * ny))
+                lam = nx * light[0] + ny * light[1] + nz * light[2]
+                shade = 0.90 + 0.16 * lam
+                cov = geom * alpha
+                for c in range(3):
+                    lit = max(0.0, min(1.0, colour[c] * shade))
+                    prem[py][px][c] = prem[py][px][c] * (1 - cov) + lit * cov
+                acc[py][px] = acc[py][px] * (1 - cov) + cov
+    return prem, acc
+
+
+def _write_grass_sheet(path, frames, w, h):
+    """One row of `(prem, acc)` frames, RGBA."""
+    rows = [bytearray() for _ in range(h)]
+    for prem, acc in frames:
+        for y in range(h):
+            row = rows[y]
+            for x in range(w):
+                a = acc[y][x]
+                if a <= 0.004:
+                    row += b'\x00\x00\x00\x00'
+                    continue
+                p = prem[y][x]
+                row += bytes(
+                    tuple(max(0, min(255, int(p[c] / a * 255))) for c in range(3))
+                    + (int(min(1.0, a) * 255),)
+                )
+    write_png(path, w * len(frames), h, rows, color_type=6)  # RGBA
+
+
+def gen_tufts(path, frame=48, variants=8):
+    """Clumps of grass standing on the ground, one row of `variants`.
+
+    Scattered over the arena and scaled to the local grass height, these are what
+    make deep grass *look* deep. They draw under everything, so they never hide
+    anyone — that is the skirt's job.
+    """
+    scale = frame * GRASS_RISE_FRAC / math.sin(SOLDIER_TILT)
+    frames = []
+    for v in range(variants):
+        rng = random.Random(4400 + v)
+        parts = []
+        for _ in range(rng.randint(10, 17)):
+            azim = rng.uniform(0, 2 * math.pi)
+            rad = rng.uniform(0.0, 0.15)
+            base = (math.cos(azim) * rad, math.sin(azim) * rad, 0.0)
+            _blade(parts, base, rng.uniform(0, 2 * math.pi),
+                   rng.uniform(0.52, 1.0), rng.uniform(0.10, 0.42), rng)
+        frames.append(_render_grass_frame(parts, frame, frame, scale))
+    _write_grass_sheet(path, frames, frame, frame)
+
+
+def gen_skirt(path, w=128, h=64, variants=3):
+    """A wide band of blades, drawn OVER whatever stands in the grass.
+
+    This is the mechanic, not decoration: scaled to the grass height at a pawn's
+    feet it swallows exactly as much of them as the grass is deep, which is why
+    it needs to be dense enough near the ground line to actually occlude. The mat
+    of short blades under the tall ones is what buys that opacity.
+    """
+    scale = h * GRASS_RISE_FRAC / math.sin(SOLDIER_TILT)
+    span = (w / 2 - 2) / scale                      # model half width in view
+    frames = []
+    for v in range(variants):
+        rng = random.Random(5100 + v)
+        parts = []
+
+        def somewhere():
+            """A base point, thinning out toward the frame edges, plus how much
+            to cut its blade down for being out there.
+
+            A band of blades with a hard vertical edge reads as a green
+            rectangle pasted over whatever it covers — which is exactly what you
+            see against a boulder. Thinning the ends isn't enough on its own;
+            they have to get SHORTER too, so the silhouette is a mound that dies
+            away into the surrounding grass."""
+            while True:
+                x = rng.uniform(-span, span)
+                edge = abs(x) / span
+                if rng.random() < 1.0 - edge ** 2.2:
+                    return x, 1.0 - 0.55 * edge * edge
+
+        # Mat first: short, dense, close to the ground — the opaque part.
+        for _ in range(100):
+            x, cut = somewhere()
+            _blade(parts, (x, rng.uniform(-0.10, 0.16), 0.0), rng.uniform(0, 2 * math.pi),
+                   rng.uniform(0.16, 0.42) * cut, rng.uniform(0.15, 0.60), rng)
+        # Then the blades that reach the full height, with a ragged top.
+        for _ in range(72):
+            x, cut = somewhere()
+            _blade(parts, (x, rng.uniform(-0.08, 0.14), 0.0), rng.uniform(0, 2 * math.pi),
+                   rng.uniform(0.62, 1.0) * cut, rng.uniform(0.08, 0.40), rng)
+        frames.append(_render_grass_frame(parts, w, h, scale))
+    _write_grass_sheet(path, frames, w, h)
+
+
+def gen_grass_tex(path, size=128):
+    """Tileable sward seen from above: the detail texture on the ground mesh.
+
+    Soil showing through a mess of short blades. Every stroke wraps, so the tile
+    is seamless in both axes; the engine repeats it in world space and multiplies
+    it by a near-white per-area tint.
+    """
+    rng = random.Random(9090)
+    prem = [[list(_GRASS_SOIL) for _ in range(size)] for _ in range(size)]
+    # Short strokes on purpose. This layer is the *base* — the sward you see
+    # even on thin ground — and the depth of the grass is carried by the tufts
+    # standing in it. Draw it with long blades and the whole arena reads as
+    # waist-high meadow no matter what `grass_height` says.
+    for _ in range(2600):
+        x0, y0 = rng.uniform(0, size), rng.uniform(0, size)
+        # Blades lean up-screen (away from the camera) far more often than down.
+        ang = -math.pi / 2 + rng.uniform(-0.85, 0.85)
+        length = rng.uniform(2.2, 5.5)
+        x1, y1 = x0 + math.cos(ang) * length, y0 + math.sin(ang) * length
+        r = rng.uniform(0.45, 0.85)
+        colour = _GRASS_GREENS[rng.randrange(len(_GRASS_GREENS))]
+        pale = rng.uniform(0.0, 0.18)
+        for py in range(int(min(y0, y1) - r - 2), int(max(y0, y1) + r + 3)):
+            for px in range(int(min(x0, x1) - r - 2), int(max(x0, x1) + r + 3)):
+                d2, along = _seg_nearest(px + 0.5, py + 0.5, x0, y0, x1, y1)
+                cov = max(0.0, min(1.0, r - math.sqrt(d2) + 0.5))
+                if cov <= 0.0:
+                    continue
+                # Tips (the far end of the stroke) catch the light.
+                lit = _mix(colour, _GRASS_SUN, pale * along)
+                for c in range(3):
+                    prem[py % size][px % size][c] = (
+                        prem[py % size][px % size][c] * (1 - cov) + lit[c] * cov
+                    )
+    rows = []
+    for y in range(size):
+        row = bytearray()
+        for x in range(size):
+            row += bytes(max(0, min(255, int(c * 255))) for c in prem[y][x])
+        rows.append(row)
+    write_png(path, size, size, rows, color_type=2)  # RGB
+
+
+def gen_shade(path, w=64, h=64):
+    """The shadow the grass throws on whatever is standing in it: opaque at the
+    ground line, gone by the top. Tinted dark and drawn over the sprite, so the
+    part of a soldier that isn't hidden outright is still down in the gloom."""
+    rows = []
+    for y in range(h):
+        row = bytearray()
+        # Full at the bottom of the frame, gone by the top, with the falloff
+        # biased low — grass shade is deepest right down among the roots.
+        a = (y / (h - 1)) ** 1.7
+        for x in range(w):
+            u = abs((x + 0.5) / w * 2 - 1)
+            edge = max(0.0, min(1.0, (1.0 - u) / 0.22))
+            row += bytes((255, 255, 255, int(a * edge * edge * (3 - 2 * edge) * 255)))
+        rows.append(row)
+    write_png(path, w, h, rows, color_type=6)  # RGBA
+
+
 if __name__ == '__main__':
     out = os.path.join(os.path.dirname(__file__), '..', 'client', 'assets')
     os.makedirs(out, exist_ok=True)
@@ -748,3 +1038,7 @@ if __name__ == '__main__':
     gen_chevron(os.path.join(out, 'chevron.png'))
     gen_rocks(os.path.join(out, 'rocks.png'))
     gen_bushes(os.path.join(out, 'bushes.png'))
+    gen_grass_tex(os.path.join(out, 'grass.png'))
+    gen_tufts(os.path.join(out, 'tufts.png'))
+    gen_skirt(os.path.join(out, 'skirt.png'))
+    gen_shade(os.path.join(out, 'shade.png'))

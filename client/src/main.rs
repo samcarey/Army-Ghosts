@@ -3,6 +3,7 @@
 //! the browser (the real target — mobile Safari/Chrome).
 
 mod ads;
+mod grass;
 mod hud;
 mod input;
 mod menu;
@@ -57,6 +58,7 @@ fn main() {
             }),
     )
     .add_plugins(vision::VisionPlugin)
+    .add_plugins(grass::GrassPlugin)
     .add_plugins(GgrsPlugin::<SessionConfig>::default())
     .add_plugins(SimPlugin::<SessionConfig>::default())
     .add_systems(ReadInputs, input::read_local_inputs)
@@ -71,6 +73,7 @@ fn main() {
         Startup,
         (
             render::setup_scene,
+            grass::setup_grass,
             net::begin_session_setup,
             touch::setup_overlay,
             hud::setup_hud,
@@ -108,9 +111,11 @@ fn main() {
                 stance::read_stance_input,
                 stance::update_stance_buttons,
                 render::attach_sprites,
+                grass::attach_curtains,
                 render::animate_players,
                 render::bullet_trails,
                 render::sync_transforms,
+                grass::update_curtains,
                 ads::update_aim_line,
                 vision::update_fog,
                 vision::fade_hidden,

@@ -68,6 +68,18 @@ pub const STANCE_CROUCH: u8 = 1;
 pub const STANCE_PRONE: u8 = 2;
 pub const STANCE_COUNT: usize = 3;
 
+/// How tall a pawn stands in each stance, world units — *physical* height, not
+/// the number of screen pixels the sprite covers (the 3/4 projection foreshortens
+/// everything vertical by `sin(tilt)`; the client applies that). Measured off the
+/// sprite sheet: 64 units is a soldier from boots to helmet, so a pawn is about
+/// 2.7 times as tall as they are wide. Crouching only takes a fifth off; going
+/// flat takes three quarters, which is the whole reason to do it.
+///
+/// The sim doesn't read these yet — they exist so that "how much of this pawn is
+/// buried in the grass" is one number both peers can agree on, the same way
+/// [`Bush`] is foliage the sim knows about but doesn't act on.
+pub const STANCE_HEIGHT: [i32; STANCE_COUNT] = [64, 52, 15];
+
 /// The only thing that crosses the network: one player's input for one tick.
 /// Kept tiny (ggrs serializes it with serde every tick). Joystick axes are
 /// quantized to i8 (-127..=127); `buttons` is a bitflag byte.
@@ -430,6 +442,106 @@ pub fn bush_layout() -> Vec<(i32, i32, Bush)> {
     bushes
 }
 
+// ── Procedural grass ────────────────────────────────────────────────────────
+//
+// Unlike the rocks and bushes there are no grass *entities*: the whole field is
+// one pure function of position, [`grass_height`], so nothing has to be spawned,
+// stored, rolled back or checksummed, and any peer (or the client's renderer, or
+// a test) can ask how deep the grass is anywhere for the cost of a few
+// multiplies. It is integer value noise for the same reason the layouts are
+// integer rejection sampling: every peer must get bit-identical answers, and
+// float noise on two different machines is exactly the kind of thing that
+// wouldn't.
+//
+// The client draws it and hides pawns in it; the sim doesn't act on it yet.
+
+/// Deepest grass, world units — a shade over the 64-unit standing soldier of
+/// [`STANCE_HEIGHT`], so the tallest patches genuinely swallow someone standing
+/// up in them. Reached only where every octave peaks together, which is rare.
+pub const GRASS_MAX_H: i32 = 72;
+/// Octave lattice sizes, world units. The coarsest is deliberately large next
+/// to the 800x600 arena — the point of it is a handful of *regions* per map, not
+/// a lawn of dots — with two finer octaves for patchiness and break-up. Only a
+/// few lattice points fall inside the arena at that scale, so the mix of open
+/// and deep ground is as much a property of [`GRASS_SEED`] as of the weights:
+/// both were picked together against the assertions in `grass_field_*`.
+const GRASS_CELL: i32 = 300;
+const GRASS_CELL_MID: i32 = 105;
+const GRASS_CELL_FINE: i32 = 38;
+const GRASS_SEED: u32 = 0x883D_58B3;
+
+/// Hash a lattice point to a well-mixed u32 (xorshift-multiply, same family as
+/// the rest of the layout code — no float, no RNG crate, no state).
+fn grass_hash(ix: i32, iy: i32, salt: u32) -> u32 {
+    let mut h = (ix as u32)
+        .wrapping_mul(0x27D4_EB2D)
+        ^ (iy as u32).wrapping_mul(0x1656_67B1)
+        ^ salt;
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x2545_F491);
+    h ^ (h >> 13)
+}
+
+/// `a + (b - a) * t` with `t` in 0..=FP.
+fn lerp_fp(a: i32, b: i32, t: i32) -> i32 {
+    a + (b - a) * t / FP
+}
+
+/// `t * t * (3 - 2t)` in FP — the same ease the renderer uses, so the noise has
+/// no lattice creases in it. Peaks at exactly FP, so nothing can overflow the
+/// interpolations above it.
+fn smoothstep_fp(t: i32) -> i32 {
+    t * t / FP * (3 * FP - 2 * t) / FP
+}
+
+/// One octave of value noise: bilinear interpolation between hashed lattice
+/// corners, eased. Returns 0..=FP.
+fn value_noise(x: i32, y: i32, cell: i32, salt: u32) -> i32 {
+    let (ix, iy) = (x.div_euclid(cell), y.div_euclid(cell));
+    // rem_euclid, so the lattice doesn't mirror across the origin (the arena
+    // straddles it — a seam down x=0 would be very visible).
+    let u = smoothstep_fp(x.rem_euclid(cell) * FP / cell);
+    let v = smoothstep_fp(y.rem_euclid(cell) * FP / cell);
+    let corner = |dx, dy| ((grass_hash(ix + dx, iy + dy, salt) >> 8 & 0xFF) as i32) * FP / 255;
+    let top = lerp_fp(corner(0, 0), corner(1, 0), u);
+    let bottom = lerp_fp(corner(0, 1), corner(1, 1), u);
+    lerp_fp(top, bottom, v)
+}
+
+/// How deep the grass is at a world point, in world units (0..=[`GRASS_MAX_H`]).
+///
+/// Three octaves of value noise — broad meadows, patchiness inside them, and a
+/// fine break-up so no edge reads as a contour line — then two corrections,
+/// both of which the field is bad without:
+///
+/// * **Contrast.** Summed octaves pile up around the middle, so the raw sum is
+///   shin-deep almost everywhere: no cover *and* no open ground. Stretching the
+///   middle half of the range over the whole output, eased at both ends, is what
+///   turns it into meadows and clearings (the test asserts the mix).
+/// * **Bias.** Even then, splitting the map evenly between deep and thin would
+///   make deep grass the default. Averaging the stretched value with its own
+///   square tilts the whole field toward thin ground, so the deep patches stay
+///   somewhere you move *to*.
+pub fn grass_height(x: i32, y: i32) -> i32 {
+    let n = (value_noise(x, y, GRASS_CELL, GRASS_SEED) * 100
+        + value_noise(x, y, GRASS_CELL_MID, GRASS_SEED ^ 0x9E37_79B9) * 34
+        + value_noise(x, y, GRASS_CELL_FINE, GRASS_SEED ^ 0x85EB_CA6B) * 12)
+        / 146;
+    let stretched = smoothstep_fp(((n - FP / 4) * 2).clamp(0, FP));
+    let shaped = (stretched * stretched / FP + stretched) / 2;
+    GRASS_MAX_H * shaped / FP
+}
+
+/// What fraction of a pawn standing at `(x, y)` in this stance the grass
+/// swallows, 0..=FP. Falls straight out of the two heights: the grass hides
+/// everything below its own tips, so going flat is worth far more than any
+/// stance bonus would be — 15 units of prone soldier disappears in grass that
+/// barely reaches a standing one's knees.
+pub fn grass_cover(x: i32, y: i32, stance: u8) -> i32 {
+    let body = STANCE_HEIGHT[(stance as usize).min(STANCE_COUNT - 1)];
+    (grass_height(x, y) * FP / body).min(FP)
+}
+
 /// Spawn the initial world: one pawn per player, the practice targets, and the
 /// procedural rock and bush fields. Both clients run this identically before
 /// the first tick.
@@ -696,6 +808,10 @@ fn tick_targets(mut targets: Query<&mut Target>) {
 mod tests {
     use super::*;
 
+    /// Deepest grass a crouching soldier still stands out of. A match arm needs
+    /// a constant and `STANCE_HEIGHT[STANCE_CROUCH as usize] - 1` isn't one.
+    const CROUCH_TOPS_OUT: i32 = 51;
+
     /// Walking straight at a boulder stops you; walking at it on an angle
     /// slides you around it (the whole point of pushing out along the normal).
     #[test]
@@ -791,6 +907,91 @@ mod tests {
                 assert!(!within(x, y, rx, ry, rock.r + bush.r), "bush inside a rock");
             }
         }
+    }
+
+    /// The grass has to be worth having: thin ground you can be caught on,
+    /// deep patches that hide a standing soldier, and most of the arena in
+    /// between. A curve tweak that quietly flattens the field into uniform
+    /// shin-deep grass would still *look* fine in a screenshot.
+    #[test]
+    fn grass_field_has_thin_and_deep_ground() {
+        let (mut thin, mut mid, mut deep, mut total) = (0, 0, 0, 0);
+        let (mut min, mut max) = (GRASS_MAX_H, 0);
+        let mut y = -ARENA_HALF_H;
+        while y <= ARENA_HALF_H {
+            let mut x = -ARENA_HALF_W;
+            while x <= ARENA_HALF_W {
+                let h = grass_height(x, y);
+                assert!((0..=GRASS_MAX_H).contains(&h), "grass out of range at {x},{y}: {h}");
+                min = min.min(h);
+                max = max.max(h);
+                // Ankle-deep / knee-to-waist / over a crouching soldier.
+                match h {
+                    0..=9 => thin += 1,
+                    10..=CROUCH_TOPS_OUT => mid += 1,
+                    _ => deep += 1,
+                }
+                total += 1;
+                x += 4;
+            }
+            y += 4;
+        }
+        println!("grass {min}..{max}: {thin} thin / {mid} mid / {deep} deep of {total}");
+        assert!(min <= 6, "nowhere in the arena is the grass thin: min {min}");
+        assert!(max >= 56, "no deep patches anywhere: max {max}");
+        // Deep cover should be a place you go to, not the default state.
+        assert!(deep * 100 / total >= 3, "too little deep grass");
+        assert!(deep * 100 / total <= 30, "too much deep grass");
+        assert!(thin * 100 / total >= 5, "nowhere is open enough to be exposed");
+    }
+
+    /// "Smooth transition between areas" is the whole spec of the field: a
+    /// player walking a straight line must never step over a wall of grass.
+    #[test]
+    fn grass_transitions_are_smooth() {
+        let mut worst = 0;
+        let mut y = -ARENA_HALF_H;
+        while y <= ARENA_HALF_H {
+            let mut x = -ARENA_HALF_W;
+            while x < ARENA_HALF_W {
+                let step = (grass_height(x + 2, y) - grass_height(x, y)).abs();
+                let up = (grass_height(x, y + 2) - grass_height(x, y)).abs();
+                worst = worst.max(step).max(up);
+                x += 2;
+            }
+            y += 2;
+        }
+        // 2 world units is a sixth of a pawn's radius. At the steepest point in
+        // the arena the grass deepens by about 2 units per unit walked — knee to
+        // waist over a pawn's width, which is the edge of a thicket rather than
+        // a seam. Anything much past that and the noise is showing its lattice.
+        println!("worst grass step over 2 units: {worst}");
+        assert!(worst <= 4, "grass steps {worst} units over 2 — visible seam");
+    }
+
+    /// Going flat is what the grass is for.
+    #[test]
+    fn grass_hides_a_prone_pawn_first() {
+        let mut sampled = 0;
+        let mut prone_hidden = 0;
+        let mut stand_hidden = 0;
+        let mut y = -ARENA_HALF_H;
+        while y <= ARENA_HALF_H {
+            let mut x = -ARENA_HALF_W;
+            while x <= ARENA_HALF_W {
+                let (flat, up) = (grass_cover(x, y, STANCE_PRONE), grass_cover(x, y, STANCE_STAND));
+                assert!(flat >= up, "prone must never be more exposed than standing");
+                assert!((0..=FP).contains(&up));
+                prone_hidden += (flat == FP) as i32;
+                stand_hidden += (up == FP) as i32;
+                sampled += 1;
+                x += 8;
+            }
+            y += 8;
+        }
+        println!("fully hidden: prone {prone_hidden}, standing {stand_hidden} of {sampled}");
+        assert!(prone_hidden * 2 > sampled, "crawling should hide you over most of the map");
+        assert!(stand_hidden * 20 < sampled, "standing should almost never be free cover");
     }
 
     #[test]

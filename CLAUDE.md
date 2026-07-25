@@ -187,6 +187,53 @@ Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_SIGNALING` env vars.
     boulders' 40, and `cover_size` scales each sheet by its own fill.
   * Leaves stop at `BUSH_LEAF_Z`: bare stems under the canopy are what makes
     the viewing angle read at all. Without them it's a green ball again.
+- **Grass** (`sim/src/lib.rs` `grass_height`/`grass_cover` + `client/src/grass.rs`
+  + `client/assets/grass.wgsl`): unlike rocks and bushes there are NO grass
+  entities. The depth anywhere is a pure integer function of position — three
+  octaves of value noise (lattice hash, smoothstep interpolation, cells
+  300/105/38), contrast-stretched and biased toward thin ground — so nothing is
+  spawned, stored, rolled back or checksummed, and the renderer, a test or a
+  future sim rule can all ask "how deep here?" for a few multiplies. It's
+  integer for the usual reason: float noise on two machines is exactly the sort
+  of thing that wouldn't match. Only a handful of lattice points land in the
+  800x600 arena at the coarse scale, so the *mix* of open and deep ground is as
+  much a property of `GRASS_SEED` as of the weights — the two were picked
+  together against the `grass_field_*` tests (currently ~21% ankle-deep, ~14%
+  over a crouching soldier, steepest gradient ~2 units per unit walked).
+  How much of you it hides is `grass_cover` = depth / `STANCE_HEIGHT`
+  (64/52/15 units): grass hides whatever is shorter than it, so going flat is
+  worth far more than any hand-tuned stance bonus — prone is fully hidden over
+  ~70% of the map, standing over ~2%. The client calls that same function rather
+  than reimplementing the ratio.
+  Rendering is three layers, all off that one number:
+  * **The field** — one static `Mesh2d` over the arena (`GrassMaterial`, another
+    vertex-color material for the `ColorMaterial` reason below), textured with
+    `grass.png` tiled in WORLD uv and tinted per vertex: dry/pale/see-through
+    over thin ground (the dirt tile shows through the vertex alpha), lush and
+    opaque in the deep. Vertex interpolation is what makes the area-to-area
+    transitions smooth for free. The shader crosses two octaves of the same
+    texture at different scales, or the 128px tile reads as a grid.
+  * **Tufts** — ~1300 clumps on a jittered grid, scaled to the local depth,
+    plus a second offset pass only where it's deep (density carries depth as
+    much as height does). They draw UNDER everything at z -8.5, so they never
+    hide anyone. Baked into a SECOND static mesh (quads with atlas UVs, emitted
+    north-to-south so near clumps cover far ones) rather than spawned as
+    sprites: nothing about a tuft ever changes, and on a phone the scarce
+    resource is per-frame sprite extraction, not triangles. Same material, with
+    the octave crossing turned off — atlas UVs would sample the neighbouring
+    frame.
+  * **Curtains** — the mechanic: a band of the same blades (`skirt.png`) drawn
+    OVER whatever stands in the grass as a child entity, sized by `cover_px`,
+    with a `shade.png` gradient under it so the part still showing is at least
+    in the gloom. Pawns re-derive their profile from `Stance` every frame
+    (`STANCE_CURTAIN`, measured off `soldier.png` bboxes — prone's ground line
+    hangs 17px BELOW `Pos` because that sprite is anchored mid-body); rocks and
+    bushes get one sized off their radius at spawn.
+  Two things worth knowing before touching it: the tuft/skirt sheets share a
+  frame layout (`GRASS_BASE_FRAC`/`GRASS_RISE_FRAC`) so one formula sizes both,
+  and the local player's curtain is drawn at half alpha — everyone else's peer
+  hides you completely, but lying in deep grass shouldn't mean staring at a lawn
+  wondering where you are.
 - **Line of sight** (`client/src/vision.rs` + `client/assets/fog.wgsl`):
   render-only — the sim never computes visibility (it can't; every peer
   simulates every pawn). Each piece of cover casts a soft shadow away from the

@@ -319,7 +319,10 @@ pub fn attach_sprites(
         // boulders out of four textures still read as a dozen boulders — and
         // every peer draws the same field (cosmetic, but it keeps screenshots
         // comparable across machines).
-        let shade = 0.38 + (rock.seed / 1024 % 64) as f32 * 0.0022;
+        // Lightened when the grass went in: against an olive ground tile 0.38
+        // read as stone, but with a sward around it a dark boulder reads as a
+        // hole in the ground rather than a rock standing in the field.
+        let shade = 0.52 + (rock.seed / 1024 % 64) as f32 * 0.0022;
         let angle = (rock.seed / ROCK_VARIANTS % 360) as f32 * std::f32::consts::PI / 180.0;
         commands.entity(entity).insert((
             Sprite {

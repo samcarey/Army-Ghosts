@@ -159,6 +159,18 @@ const TRAIL_ALPHA: f32 = 0.45;
 /// frames' travel is a rollback teleport — skip it rather than streak it.
 const TRAIL_MAX_SEG: f32 = 48.0;
 
+/// Marks a sprite that stands ON the ground, so its draw order comes from where
+/// it stands rather than from a fixed layer: `grass::y_sort` of its `Pos.y`,
+/// plus this bias.
+///
+/// Everything in the field shares one z band — pawns, boulders, practice
+/// dummies and every band of grass — which is what makes the grass behave: the
+/// clumps between you and the camera are drawn after you and swallow your legs,
+/// the ones behind you are drawn before you and don't. It also means you can now
+/// walk *behind* a boulder as well as in front of one.
+#[derive(Component)]
+pub struct Grounded(f32);
+
 /// Render-only per-bullet trail bookkeeping.
 #[derive(Component, Default)]
 pub struct TrailState {
@@ -188,10 +200,9 @@ const PLAYER_COLORS: [Color; 8] = [
 ];
 
 const Z_GROUND: f32 = -10.0;
-const Z_TARGET: f32 = 0.0;
-/// Boulders sit under the pawns, so you can walk in front of one.
-const Z_ROCK: f32 = 0.5;
-const Z_PLAYER: f32 = 1.0;
+/// Bullets and their trails ride ABOVE the y-sorted band: a round in flight is
+/// off the ground, and a tracer that disappeared behind a tuft would read as a
+/// bug rather than as cover.
 const Z_TRAIL: f32 = 1.9;
 const Z_BULLET: f32 = 2.0;
 /// Cover draws *below* the fog mesh at z=5.0 (`vision.rs`) — on purpose: each
@@ -280,7 +291,8 @@ pub fn attach_sprites(
             // re-anchors when the stance changes).
             Anchor(stance_anchor(STANCE_STAND)),
             WalkAnim::default(),
-            Transform::from_xyz(0.0, 0.0, Z_PLAYER),
+            Grounded(0.0),
+            Transform::default(),
         ));
     }
     for (entity, bullet) in &new_bullets {
@@ -311,7 +323,8 @@ pub fn attach_sprites(
     for entity in &new_targets {
         commands.entity(entity).insert((
             Sprite::from_color(Color::srgb(0.55, 0.55, 0.55), Vec2::splat((TARGET_R * 2) as f32)),
-            Transform::from_xyz(0.0, 0.0, Z_TARGET),
+            Grounded(0.0),
+            Transform::default(),
         ));
     }
     for (entity, rock) in &new_rocks {
@@ -335,7 +348,10 @@ pub fn attach_sprites(
                 custom_size: Some(cover_size(rock.r, ROCK_FILL_PX)),
                 ..default()
             },
-            Transform::from_xyz(0.0, 0.0, Z_ROCK).with_rotation(Quat::from_rotation_z(angle)),
+            // Half a hair under the pawns: a boulder and a soldier on the same
+            // line are close enough that the tie should go to the soldier.
+            Grounded(-0.002),
+            Transform::from_rotation(Quat::from_rotation_z(angle)),
         ));
     }
     for (entity, bush) in &new_bushes {
@@ -477,14 +493,20 @@ pub fn bullet_trails(
 /// Mirror integer sim positions into render transforms, and flash targets that
 /// were just hit.
 pub fn sync_transforms(
-    mut movers: Query<(&Pos, &mut Transform), Without<Bullet>>,
+    mut movers: Query<(&Pos, Option<&Grounded>, &mut Transform), Without<Bullet>>,
     mut bullets: Query<(&Pos, &MuzzleLift, &mut Transform), With<Bullet>>,
     mut targets: Query<(&Target, &mut Sprite)>,
 ) {
-    for (pos, mut transform) in &mut movers {
+    for (pos, grounded, mut transform) in &mut movers {
         let (x, y) = pos.to_f32();
         transform.translation.x = x;
         transform.translation.y = y;
+        // Anything standing in the field re-sorts as it walks: draw order is
+        // where your feet are, so the grass in front of you covers you and the
+        // grass behind you doesn't (see `grass::y_sort`).
+        if let Some(grounded) = grounded {
+            transform.translation.z = crate::grass::y_sort(y) + grounded.0;
+        }
     }
     // Rounds fly at the weapon height they were fired from, not ankle height.
     for (pos, lift, mut transform) in &mut bullets {

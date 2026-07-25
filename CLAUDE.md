@@ -200,11 +200,12 @@ Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_SIGNALING` env vars.
   much a property of `GRASS_SEED` as of the weights — the two were picked
   together against the `grass_field_*` tests (currently ~21% ankle-deep, ~14%
   over a crouching soldier, steepest gradient ~2 units per unit walked).
-  How much of you it hides is `grass_cover` = depth / `STANCE_HEIGHT`
-  (64/52/15 units): grass hides whatever is shorter than it, so going flat is
-  worth far more than any hand-tuned stance bonus — prone is fully hidden over
-  ~70% of the map, standing over ~2%. The client calls that same function rather
-  than reimplementing the ratio.
+  How much of you it hides is *emergent* — it's whichever clumps happen to stand
+  between you and the camera (see y-sorting below) — but the sim still states the
+  rule: `grass_cover` = depth / `STANCE_HEIGHT` (64/52/15 units), i.e. grass
+  hides whatever is shorter than it. Prone qualifies over ~70% of the map,
+  standing over ~2%, which is why going flat beats any hand-tuned stance bonus.
+  The shade sprite follows that number.
   Rendering is three layers, all off that one number:
   * **The field** — one static `Mesh2d` over the arena (`GrassMaterial`, another
     vertex-color material for the `ColorMaterial` reason below), textured with
@@ -213,27 +214,34 @@ Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_SIGNALING` env vars.
     opaque in the deep. Vertex interpolation is what makes the area-to-area
     transitions smooth for free. The shader crosses two octaves of the same
     texture at different scales, or the 128px tile reads as a grid.
-  * **Tufts** — ~1300 clumps on a jittered grid, scaled to the local depth,
-    plus a second offset pass only where it's deep (density carries depth as
-    much as height does). They draw UNDER everything at z -8.5, so they never
-    hide anyone. Baked into a SECOND static mesh (quads with atlas UVs, emitted
-    north-to-south so near clumps cover far ones) rather than spawned as
-    sprites: nothing about a tuft ever changes, and on a phone the scarce
-    resource is per-frame sprite extraction, not triangles. Same material, with
+  * **Tufts** — ~2000 small clumps on a fine jittered grid (`TUFT_STEP` 6, with
+    acceptance from `tuft_density`, so depth thickens the field as well as
+    heightening it), each drawn as tall as the grass is deep where it stands.
+    Baked into static meshes (quads with atlas UVs) rather than sprites:
+    nothing about a tuft ever changes, and on a phone the scarce resource is
+    per-frame sprite extraction, not triangles. Same material as the field with
     the octave crossing turned off — atlas UVs would sample the neighbouring
     frame.
-  * **Curtains** — the mechanic: a band of the same blades (`skirt.png`) drawn
-    OVER whatever stands in the grass as a child entity, sized by `cover_px`,
-    with a `shade.png` gradient under it so the part still showing is at least
-    in the gloom. Pawns re-derive their profile from `Stance` every frame
-    (`STANCE_CURTAIN`, measured off `soldier.png` bboxes — prone's ground line
-    hangs 17px BELOW `Pos` because that sprite is anchored mid-body); rocks and
-    bushes get one sized off their radius at spawn.
-  Two things worth knowing before touching it: the tuft/skirt sheets share a
-  frame layout (`GRASS_BASE_FRAC`/`GRASS_RISE_FRAC`) so one formula sizes both,
-  and the local player's curtain is drawn at half alpha — everyone else's peer
-  hides you completely, but lying in deep grass shouldn't mean staring at a lawn
-  wondering where you are.
+  * **Shade** — the only thing parented to a pawn: a `shade.png` gradient over
+    its lower body, reaching as far up as `grass_cover` says the grass buries
+    it (`STANCE_SHADE`, measured off `soldier.png` bboxes — prone's ground line
+    hangs 17px BELOW `Pos` because that sprite is anchored mid-body).
+  **Y-SORTING is what makes the grass behave, and it is not optional.** Grass is
+  baked one mesh per `GRASS_BAND` (12-unit) slice of the arena, each drawn at
+  the z of its SOUTHERN edge, and everything standing on the ground — pawns,
+  boulders, practice dummies — carries `render::Grounded` and takes its z from
+  `grass::y_sort(Pos.y)` in `sync_transforms`. So the clumps between you and the
+  camera are drawn after you and swallow your legs, the ones behind you are
+  drawn before you and don't, and walking north uncovers you a clump at a time.
+  A mesh has one sort key, which is the only reason bands exist; a band's worth
+  of grass north of you can still draw over you (12 units, half a pawn's width,
+  invisible in practice). Consequences: the whole band `Z_SORT_LO..Z_SORT_HI`
+  (0.1..1.8) is spoken for, so bullets (2.0), trails (1.9), the ADS aim line
+  (1.85) and bush canopies (2.5) must stay above it; and boulders now sort with
+  pawns, so you can walk behind one as well as in front of it.
+  The predecessor was a "curtain": a band of blades parented to each pawn and
+  scaled by `grass_cover`. Do not go back to it. Grass that moves with you reads
+  as grass you are *wearing*, and it covered heads while boots stuck out.
 - **Line of sight** (`client/src/vision.rs` + `client/assets/fog.wgsl`):
   render-only — the sim never computes visibility (it can't; every peer
   simulates every pawn). Each piece of cover casts a soft shadow away from the

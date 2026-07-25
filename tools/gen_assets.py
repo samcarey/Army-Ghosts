@@ -26,14 +26,12 @@ Outputs to client/assets/:
                 of short blade strokes, every stroke wrapped so the tile is
                 seamless. The ground mesh repeats it in WORLD space and tints it
                 per area from the sim's grass depth.
-  tufts.png   - 8x1 grid of 48x48 grass clumps (RGBA, COLOUR), modelled in 3D
+  tufts.png   - 12x1 grid of 28x48 grass clumps (RGBA, COLOUR), modelled in 3D
                 and projected at the same 40 degrees as everything else, ground
-                line GRASS_BASE_FRAC up from the bottom edge. Scattered over the
-                arena and scaled to the local depth; drawn UNDER everything.
-  skirt.png   - 3x1 grid of 128x64 bands of the same blades (RGBA, COLOUR), same
-                frame layout. Drawn OVER whatever stands in the grass — this is
-                what actually hides a soldier's legs, so it is dense near the
-                ground line.
+                line GRASS_BASE_FRAC up from the bottom edge. Small and narrow:
+                the engine scatters thousands of them, scaled to the local
+                depth, and y-sorts them against everything standing in the
+                field.
   shade.png   - 64x64 white vertical gradient (RGBA), full at the bottom: the
                 shadow the grass throws up the front of whatever is standing in
                 it. Tinted dark green at draw time.
@@ -752,18 +750,20 @@ def gen_bushes(path, frame=96, variants=6):
 
 
 # ── Grass ────────────────────────────────────────────────────────────────────
-# Grass is three assets that have to agree with each other, because the engine
-# scales all of them off ONE number: the sim's `grass_height` in world units.
+# Grass is two assets that have to agree with each other, because the engine
+# scales both off ONE number: the sim's `grass_height` in world units.
 #
 #   grass.png  the sward seen from above — the detail texture on the ground mesh
-#   tufts.png  clumps standing in it, scattered over the arena
-#   skirt.png  a wide band of the same blades, drawn OVER whatever is standing
-#              in the grass, which is what actually hides a soldier's legs
+#   tufts.png  small clumps standing in it, scattered over the arena in their
+#              thousands and y-sorted, so the ones SOUTH of a soldier cover his
+#              legs and the ones north of him don't. (There used to be a third
+#              sheet, a band of blades drawn over each pawn. It moved with them:
+#              you wore the grass rather than stood in it.)
 #
-# The two 3D sheets are modelled and projected exactly like the soldier and the
+# The tuft sheet is modelled and projected exactly like the soldier and the
 # bushes (x right, y forward, z up, `SOLDIER_TILT` off straight-down), so a
-# blade, a bush and a rifle all lean the same way. They share a frame layout so
-# the engine can size them with one formula: the clump's ground point sits
+# blade, a bush and a rifle all lean the same way. Its frame layout lets the
+# engine size a clump with one formula: the clump's ground point sits
 # `GRASS_BASE_FRAC` up from the bottom edge (there is room below it for blades
 # drooping toward the camera) and a blade of model height 1.0 rises
 # `GRASS_RISE_FRAC` of the frame. So drawing grass of world height H means a
@@ -899,68 +899,29 @@ def _write_grass_sheet(path, frames, w, h):
     write_png(path, w * len(frames), h, rows, color_type=6)  # RGBA
 
 
-def gen_tufts(path, frame=48, variants=8):
-    """Clumps of grass standing on the ground, one row of `variants`.
+def gen_tufts(path, w=28, h=48, variants=12):
+    """Small clumps of grass standing on the ground, one row of `variants`.
 
-    Scattered over the arena and scaled to the local grass height, these are what
-    make deep grass *look* deep. They draw under everything, so they never hide
-    anyone — that is the skirt's job.
+    Deliberately NARROW and only a few blades each: the arena is covered by
+    thousands of these rather than a few hundred big ones, so that walking north
+    takes you through the grass a clump at a time instead of stepping over
+    obvious tussocks. They keep the full model height, though — a clump's height
+    is the depth of the grass where it stands, and the whole occlusion model
+    rests on that being honest.
     """
-    scale = frame * GRASS_RISE_FRAC / math.sin(SOLDIER_TILT)
+    scale = h * GRASS_RISE_FRAC / math.sin(SOLDIER_TILT)
     frames = []
     for v in range(variants):
         rng = random.Random(4400 + v)
         parts = []
-        for _ in range(rng.randint(10, 17)):
+        for _ in range(rng.randint(4, 8)):
             azim = rng.uniform(0, 2 * math.pi)
-            rad = rng.uniform(0.0, 0.15)
+            rad = rng.uniform(0.0, 0.07)
             base = (math.cos(azim) * rad, math.sin(azim) * rad, 0.0)
+            # Bend is capped by the narrow frame: a blade that arcs further than
+            # this leaves the quad and gets cut off mid-leaf.
             _blade(parts, base, rng.uniform(0, 2 * math.pi),
-                   rng.uniform(0.52, 1.0), rng.uniform(0.10, 0.42), rng)
-        frames.append(_render_grass_frame(parts, frame, frame, scale))
-    _write_grass_sheet(path, frames, frame, frame)
-
-
-def gen_skirt(path, w=128, h=64, variants=3):
-    """A wide band of blades, drawn OVER whatever stands in the grass.
-
-    This is the mechanic, not decoration: scaled to the grass height at a pawn's
-    feet it swallows exactly as much of them as the grass is deep, which is why
-    it needs to be dense enough near the ground line to actually occlude. The mat
-    of short blades under the tall ones is what buys that opacity.
-    """
-    scale = h * GRASS_RISE_FRAC / math.sin(SOLDIER_TILT)
-    span = (w / 2 - 2) / scale                      # model half width in view
-    frames = []
-    for v in range(variants):
-        rng = random.Random(5100 + v)
-        parts = []
-
-        def somewhere():
-            """A base point, thinning out toward the frame edges, plus how much
-            to cut its blade down for being out there.
-
-            A band of blades with a hard vertical edge reads as a green
-            rectangle pasted over whatever it covers — which is exactly what you
-            see against a boulder. Thinning the ends isn't enough on its own;
-            they have to get SHORTER too, so the silhouette is a mound that dies
-            away into the surrounding grass."""
-            while True:
-                x = rng.uniform(-span, span)
-                edge = abs(x) / span
-                if rng.random() < 1.0 - edge ** 2.2:
-                    return x, 1.0 - 0.55 * edge * edge
-
-        # Mat first: short, dense, close to the ground — the opaque part.
-        for _ in range(100):
-            x, cut = somewhere()
-            _blade(parts, (x, rng.uniform(-0.10, 0.16), 0.0), rng.uniform(0, 2 * math.pi),
-                   rng.uniform(0.16, 0.42) * cut, rng.uniform(0.15, 0.60), rng)
-        # Then the blades that reach the full height, with a ragged top.
-        for _ in range(72):
-            x, cut = somewhere()
-            _blade(parts, (x, rng.uniform(-0.08, 0.14), 0.0), rng.uniform(0, 2 * math.pi),
-                   rng.uniform(0.62, 1.0) * cut, rng.uniform(0.08, 0.40), rng)
+                   rng.uniform(0.50, 1.0), rng.uniform(0.05, 0.17), rng)
         frames.append(_render_grass_frame(parts, w, h, scale))
     _write_grass_sheet(path, frames, w, h)
 
@@ -1040,5 +1001,4 @@ if __name__ == '__main__':
     gen_bushes(os.path.join(out, 'bushes.png'))
     gen_grass_tex(os.path.join(out, 'grass.png'))
     gen_tufts(os.path.join(out, 'tufts.png'))
-    gen_skirt(os.path.join(out, 'skirt.png'))
     gen_shade(os.path.join(out, 'shade.png'))

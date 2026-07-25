@@ -9,21 +9,25 @@
 //!     patchy over thin ground (the dirt tile shows through the alpha), lush and
 //!     opaque in the deep patches. Vertex interpolation across the grid is what
 //!     makes area-to-area transitions smooth for free.
-//!   * **Tufts.** Clumps scattered on a jittered grid, each scaled to the depth
-//!     where it stands, and all of them baked into a second static mesh rather
-//!     than spawned as ~1300 sprites nothing ever moves. They draw *under*
-//!     everything, so they never hide anyone; they're what makes deep grass read
-//!     as deep before you walk into it.
-//!   * **Curtains.** The mechanic. A band of the same blades drawn *over*
-//!     whatever is standing in the grass, tall enough to swallow exactly as much
-//!     of it as the grass is deep, plus a shadow gradient above that so the part
-//!     still showing is at least down in the gloom.
+//!   * **Tufts.** Thousands of small clumps scattered on a fine jittered grid,
+//!     each as tall as the grass is deep where it stands, baked into static
+//!     meshes — one per horizontal band of the arena — and **y-sorted** against
+//!     everything else standing on the ground.
+//!   * **Shade.** The one thing that rides on a pawn: the gloom down among the
+//!     blades, reaching as far up the body as the grass buries it.
 //!
-//! How much of a pawn a curtain swallows is [`army_ghosts_sim::grass_cover`]:
-//! grass hides everything shorter than itself, so it's the ratio of the local
-//! depth to the pawn's `STANCE_HEIGHT`. That makes going flat worth far more
-//! than any hand-tuned stance bonus — a prone soldier is 15 units tall and
-//! disappears in grass a standing one barely notices.
+//! The y-sorting is the whole mechanic. Nothing hides a soldier except the
+//! clumps that happen to stand between him and the camera, so what you get is
+//! what the geometry says: walk north through a patch and the blades in front of
+//! you drop behind you a clump at a time, uncovering you gradually; go prone and
+//! the same field swallows you. Deeper grass hides more because it is taller and
+//! thicker, not because anything is scaling a mask.
+//!
+//! It replaced a "curtain" — a band of blades parented to each pawn and sized
+//! from [`army_ghosts_sim::grass_cover`]. It was cheap and it was wrong: the
+//! grass moved with you, so you wore it rather than stood in it, and clumps north
+//! of you covered your head while your boots stuck out below them. `grass_cover`
+//! survives as the rule the shade follows.
 //!
 //! Render-only, all of it. The sim never asks who can see what (it can't —
 //! every peer simulates every pawn), exactly like `vision.rs`.
@@ -38,11 +42,10 @@ use bevy::render::render_resource::{
 use bevy::shader::ShaderRef;
 use bevy::sprite::Anchor;
 use bevy::sprite_render::{AlphaMode2d, Material2d, Material2dKey, Material2dPlugin};
-use bevy_ggrs::LocalPlayers;
 
 use army_ghosts_sim::{
-    grass_cover, grass_height, Bush, Player, Pos, Rock, Stance, ARENA_HALF_H, ARENA_HALF_W, FP,
-    GRASS_MAX_H, STANCE_COUNT, STANCE_HEIGHT,
+    grass_cover, grass_height, Player, Pos, Stance, ARENA_HALF_H, ARENA_HALF_W, FP, GRASS_MAX_H,
+    STANCE_COUNT,
 };
 
 /// The projection foreshortening: one world unit of *height* draws this far up
@@ -50,11 +53,13 @@ use army_ghosts_sim::{
 /// sheets are all modelled at (`tools/gen_assets.py`), which is why a blade, a
 /// canopy and a rifle all lean together.
 pub const GRASS_VERT: f32 = 0.6428;
-/// Frame layout shared by `tufts.png` and `skirt.png` (see `gen_assets.py`):
-/// the ground line sits this far up from the bottom edge, and a blade of model
-/// height 1.0 rises this fraction of the frame.
+/// Frame layout of `tufts.png` (see `gen_assets.py`): the ground line sits this
+/// far up from the bottom edge, and a blade of model height 1.0 rises this
+/// fraction of the frame.
 const GRASS_BASE_FRAC: f32 = 0.15;
 const GRASS_RISE_FRAC: f32 = 0.82;
+/// Frame aspect, so a clump `h` px tall is drawn `h * TUFT_ASPECT` wide.
+const TUFT_ASPECT: f32 = 28.0 / 48.0;
 
 /// World px the detail texture repeats over. Small enough that blades are blade
 /// sized; the shader crosses two octaves of it so the tiling doesn't read.
@@ -64,76 +69,66 @@ const GRASS_TEX_PX: f32 = 128.0;
 /// vertex interpolation can carry without banding.
 const GRASS_GRID: i32 = 20;
 
-/// Tuft grid spacing, and the depth below which a patch isn't worth a clump.
-const TUFT_STEP: i32 = 20;
-const TUFT_MIN_H: i32 = 8;
-/// Deep grass gets a second, offset pass of clumps — density carries depth as
-/// much as height does.
-const TUFT_DENSE_H: i32 = 30;
-const TUFT_VARIANTS: usize = 8;
+/// Candidate grid for scattering clumps, world units. Fine, because the field
+/// has to be *continuous* — thousands of small tufts you walk into one at a time,
+/// not a few hundred tussocks you step over. Acceptance comes from the depth (see
+/// `tuft_density`), so the grid only sets the ceiling.
+const TUFT_STEP: i32 = 6;
+/// Depth below which the ground is bare — the sward texture is the grass there.
+const TUFT_MIN_H: i32 = 6;
+const TUFT_VARIANTS: usize = 12;
 
-const SKIRT_VARIANTS: usize = 3;
-const SKIRT_W: u32 = 128;
-const SKIRT_H: u32 = 64;
-
-/// Between the dirt tile (-10) and everything that stands on it. Tufts sit just
-/// above the field mesh and below all cover and pawns.
+/// The ground itself, under everything (the dirt tile is at -10).
 const Z_FIELD: f32 = -9.0;
-const Z_TUFT: f32 = -8.5;
-/// Curtains ride on their owner, just in front of it: shadow first, blades over
-/// the top. Small enough offsets that they stay inside the owner's z band.
-const Z_CURTAIN_SHADE: f32 = 0.02;
-const Z_CURTAIN: f32 = 0.04;
+/// The z band that y-sorting maps the arena into. Everything standing on the
+/// ground — pawns, boulders, targets and every band of grass — gets a z in here
+/// from its ground line, so what's drawn over what falls out of who is nearer the
+/// camera. Bullets (2.0), their trails (1.9) and bush canopies (2.5) sit above
+/// the whole band on purpose.
+pub const Z_SORT_LO: f32 = 0.1;
+pub const Z_SORT_HI: f32 = 1.8;
+/// How thick a slice of the arena shares one grass mesh, world units. Grass is
+/// baked per band rather than per clump: a mesh has ONE sort key, so this is the
+/// resolution of the y-sorting. Anything up to a band's worth of grass north of
+/// you can therefore still draw over you — at 12 units that's half a pawn's
+/// width, and blades are soft enough that you don't see it. Halving it doubles
+/// the draw calls.
+const GRASS_BAND: i32 = 12;
+
+/// The shade rides a hair in front of its pawn — enough to beat the sprite it
+/// darkens, small enough to stay inside that pawn's y-sorted slot.
+const Z_SHADE_LIFT: f32 = 0.01;
 
 /// Grass shade. Not black — a shadow among green blades is still green, and
-/// pure black over a soldier reads as a hole in the sprite. Weak, too: it is
-/// the gloom *between* blades, and at full strength it turns every boulder
-/// standing in deep grass into a dark hole in the ground.
+/// pure black over a soldier reads as a hole in the sprite. Weak, too: the
+/// blades in front of you are what actually hide you, and this is only the
+/// gloom down among them.
 const SHADE_COLOR: Color = Color::srgb(0.10, 0.14, 0.07);
-const SHADE_ALPHA: f32 = 0.34;
-/// How far above the blade tips the shadow reaches, as a multiple of the
-/// curtain height. Grass doesn't stop shading you the moment it stops touching
-/// you.
-const SHADE_REACH: f32 = 1.4;
-/// Your own pawn's curtain is drawn this much weaker (and its shadow weaker
-/// still). Everyone else sees you at full strength — this is only so that lying
-/// in deep grass doesn't mean staring at a patch of lawn wondering where you
-/// are.
-const LOCAL_CURTAIN_ALPHA: f32 = 0.34;
-const LOCAL_SHADE_ALPHA: f32 = 0.2;
+const SHADE_ALPHA: f32 = 0.30;
 
 /// Where a pawn meets the grass, per stance: `base` is its ground line relative
-/// to `Pos` (negative = the sprite hangs below), `span` how tall it draws above
-/// that line, `height` how tall it physically is, `width` how wide a curtain it
-/// needs. The three px numbers are measured off `soldier.png` bounding boxes
-/// (frame px x `SOLDIER_SIZE / SOLDIER_FRAME`); prone hangs below `Pos` because
-/// that sprite is anchored mid-body, and is the widest because a soldier lying
-/// side-on is as long as a standing one is tall.
-const STANCE_CURTAIN: [Curtain; STANCE_COUNT] = [
-    Curtain { base: -5.1, span: 43.8, height: STANCE_HEIGHT[0] as f32, width: 46.0 },
-    Curtain { base: -6.6, span: 38.2, height: STANCE_HEIGHT[1] as f32, width: 46.0 },
-    Curtain { base: -17.2, span: 38.3, height: STANCE_HEIGHT[2] as f32, width: 62.0 },
+/// to `Pos` (negative = the sprite hangs below) and `span` how tall it draws
+/// above that line. Measured off `soldier.png` bounding boxes (frame px x
+/// `SOLDIER_SIZE / SOLDIER_FRAME`); prone hangs below `Pos` because that sprite
+/// is anchored mid-body, and is the widest because a soldier lying side-on is as
+/// long as a standing one is tall.
+const STANCE_SHADE: [ShadeProfile; STANCE_COUNT] = [
+    ShadeProfile { base: -5.1, span: 43.8, width: 40.0 },
+    ShadeProfile { base: -6.6, span: 38.2, width: 40.0 },
+    ShadeProfile { base: -17.2, span: 38.3, width: 54.0 },
 ];
 
-/// One thing standing in the grass, as far as the grass is concerned.
+/// How a pawn sits in the grass, for the purpose of shading it.
 #[derive(Component, Copy, Clone)]
-pub struct Curtain {
+pub struct ShadeProfile {
     base: f32,
     span: f32,
-    height: f32,
     width: f32,
 }
 
-/// Marks the shadow half of a curtain (the blades are the other child).
-#[derive(Component)]
-pub struct CurtainShade;
-
-/// The sheets the curtains are drawn from (the two static meshes bake theirs in
-/// at startup and need nothing kept).
+/// The one sheet drawn per-entity (the grass meshes bake theirs in at startup).
 #[derive(Resource)]
 pub struct GrassAssets {
-    skirt: Handle<Image>,
-    skirt_layout: Handle<TextureAtlasLayout>,
     shade: Handle<Image>,
 }
 
@@ -191,9 +186,18 @@ fn sprite_height(h: f32) -> f32 {
     h * GRASS_VERT / GRASS_RISE_FRAC
 }
 
-/// Grass sprites pivot on their ground line, not their middle.
-fn grass_anchor() -> Anchor {
-    Anchor(Vec2::new(0.0, -0.5 + GRASS_BASE_FRAC))
+/// Draw depth for something whose ground line is at world `y`.
+///
+/// This is the whole trick behind grass that behaves: the arena's y axis maps
+/// onto a z band, south (nearer the camera) getting the higher z, so the painter
+/// sorts everything standing on the ground by how close it is to the viewer. A
+/// clump of grass south of a soldier is drawn after him and swallows his legs; a
+/// clump the same height two feet north of him is drawn before him and doesn't
+/// touch him. Nothing is attached to anybody: the grass just sits on the map and
+/// he walks into it and out of it.
+pub fn y_sort(y: f32) -> f32 {
+    let f = ((ARENA_HALF_H as f32 - y) / (2.0 * ARENA_HALF_H as f32)).clamp(0.0, 1.0);
+    Z_SORT_LO + (Z_SORT_HI - Z_SORT_LO) * f
 }
 
 /// Where a pawn stands, in the whole world units the grass field is sampled at.
@@ -219,14 +223,14 @@ fn grass_look(h: f32) -> (Color, f32) {
     )
 }
 
-/// How tall to draw a curtain, in world px, given how much of its owner the
-/// grass swallows (`fraction`) and how tall that owner draws (`span`).
+/// Chance out of 255 that a candidate spot grows a clump, from the depth there.
 ///
-/// The `max` is why grass in front of a crawling soldier is still as tall as the
-/// grass beside them: once the fraction saturates, the blades keep growing with
-/// the depth even though there's nothing left to hide.
-fn cover_px(depth: f32, fraction: f32, span: f32) -> f32 {
-    (depth * GRASS_VERT).max(fraction.clamp(0.0, 1.0) * span)
+/// Density is the other half of depth: deep grass isn't just taller, it's
+/// thicker, and the whole point of a fine candidate grid is that the two ramp
+/// together instead of the field switching between "lawn" and "tussocks".
+fn tuft_density(h: i32) -> u32 {
+    let f = (h as f32 / GRASS_MAX_H as f32).clamp(0.0, 1.0);
+    (255.0 * (0.05 + 0.50 * f * f)) as u32
 }
 
 /// Cheap deterministic hash for scattering tufts. Same family as the sim's
@@ -243,7 +247,6 @@ pub fn setup_grass(
     mut commands: Commands,
     assets: Res<AssetServer>,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut layouts: ResMut<Assets<TextureAtlasLayout>>,
     mut materials: ResMut<Assets<GrassMaterial>>,
 ) {
     // World-space UVs run well past 1, so the detail texture has to repeat —
@@ -264,27 +267,24 @@ pub fn setup_grass(
         })),
         Transform::from_xyz(0.0, 0.0, Z_FIELD),
     ));
-    commands.spawn((
-        Mesh2d(meshes.add(tuft_mesh())),
-        MeshMaterial2d(materials.add(GrassMaterial {
-            params: Vec4::ZERO, // atlas UVs — crossing octaves would sample the neighbours
-            texture: assets.load("tufts.png"),
-        })),
-        Transform::from_xyz(0.0, 0.0, Z_TUFT),
-    ));
+    // One mesh per band, all sharing a material: a mesh has a single sort key,
+    // so a band is the unit of y-sorting.
+    let tufts = materials.add(GrassMaterial {
+        params: Vec4::ZERO, // atlas UVs — crossing octaves would sample the neighbours
+        texture: assets.load("tufts.png"),
+    });
+    let mut clumps = 0;
+    for (z, mesh, count) in tuft_bands() {
+        clumps += count;
+        commands.spawn((
+            Mesh2d(meshes.add(mesh)),
+            MeshMaterial2d(tufts.clone()),
+            Transform::from_xyz(0.0, 0.0, z),
+        ));
+    }
+    info!("grass: {clumps} clumps in {} bands", 2 * ARENA_HALF_H / GRASS_BAND);
 
-    let grass = GrassAssets {
-        skirt: assets.load("skirt.png"),
-        skirt_layout: layouts.add(TextureAtlasLayout::from_grid(
-            UVec2::new(SKIRT_W, SKIRT_H),
-            SKIRT_VARIANTS as u32,
-            1,
-            None,
-            None,
-        )),
-        shade: assets.load("shade.png"),
-    };
-    commands.insert_resource(grass);
+    commands.insert_resource(GrassAssets { shade: assets.load("shade.png") });
 }
 
 /// The arena-wide sward mesh: a grid of quads, colored per vertex from the
@@ -320,18 +320,27 @@ fn field_mesh() -> Mesh {
     mesh
 }
 
-/// Every clump in the arena, as ONE mesh: a quad per tuft, UVs into
-/// `tufts.png`, tint in the vertex color.
+/// Every clump in the arena, baked into one mesh per `GRASS_BAND`-thick slice:
+/// `(draw z, mesh, clump count)`, southernmost band last.
 ///
-/// Sprites would be the obvious way and are the wrong one here. Nothing about a
-/// tuft ever changes, so ~1300 of them would be ~1300 entities extracted, sorted
-/// and batched every single frame on a phone, to draw exactly the same thing as
-/// a mesh built once. Emitting them north-to-south also fixes their overlap
-/// order for free: the near clump is drawn last, so it covers the far one.
-fn tuft_mesh() -> Mesh {
-    let mut clumps: Vec<(i32, i32, u32)> = Vec::new();
-    let mut consider = |x: i32, y: i32, salt: u32| {
-        let noise = scatter(x, y, salt);
+/// Two decisions live here.
+///
+/// *Meshes, not sprites.* Nothing about a tuft ever changes, so thousands of
+/// them as entities would be thousands of extractions, sorts and batches every
+/// frame on a phone to draw exactly what a mesh built once draws. The cost is
+/// that a mesh has a single sort key — hence bands.
+///
+/// *Bands, not one mesh.* A single mesh would have to be drawn either wholly
+/// before or wholly after each soldier, which is what makes grass look painted
+/// onto people. Slicing the arena by y and giving each slice the z of its
+/// SOUTHERN edge means the grass between you and the camera is drawn after you
+/// and the grass behind you before you — no matter where anyone stands, and with
+/// nothing parented to anyone.
+fn tuft_bands() -> Vec<(f32, Mesh, usize)> {
+    let bands = (2 * ARENA_HALF_H / GRASS_BAND) as usize;
+    let mut binned: Vec<Vec<(i32, i32, u32)>> = vec![Vec::new(); bands];
+    let mut consider = |x: i32, y: i32| {
+        let noise = scatter(x, y, 0x51DE);
         // Jitter off the grid, or the clumps line up in rows the eye finds
         // immediately.
         let jx = x + (noise % TUFT_STEP as u32) as i32 - TUFT_STEP / 2;
@@ -340,190 +349,121 @@ fn tuft_mesh() -> Mesh {
             return;
         }
         let h = grass_height(jx, jy);
-        // The second pass only fills in where the grass is deep: density has to
-        // carry depth as much as height does, or a deep patch is just a taller
-        // version of the same lawn.
-        if h < TUFT_MIN_H || (salt != 0 && h < TUFT_DENSE_H) {
+        if h < TUFT_MIN_H || (noise >> 16 & 0xFF) > tuft_density(h) {
             return;
         }
-        clumps.push((jx, jy, noise));
+        let band = ((ARENA_HALF_H - jy) / GRASS_BAND).clamp(0, bands as i32 - 1) as usize;
+        binned[band].push((jx, jy, noise));
     };
     let mut y = -ARENA_HALF_H;
     while y <= ARENA_HALF_H {
         let mut x = -ARENA_HALF_W;
         while x <= ARENA_HALF_W {
-            consider(x, y, 0);
-            consider(x + TUFT_STEP / 2, y + TUFT_STEP / 2, 0x51DE);
+            consider(x, y);
             x += TUFT_STEP;
         }
         y += TUFT_STEP;
     }
-    clumps.sort_by_key(|&(x, y, _)| (std::cmp::Reverse(y), x));
 
-    let (mut positions, mut uvs, mut colors, mut indices) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    for (x, y, noise) in clumps {
-        let h = grass_height(x, y) as f32;
-        // Clumps aren't all the same size even where the grass is level.
-        let height = sprite_height(h) * (0.78 + (noise / 4096 % 45) as f32 * 0.01);
-        let (half_w, x, y) = (height * 0.55, x as f32, y as f32);
-        // The frame's ground line is `GRASS_BASE_FRAC` up from its bottom edge,
-        // so the quad hangs that much below the clump's own position.
-        let (bottom, top) = (y - height * GRASS_BASE_FRAC, y + height * (1.0 - GRASS_BASE_FRAC));
-        let variant = (noise / 128) as usize % TUFT_VARIANTS;
-        let (u0, u1) = {
-            let (a, b) = (variant as f32 / TUFT_VARIANTS as f32,
-                          (variant + 1) as f32 / TUFT_VARIANTS as f32);
-            if noise / 32 % 2 == 0 { (b, a) } else { (a, b) } // mirror = swapped u
-        };
-        let (tint, _) = grass_look(h);
-        let tint = tint.to_linear();
-        let base = positions.len() as u32;
-        for (px, py, u, v) in [
-            (x - half_w, top, u0, 0.0),
-            (x + half_w, top, u1, 0.0),
-            (x + half_w, bottom, u1, 1.0),
-            (x - half_w, bottom, u0, 1.0),
-        ] {
-            positions.push([px, py, 0.0]);
-            uvs.push([u, v]);
-            colors.push([tint.red, tint.green, tint.blue, 1.0]);
+    let mut out = Vec::with_capacity(bands);
+    for (band, mut clumps) in binned.into_iter().enumerate() {
+        // Within a band the painter still has to run north to south, so a near
+        // clump covers the far one it overlaps.
+        clumps.sort_by_key(|&(x, y, _)| (std::cmp::Reverse(y), x));
+        let count = clumps.len();
+        let (mut positions, mut uvs, mut colors, mut indices) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for (x, y, noise) in clumps {
+            let h = grass_height(x, y) as f32;
+            // Clumps aren't all the same size even where the grass is level.
+            let height = sprite_height(h) * (0.78 + (noise / 4096 % 45) as f32 * 0.01);
+            let (half_w, x, y) = (height * TUFT_ASPECT * 0.5, x as f32, y as f32);
+            // The frame's ground line is `GRASS_BASE_FRAC` up from its bottom
+            // edge, so the quad hangs that much below the clump's own position.
+            let (bottom, top) =
+                (y - height * GRASS_BASE_FRAC, y + height * (1.0 - GRASS_BASE_FRAC));
+            let variant = (noise / 128) as usize % TUFT_VARIANTS;
+            let (u0, u1) = {
+                let (a, b) = (variant as f32 / TUFT_VARIANTS as f32,
+                              (variant + 1) as f32 / TUFT_VARIANTS as f32);
+                if noise / 32 % 2 == 0 { (b, a) } else { (a, b) } // mirror = swapped u
+            };
+            let (tint, _) = grass_look(h);
+            let tint = tint.to_linear();
+            let base = positions.len() as u32;
+            for (px, py, u, v) in [
+                (x - half_w, top, u0, 0.0),
+                (x + half_w, top, u1, 0.0),
+                (x + half_w, bottom, u1, 1.0),
+                (x - half_w, bottom, u0, 1.0),
+            ] {
+                positions.push([px, py, 0.0]);
+                uvs.push([u, v]);
+                colors.push([tint.red, tint.green, tint.blue, 1.0]);
+            }
+            indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
         }
-        indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+        let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+        mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+        mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+        mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+        mesh.insert_indices(Indices::U32(indices));
+        // The band's southern edge: anything standing north of that line is
+        // behind every blade in this band, which is the whole ordering rule.
+        let south = (ARENA_HALF_H - (band as i32 + 1) * GRASS_BAND) as f32;
+        out.push((y_sort(south), mesh, count));
     }
-    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
-    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
-    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
-    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
-    mesh.insert_indices(Indices::U32(indices));
-    mesh
+    out
 }
 
-/// Give everything that can stand in the grass a curtain. Runs on `Added<..>`
-/// like `attach_sprites`, so rollback-respawned cover gets one too.
-pub fn attach_curtains(
+/// Give every pawn the shadow the grass throws up its front. Runs on
+/// `Added<Player>` like `attach_sprites`, so a pawn respawned by a session
+/// restart gets one too.
+///
+/// Only pawns: boulders and bushes standing in the grass are covered by the
+/// blades in front of them like everything else, and a boulder that also carried
+/// its own gloom just read as a hole in the ground.
+pub fn attach_grass_shade(
     mut commands: Commands,
     grass: Option<Res<GrassAssets>>,
     new_players: Query<Entity, Added<Player>>,
-    new_rocks: Query<(Entity, &Rock), Added<Rock>>,
-    new_bushes: Query<(Entity, &Bush), Added<Bush>>,
 ) {
     let Some(grass) = grass else { return };
     for entity in &new_players {
-        // Sized every frame by `update_curtains` — a pawn's profile changes
-        // with its stance and the ground it's walking over.
-        spawn_curtain(&mut commands, &grass, entity, STANCE_CURTAIN[0], 0);
-    }
-    for (entity, rock) in &new_rocks {
-        // A boulder is drawn centred on its `Pos` at `2r * FRAME / FILL`, so its
-        // lower edge is about `r` below it, and it stands roughly as tall as it
-        // is wide across the bottom.
-        let r = rock.r as f32;
-        let curtain = Curtain { base: -r * 0.85, span: r * 1.7, height: r * 1.5, width: r * 2.2 };
-        spawn_curtain(&mut commands, &grass, entity, curtain, rock.seed as usize);
-    }
-    for (entity, bush) in &new_bushes {
-        // The bush frame is centred on the CANOPY, so its ground line is well
-        // below `Pos` (`BUSH_CANOPY_Z * sin(TILT)` of the frame). A bush is
-        // taller than it is wide, and grass only ever laps at its stems.
-        let r = bush.r as f32;
-        let curtain = Curtain { base: -r * 0.72, span: r * 2.4, height: r * 1.8, width: r * 1.7 };
-        spawn_curtain(&mut commands, &grass, entity, curtain, bush.seed as usize);
+        commands.spawn((
+            STANCE_SHADE[0], // sized every frame below; the stance changes it
+            Sprite {
+                image: grass.shade.clone(),
+                color: SHADE_COLOR.with_alpha(0.0),
+                custom_size: Some(Vec2::ZERO),
+                ..default()
+            },
+            Anchor(Vec2::new(0.0, -0.5)),
+            Transform::from_xyz(0.0, 0.0, Z_SHADE_LIFT),
+            ChildOf(entity),
+        ));
     }
 }
 
-fn spawn_curtain(
-    commands: &mut Commands,
-    grass: &GrassAssets,
-    owner: Entity,
-    curtain: Curtain,
-    variant: usize,
-) {
-    commands.spawn((
-        CurtainShade,
-        curtain,
-        Sprite {
-            image: grass.shade.clone(),
-            color: SHADE_COLOR.with_alpha(0.0),
-            custom_size: Some(Vec2::ZERO),
-            ..default()
-        },
-        Anchor(Vec2::new(0.0, -0.5)),
-        Transform::from_xyz(0.0, 0.0, Z_CURTAIN_SHADE),
-        ChildOf(owner),
-    ));
-    commands.spawn((
-        curtain,
-        Sprite {
-            image: grass.skirt.clone(),
-            texture_atlas: Some(TextureAtlas {
-                layout: grass.skirt_layout.clone(),
-                index: variant % SKIRT_VARIANTS,
-            }),
-            custom_size: Some(Vec2::ZERO),
-            flip_x: variant / SKIRT_VARIANTS % 2 == 1,
-            ..default()
-        },
-        grass_anchor(),
-        Transform::from_xyz(0.0, 0.0, Z_CURTAIN),
-        ChildOf(owner),
-    ));
-}
-
-/// Size and tint every curtain from the grass its owner is standing in.
+/// Size each pawn's shade from the grass it is standing in.
 ///
-/// Cover doesn't move, but pawns do — and cheaply enough (a handful of entities)
-/// that there's no point splitting the static case out. Pawns also override the
-/// stored profile from their stance: dropping prone changes how tall you are,
-/// which is the entire point of the mechanic.
-pub fn update_curtains(
-    local_players: Option<Res<LocalPlayers>>,
-    owners: Query<(&Pos, Option<&Stance>, Option<&Player>)>,
-    mut curtains: Query<(
-        &ChildOf,
-        &Curtain,
-        Has<CurtainShade>,
-        &mut Sprite,
-        &mut Transform,
-    )>,
+/// This is the one thing that rides on a pawn rather than on the map, and it is
+/// the only one that should: the blades are the map's, but the gloom down among
+/// them belongs to whoever is standing there. It reaches exactly as far up the
+/// body as the sim says the grass buries it — `grass_cover`, depth over
+/// `STANCE_HEIGHT` — so dropping prone darkens all of you and standing in the
+/// same spot darkens your boots.
+pub fn update_grass_shade(
+    owners: Query<(&Pos, &Stance)>,
+    mut shades: Query<(&ChildOf, &mut ShadeProfile, &mut Sprite, &mut Transform)>,
 ) {
-    let local = local_players
-        .as_deref()
-        .and_then(|local| local.0.first().copied());
-
-    for (parent, stored, is_shade, mut sprite, mut transform) in &mut curtains {
-        let Ok((pos, stance, player)) = owners.get(parent.parent()) else { continue };
-        // A pawn's profile comes from its stance, not from what it was spawned
-        // with: dropping prone changes how tall you are, which is the entire
-        // point. Cover keeps the profile it was measured with.
-        let profile = stance
-            .map(|s| STANCE_CURTAIN[(s.level as usize).min(STANCE_COUNT - 1)])
-            .unwrap_or(*stored);
+    for (parent, mut profile, mut sprite, mut transform) in &mut shades {
+        let Ok((pos, stance)) = owners.get(parent.parent()) else { continue };
+        *profile = STANCE_SHADE[(stance.level as usize).min(STANCE_COUNT - 1)];
         let (x, y) = units(pos);
-        let depth = grass_height(x, y) as f32;
-        // Pawns take their coverage straight from the sim's rule rather than
-        // recomputing it here, so what the grass hides can't drift from what the
-        // sim says it hides. Cover isn't a pawn and has no stance, so it falls
-        // back to the same ratio against its own measured height.
-        let fraction = match stance {
-            Some(s) => grass_cover(x, y, s.level) as f32 / FP as f32,
-            None => depth / profile.height,
-        };
-        let cover = cover_px(depth, fraction, profile.span);
-        // Yours is drawn weaker so you can still find yourself in deep grass;
-        // everyone else's peer draws you at full strength.
-        let mine = matches!((player, local), (Some(p), Some(handle)) if p.handle == handle);
-        if is_shade {
-            let strength = (depth / GRASS_MAX_H as f32).clamp(0.0, 1.0);
-            let alpha = if mine { LOCAL_SHADE_ALPHA } else { 1.0 };
-            sprite.custom_size = Some(Vec2::new(profile.width, cover * SHADE_REACH));
-            sprite.color = SHADE_COLOR.with_alpha(SHADE_ALPHA * strength * alpha);
-        } else {
-            let (tint, _) = grass_look(depth);
-            let alpha = if mine { LOCAL_CURTAIN_ALPHA } else { 1.0 };
-            sprite.custom_size = Some(Vec2::new(profile.width, cover));
-            sprite.color = tint.with_alpha(alpha);
-        }
+        let buried = grass_cover(x, y, stance.level) as f32 / FP as f32;
+        sprite.custom_size = Some(Vec2::new(profile.width, buried * profile.span));
+        sprite.color = SHADE_COLOR.with_alpha(SHADE_ALPHA * buried);
         transform.translation.y = profile.base;
     }
 }

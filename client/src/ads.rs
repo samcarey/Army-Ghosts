@@ -31,11 +31,13 @@ const BUTTON_SIZE: f32 = 76.0;
 const ICON_SIZE: f32 = 54.0;
 const BOTTOM_OFFSET: f32 = 22.0;
 
-/// The aim line: thin, white, and drawn above the ground/targets but below
-/// bullets and their trails (see the `Z_*` ladder in `render.rs`).
+/// The aim line: thin, white, and drawn above everything standing in the field
+/// but below bullets and their trails (see the `Z_*` ladder in `render.rs`).
+/// It has to clear the top of the y-sorted band (`grass::Z_SORT_HI`) — where it
+/// used to sit, grass south of the shooter drew over their own sight line.
 const AIM_LINE_WIDTH: f32 = 0.6;
 const AIM_LINE_ALPHA: f32 = 0.22;
-const Z_AIM_LINE: f32 = 1.5;
+const Z_AIM_LINE: f32 = 1.85;
 
 /// Local aim-down-sights state. Not rollback state — it only ever feeds a
 /// button bit into the input stream.

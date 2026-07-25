@@ -245,7 +245,23 @@ Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_SIGNALING` env vars.
 - **Line of sight** (`client/src/vision.rs` + `client/assets/fog.wgsl`):
   render-only — the sim never computes visibility (it can't; every peer
   simulates every pawn). Each piece of cover casts a soft shadow away from the
-  local player into ONE `Mesh2d` rebuilt each frame.
+  local player into ONE `Mesh2d` rebuilt each frame. **Grass is the exception**:
+  it's a continuous depth field, not a set of casters, so `grass_conceal` walks
+  the sight line instead. At each step, a blade of depth `g` at fraction `t`
+  along the path, seen from an eye at height `E` (the viewer's `STANCE_HEIGHT`),
+  hides the target up to `E + (g - E) / t` — similar triangles — and the share of
+  the body under that line accumulates as Beer-Lambert extinction over the
+  BLOCKED LENGTH. The length is the whole point: taking the worst step instead
+  made every prone pawn invisible from everywhere and every prone viewer blind,
+  because on any long line some blade beats the sight line. With
+  `GRASS_EXTINCTION` at 0.010, two standing pawns 60 units apart barely dim
+  (~0.03), at 300 units they're half gone, a prone pawn at that range is ~0.8
+  hidden, and lying down costs you the far half of the field while keeping close
+  range — crawl to the edge of a patch to see out of it. Multiplies with the
+  cover term in `fade_hidden`. `grass_cover` (depth / `STANCE_HEIGHT`) is the
+  same rule's t = 1 limit. Terrain shading does NOT yet include grass — the fog
+  mesh is per-caster geometry and would need its own grid — so "two effects, one
+  number" holds for cover but not for grass yet.
 - **The camera model.** Sight lines start `VIEW_PULLBACK` (50) *behind* the
   pawn, at TWO points `SHOULDER_OFFSET` (30) either side — a third-person
   camera looking over either shoulder, so you can peek around cover you're

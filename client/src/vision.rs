@@ -9,6 +9,10 @@
 //! third-person camera over the shoulder — so you can peek around cover you're
 //! hugging instead of having it black out half the screen. See `push_caster`.
 //!
+//! Grass is the third kind and works differently again — it's a continuous
+//! depth field, not a set of casters, so instead of a shadow it gets a ray test
+//! in elevation plus extinction along the blocked length. See [`grass_conceal`].
+//!
 //! Two kinds of cover, which hide differently:
 //!   * **Boulders** cast opaque grey. Anything standing in it — a player, a
 //!     bullet, another rock — is genuinely gone, not dimmed.
@@ -49,7 +53,7 @@ use bevy::shader::ShaderRef;
 use bevy::sprite_render::{AlphaMode2d, Material2d, Material2dKey, Material2dPlugin};
 use bevy_ggrs::LocalPlayers;
 
-use army_ghosts_sim::{Bush, Player, Pos, Rock, PLAYER_R};
+use army_ghosts_sim::{grass_height, Bush, Player, Pos, Rock, Stance, PLAYER_R, STANCE_HEIGHT};
 
 /// Unlit ground: dark enough to read as "no information", light enough to tell
 /// apart from the out-of-arena clear color. Authored in sRGB like every other
@@ -114,6 +118,22 @@ const EDGE_MIN_FRACTION: f32 = 0.08;
 /// as an edge; foliage shouldn't read as anything but a smudge.
 const ROCK_BLUR_SCALE: f32 = 1.0;
 const BUSH_BLUR_SCALE: f32 = 1.8;
+/// Steps along a sight line when testing it against the grass. The depth field's
+/// finest octave is 38 units across, so even a sight line the width of the arena
+/// samples it faster than it changes.
+const GRASS_SAMPLES: usize = 24;
+/// Where the grass test starts, as a fraction of the way to the target. The
+/// first stretch in front of your face is skipped on the grounds that you are
+/// looking *through* the blades you're lying in, not at them — and because the
+/// `1/t` in `grass_conceal` has to be kept away from zero. Raise it to make
+/// crawling less blinding, lower it to make grass at your nose count.
+const GRASS_NEAR_T: f32 = 0.06;
+/// Extinction per world unit of blocked sight line. Tuned so grass matters at
+/// fighting range without erasing the game: at 60 units apart in ordinary grass
+/// two standing pawns barely dim (~0.03), across 300 units they're half gone,
+/// and a prone pawn at that range is ~0.8 hidden. Turning this up hides
+/// everything from everyone; turning it down makes grass decoration.
+const GRASS_EXTINCTION: f32 = 0.010;
 /// What share of a shadow gets painted on the terrain. The rest of its
 /// strength goes into hiding whoever stands in it (`fade_hidden`), so cover is
 /// total against players while the ground behind it only dims — you keep a
@@ -485,26 +505,91 @@ fn smoothstep(s: f32) -> f32 {
     s * s * (3.0 - 2.0 * s)
 }
 
-/// Fade other players by how well the cover hides them from the local pawn.
+/// How much of a pawn `target_h` units tall the GRASS between it and the eye
+/// hides, 0..=1.
 ///
-/// This is the *full* shadow, not the halved version painted on the ground: a
+/// Grass can't cast a [`Cast`] — it isn't a set of discrete casters but a
+/// continuous depth field — so it gets the honest thing instead: a ray test in
+/// elevation. Walk the sight line, and at each step ask how high up the target a
+/// sight line grazing the blade tips there would land. A blade of depth `g` at
+/// fraction `t` along the path, seen from an eye at height `E`, hides everything
+/// on the target below
+///
+///     E + (g - E) / t
+///
+/// (similar triangles: the line through the tip carries on to the target plane).
+/// The share of the body under that line is how much *this* step hides.
+///
+/// Those shares then go through Beer-Lambert rather than a max, and that choice
+/// is the whole character of the mechanic. Grass is not a wall: it is blades with
+/// gaps, so a metre of it dims and fifty metres of it hides. Taking the worst
+/// step instead made every prone pawn on the map invisible from everywhere and
+/// every prone *viewer* blind, because somewhere on any long line there is always
+/// one blade taller than the sight line. Extinction over the blocked LENGTH gives
+/// the thing its distance falloff: with `GRASS_EXTINCTION`, about 150 units of
+/// fully-blocking grass hides ~80% of a pawn.
+///
+/// Two more things fall out of the geometry rather than being written into it:
+///   * **Grass at the target's own feet (t = 1) hides it up to `g`** — which is
+///     [`army_ghosts_sim::grass_cover`], the standing-in-it rule, as the limiting
+///     case of this one.
+///   * **Lying down costs you sight as well as buying it.** A prone eye is 15
+///     units up, so anything deeper than that near you blocks; you keep close
+///     range vision and lose the far half of the field. Crawling to the edge of a
+///     patch to see out of it is the intended move.
+///
+/// The eye here is the pawn itself, not the pulled-back shoulder cameras the
+/// [`Cast`]s use: peeking *around* a field of grass isn't a thing.
+fn grass_conceal(eye: Vec2, eye_h: f32, target: Vec2, target_h: f32) -> f32 {
+    let dist = eye.distance(target);
+    if target_h <= 0.0 || dist < 1.0 {
+        return 0.0;
+    }
+    let mut blocked_len = 0.0;
+    let step = dist * (1.0 - GRASS_NEAR_T) / GRASS_SAMPLES as f32;
+    for i in 0..GRASS_SAMPLES {
+        let t = GRASS_NEAR_T
+            + (1.0 - GRASS_NEAR_T) * (i + 1) as f32 / GRASS_SAMPLES as f32;
+        let p = eye.lerp(target, t);
+        let depth = grass_height(p.x.round() as i32, p.y.round() as i32) as f32;
+        let reaches = eye_h + (depth - eye_h) / t;
+        blocked_len += (reaches / target_h).clamp(0.0, 1.0) * step;
+    }
+    1.0 - (-GRASS_EXTINCTION * blocked_len).exp()
+}
+
+/// A pawn's eye height, world units — where it looks from, and (near enough)
+/// where it can be seen to.
+fn eye_height(stance: &Stance) -> f32 {
+    STANCE_HEIGHT[(stance.level as usize).min(STANCE_HEIGHT.len() - 1)] as f32
+}
+
+/// Fade other players by how well cover and grass hide them from the local pawn.
+///
+/// Cover is the *full* shadow, not the halved version painted on the ground: a
 /// pawn in complete cover goes completely invisible, which is what makes hiding
 /// mean anything, while the terrain behind them stays merely dim. Sampled at
 /// several points across the body rather than just the centre, so someone
 /// edging out from behind a rock fades in gradually instead of popping.
+///
+/// The grass term multiplies with that — two independent ways of not being seen,
+/// so a bush in front of a pawn already lying in deep grass compounds.
 pub fn fade_hidden(
     local_players: Option<Res<LocalPlayers>>,
     rocks: Query<(&Rock, &Pos)>,
     bushes: Query<(&Bush, &Pos)>,
-    mut players: Query<(&Player, &Pos, &mut Sprite), With<Player>>,
+    mut players: Query<(&Player, &Pos, &Stance, &mut Sprite), With<Player>>,
 ) {
     let Some(local) = local_players else { return };
     let Some(&handle) = local.0.first() else { return };
-    let viewer = players.iter().find(|(p, _, _)| p.handle == handle).map(|(_, pos, _)| {
-        let (x, y) = pos.to_f32();
-        Vec2::new(x, y)
-    });
-    let Some(viewer) = viewer else { return };
+    let eye = players
+        .iter()
+        .find(|(p, _, _, _)| p.handle == handle)
+        .map(|(_, pos, stance, _)| {
+            let (x, y) = pos.to_f32();
+            (Vec2::new(x, y), eye_height(stance))
+        });
+    let Some((viewer, viewer_h)) = eye else { return };
 
     let mut casts: Vec<Cast> = Vec::new();
     for (bush, pos) in &bushes {
@@ -517,7 +602,7 @@ pub fn fade_hidden(
     }
 
     let reach = PLAYER_R as f32 * 0.7;
-    for (player, pos, mut sprite) in &mut players {
+    for (player, pos, stance, mut sprite) in &mut players {
         if player.handle == handle {
             sprite.color.set_alpha(1.0); // never hide yourself
             continue;
@@ -535,6 +620,55 @@ pub fn fade_hidden(
         .map(|offset| coverage_at(&casts, body + *offset))
         .sum::<f32>()
             / 5.0;
-        sprite.color.set_alpha((1.0 - hidden).clamp(0.0, 1.0));
+        let grass = grass_conceal(viewer, viewer_h, body, eye_height(stance));
+        sprite
+            .color
+            .set_alpha(((1.0 - hidden) * (1.0 - grass)).clamp(0.0, 1.0));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The properties the grass sight model is *for*. All of these are things a
+    /// plausible-looking tweak to `GRASS_EXTINCTION` or the ray math has broken
+    /// at least once, and none of them depend on the exact numbers.
+    #[test]
+    fn grass_hides_by_height_distance_and_stance() {
+        let h = |level: usize| STANCE_HEIGHT[level] as f32;
+        let (west, east) = (Vec2::new(-150.0, 0.0), Vec2::new(150.0, 0.0));
+        let near = Vec2::new(-90.0, 0.0); // same bearing, a fifth of the way
+
+        let standing = grass_conceal(west, h(0), east, h(0));
+        let crouching = grass_conceal(west, h(0), east, h(1));
+        let prone = grass_conceal(west, h(0), east, h(2));
+        assert!((0.0..=1.0).contains(&standing));
+        assert!(
+            prone > crouching && crouching > standing,
+            "lower must always be harder to see: {standing} / {crouching} / {prone}"
+        );
+
+        // Distance has to matter, or grass stops being terrain and becomes a
+        // property of standing in it.
+        assert!(
+            grass_conceal(west, h(0), near, h(0)) < standing,
+            "a pawn 60 units away must be plainer than one 300 away"
+        );
+
+        // Lying down buys concealment and costs sight: the same target is harder
+        // to make out from down in the blades.
+        assert!(
+            grass_conceal(west, h(2), east, h(0)) > standing,
+            "a prone viewer must see less, not more"
+        );
+
+        // Bare ground hides nobody. (0, -250) sits in the arena's thinnest
+        // corner; if the depth field is ever reseeded this may need moving.
+        let bare = Vec2::new(-40.0, -250.0);
+        assert!(
+            grass_conceal(bare, h(0), bare + Vec2::new(60.0, 0.0), h(0)) < 0.2,
+            "thin ground must not conceal"
+        );
     }
 }

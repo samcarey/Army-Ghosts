@@ -244,24 +244,41 @@ Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_SIGNALING` env vars.
   as grass you are *wearing*, and it covered heads while boots stuck out.
 - **Line of sight** (`client/src/vision.rs` + `client/assets/fog.wgsl`):
   render-only — the sim never computes visibility (it can't; every peer
-  simulates every pawn). Each piece of cover casts a soft shadow away from the
-  local player into ONE `Mesh2d` rebuilt each frame. **Grass is the exception**:
-  it's a continuous depth field, not a set of casters, so `grass_conceal` walks
-  the sight line instead. At each step, a blade of depth `g` at fraction `t`
-  along the path, seen from an eye at height `E` (the viewer's `STANCE_HEIGHT`),
-  hides the target up to `E + (g - E) / t` — similar triangles — and the share of
-  the body under that line accumulates as Beer-Lambert extinction over the
-  BLOCKED LENGTH. The length is the whole point: taking the worst step instead
-  made every prone pawn invisible from everywhere and every prone viewer blind,
-  because on any long line some blade beats the sight line. With
-  `GRASS_EXTINCTION` at 0.010, two standing pawns 60 units apart barely dim
+  simulates every pawn). Split in two halves, and keeping them apart is what
+  makes it tractable:
+  * **The rays are continuous.** Cover resolves into `Cast` shadow cones swept
+    from the viewer (see the camera model below); grass, being a depth field and
+    not a set of casters, gets an elevation ray test instead (`grass_conceal`,
+    below). Both answer the same question about any point: how much of someone
+    standing THERE can be seen from HERE.
+  * **The display is quantized to hexes.** The arena is a flat-top hex grid
+    (`HEX_R` 16, ~750 tiles); each tile integrates that answer over its own area
+    (`HEX_PROBES` points) and paints the average FLAT across itself. Adjacent
+    tiles don't share vertices, so boundaries are hard on purpose — what's hidden
+    reads as a place on the map rather than a smear. The fog draws over
+    everything at z 5, so a pawn straddling two tiles is shaded by both, which is
+    the tell that the fog belongs to the ground and not to them.
+  Two things this buys beyond legibility: the mesh is static (only vertex colors
+  change), and because the answer is quantized anyway it only needs recomputing
+  when the viewer moves ~a third of a tile — standing still is free, walking
+  updates ~20x/s instead of 60. Two things it costs: the soft penumbra is gone
+  (that was `RIM_FEATHER`, the blur skirts and a per-pixel feather in
+  `fog.wgsl` — `git log` if it's wanted back), and a tile carries ONE color, so
+  bush haze no longer tints greener than boulder grey, only weaker.
+  **Grass concealment** (`grass_conceal`): a blade of depth `g` at fraction `t`
+  along the sight line, seen from an eye at height `E` (the viewer's
+  `STANCE_HEIGHT`), hides the target up to `E + (g - E) / t` — similar triangles
+  — and the share of the body under that line accumulates as Beer-Lambert
+  extinction over the BLOCKED LENGTH. The length is the whole point: taking the
+  worst step instead made every prone pawn invisible from everywhere and every
+  prone viewer blind, because on any long line some blade beats the sight line.
+  With `GRASS_EXTINCTION` at 0.010, two standing pawns 60 units apart barely dim
   (~0.03), at 300 units they're half gone, a prone pawn at that range is ~0.8
   hidden, and lying down costs you the far half of the field while keeping close
-  range — crawl to the edge of a patch to see out of it. Multiplies with the
-  cover term in `fade_hidden`. `grass_cover` (depth / `STANCE_HEIGHT`) is the
-  same rule's t = 1 limit. Terrain shading does NOT yet include grass — the fog
-  mesh is per-caster geometry and would need its own grid — so "two effects, one
-  number" holds for cover but not for grass yet.
+  range. `grass_cover` (depth / `STANCE_HEIGHT`) is the same rule's t = 1 limit.
+  Tiles ask it about a STANDING target, which is the question a player asks of a
+  patch of ground — asking about the dirt itself would darken the whole map,
+  since grass hides dirt long before it hides a soldier.
 - **The camera model.** Sight lines start `VIEW_PULLBACK` (50) *behind* the
   pawn, at TWO points `SHOULDER_OFFSET` (30) either side — a third-person
   camera looking over either shoulder, so you can peek around cover you're

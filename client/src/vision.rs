@@ -1,47 +1,44 @@
 //! Line of sight: everything the local player can't see is covered up.
 //!
 //! Purely render-side — the sim has no notion of who can see what (it can't:
-//! every peer simulates every pawn). Every piece of cover casts a shadow away
-//! from the local player; all of them go into one triangle mesh, rebuilt every
-//! frame, drawn above the world but below the touch overlay and the HUD.
+//! every peer simulates every pawn).
+//!
+//! Two halves, and keeping them apart is what makes this tractable:
+//!
+//! **The rays are continuous.** Every piece of cover resolves into a [`Cast`] —
+//! a shadow cone swept from the viewer — and grass, which is a depth field
+//! rather than a set of casters, gets an elevation ray test instead
+//! ([`grass_conceal`]). Both answer the same question about any point on the
+//! map: how much of someone standing THERE could you see from HERE.
+//!
+//! **The display is quantized.** The arena is a grid of flat-top hexes, and each
+//! one integrates that answer over its own area ([`HEX_PROBES`] points) and
+//! paints the average flat across the tile. Adjacent tiles don't share vertices,
+//! so the boundaries are hard on purpose: what's hidden reads as a *place* —
+//! this hex, not that one — rather than as a smear whose edge you can't locate.
+//! A pawn straddling two tiles is shaded by both, which is the tell that the fog
+//! belongs to the ground and not to them.
 //!
 //! Sight lines start `VIEW_PULLBACK` *behind* the pawn rather than at it — a
-//! third-person camera over the shoulder — so you can peek around cover you're
-//! hugging instead of having it black out half the screen. See `push_caster`.
+//! third-person camera over the shoulder, at two [`SHOULDER_OFFSET`] positions —
+//! so you can peek around cover you're hugging instead of having it black out
+//! half the screen. Ground is only dark where BOTH shoulders are blocked.
 //!
-//! Grass is the third kind and works differently again — it's a continuous
-//! depth field, not a set of casters, so instead of a shadow it gets a ray test
-//! in elevation plus extinction along the blocked length. See [`grass_conceal`].
+//! Three kinds of concealment, which hide differently:
+//!   * **Boulders** cast opaque grey. Anything standing in it is genuinely gone.
+//!   * **Bushes** cast a translucent haze. One bush is a smudge; a thicket is
+//!     nearly a wall, because each overlap multiplies what gets through.
+//!   * **Grass** hides by height along the line rather than by blocking it: see
+//!     [`grass_conceal`] for why that ends up as extinction over a length.
 //!
-//! Two kinds of cover, which hide differently:
-//!   * **Boulders** cast opaque grey. Anything standing in it — a player, a
-//!     bullet, another rock — is genuinely gone, not dimmed.
-//!   * **Bushes** cast a translucent haze. One bush between you and something
-//!     is a smudge; a whole thicket is nearly as good as a wall. That stacking
-//!     is free: the shadows are separate triangles in one alpha-blended mesh,
-//!     so each overlap multiplies what gets through — the same stacking the
-//!     translucent bush sprites themselves do on the ground. Bush shadows are
-//!     emitted first so the opaque boulder shadows paint over them.
-//!
-//! The shadows are *soft*, because a hard-edged wedge reads as a polygon
-//! someone drew on the level rather than as fog. Two things do that:
-//!   * Each shadow starts *inside* its caster: `push_caster` sweeps rays across
-//!     the angle the cover subtends and ramps alpha from nothing where a ray
-//!     enters the circle to full where it leaves, so cover is lit on the
-//!     player's side and rolls into darkness over its back, like a sphere lit
-//!     from one side. Cover therefore draws UNDER the fog (`render.rs` `Z_*`) —
-//!     the fog is what shades it. It also means a thicket darkens bush by bush
-//!     from the inside, instead of going flat at the front of the cluster.
-//!     Grazing rays enter and leave at nearly the same point, so `RIM_FEATHER`
-//!     gives them a minimum ramp — without it every rock has a hard rim exactly
-//!     where the eye looks.
-//!   * Both flanks get a penumbra skirt fading to nothing, narrow at the
-//!     silhouette and widening with distance *past the caster* — what an area
-//!     light does. Measuring that from the eye instead makes the skirt balloon
-//!     around the near side and halo over the lit flanks of its own rock.
-//!
-//! Tint and falloff both ride in vertex colors, which is why this uses its own
+//! Tiles carry the strength in vertex colors, which is why this uses its own
 //! [`FogMaterial`] rather than `ColorMaterial`; see `assets/fog.wgsl`.
+//!
+//! This replaced a swept soft-shadow mesh — per-caster geometry with penumbra
+//! skirts and a per-pixel feather in the shader. It was prettier and much harder
+//! to read: you could never tell where a shadow's edge actually was, and three
+//! different concealment systems each had their own falloff. `git log` this file
+//! if the soft version is wanted back.
 
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, MeshVertexBufferLayoutRef, PrimitiveTopology};
@@ -53,7 +50,10 @@ use bevy::shader::ShaderRef;
 use bevy::sprite_render::{AlphaMode2d, Material2d, Material2dKey, Material2dPlugin};
 use bevy_ggrs::LocalPlayers;
 
-use army_ghosts_sim::{grass_height, Bush, Player, Pos, Rock, Stance, PLAYER_R, STANCE_HEIGHT};
+use army_ghosts_sim::{
+    grass_height, Bush, Player, Pos, Rock, Stance, ARENA_HALF_H, ARENA_HALF_W, PLAYER_R,
+    STANCE_HEIGHT,
+};
 
 /// Unlit ground: dark enough to read as "no information", light enough to tell
 /// apart from the out-of-arena clear color. Authored in sRGB like every other
@@ -62,16 +62,13 @@ use army_ghosts_sim::{grass_height, Bush, Player, Pos, Rock, Stance, PLAYER_R, S
 const FOG_COLOR: Color = Color::srgb(0.14, 0.145, 0.15);
 const FOG_UMBRA: f32 = 1.0;
 /// Per-bush haze. A lone bush nearly hides what's behind it and two are all but
-/// solid (1 - 0.085^2 ≈ 0.99), so a thicket is a wall.
-const BUSH_FOG_COLOR: Color = Color::srgb(0.13, 0.15, 0.12);
+/// solid (1 - 0.085^2 ≈ 0.99), so a thicket is a wall. (Bushes used to tint
+/// their shadow greener than a boulder's; a tile carries one color, so that
+/// distinction now lives only in the strength.)
 const BUSH_FOG_UMBRA: f32 = 0.915;
 /// How far a shadow is extended past its caster, world units. Anything past
 /// the arena diagonal is off-screen at any sane zoom.
 const FOG_FAR: f32 = 1600.0;
-/// Sight lines sampled across the angle a piece of cover subtends. More rays =
-/// rounder silhouette, since the shadow's shape is traced by where these enter
-/// and leave the circle.
-const CAST_RAYS: usize = 16;
 /// How far behind the pawn sight lines start, world units — the third-person
 /// camera setback. Bigger = more you can see around cover you're touching.
 /// Roughly half a mobile screen, matching `ads.rs`'s ADS_SHIFT so the two
@@ -88,13 +85,6 @@ const VIEW_PULLBACK: f32 = 50.0;
 /// the fraction `offset / radius` — keep it well under the smallest cover
 /// radius (bushes bottom out at 13) or small cover stops casting at all.
 const SHOULDER_OFFSET: f32 = 30.0;
-/// Steps across the front-to-back terminator on each ray. Enough that the ramp
-/// reads as a curve rather than a flat wedge.
-const TERMINATOR_STEPS: usize = 4;
-/// Steps along the body of the shadow. The inward feather varies down its
-/// length (the cone narrows, the blur widens), so it needs more than the two
-/// ends to interpolate between.
-const BODY_STEPS: usize = 3;
 /// Shortest terminator a ray may have, world units. Rays grazing the silhouette
 /// enter and leave the cover at nearly the same point, so without a floor they
 /// snap from lit to full shadow over no distance at all — a hard rim right at
@@ -134,14 +124,26 @@ const GRASS_NEAR_T: f32 = 0.06;
 /// and a prone pawn at that range is ~0.8 hidden. Turning this up hides
 /// everything from everyone; turning it down makes grass decoration.
 const GRASS_EXTINCTION: f32 = 0.010;
-/// What share of a shadow gets painted on the terrain. The rest of its
-/// strength goes into hiding whoever stands in it (`fade_hidden`), so cover is
-/// total against players while the ground behind it only dims — you keep a
-/// sense of terrain you can't actually see into.
-const TERRAIN_SHADOW_SCALE: f32 = 0.5;
+/// How dark a fully-hidden tile gets. The rest of the hiding is spent on
+/// whoever is standing there (`fade_hidden`), so cover stays total against
+/// players while the ground merely goes unreadable — you keep a sense of terrain
+/// you can't see into.
+const TILE_SHADOW_SCALE: f32 = 0.8;
 /// Above the world (players, bushes, bullets, aim line), below the
 /// camera-parented touch overlay at z=100. The HUD is bevy_ui, own pass.
 const Z_FOG: f32 = 5.0;
+/// Hex circumradius, world units — corner to corner is `2 * HEX_R`, flat to flat
+/// `sqrt(3) * HEX_R`. Sized against the pawn (24 units across) rather than
+/// against the cover: much bigger and you can't tell which side of a boulder a
+/// tile is on; much smaller and quantizing stops simplifying anything. At 16 the
+/// arena is about 750 tiles.
+const HEX_R: f32 = 16.0;
+/// Points sampled inside each tile before its shadow is averaged: the centre
+/// plus one toward every other corner. A tile straddling the edge of a shadow
+/// has to come out half dark rather than picking a side — but this is the inner
+/// loop of the whole system (probes x tiles x casts, every frame), so it buys
+/// that with four points rather than seven.
+const HEX_PROBES: usize = 4;
 
 /// Flat vertex-color material for the fog mesh — no uniforms, no textures.
 ///
@@ -176,7 +178,6 @@ impl Material2d for FogMaterial {
     ) -> Result<(), SpecializedMeshPipelineError> {
         descriptor.vertex.buffers = vec![layout.0.get_layout(&[
             Mesh::ATTRIBUTE_POSITION.at_shader_location(0),
-            Mesh::ATTRIBUTE_UV_0.at_shader_location(2),
             Mesh::ATTRIBUTE_COLOR.at_shader_location(4),
         ])?];
         Ok(())
@@ -191,28 +192,77 @@ impl Plugin for VisionPlugin {
     }
 }
 
-/// Handle to the shadow mesh, rebuilt in place each frame.
+/// The hex fog: static geometry (one fan per tile), colors rewritten each frame.
+///
+/// `centres` is parallel to the tiles in the mesh, so `update_fog` can walk the
+/// two together without recomputing any geometry.
 #[derive(Resource)]
-pub struct FogMesh(Handle<Mesh>);
+pub struct FogMesh {
+    mesh: Handle<Mesh>,
+    centres: Vec<Vec2>,
+}
 
 /// Marks the fog entity.
 #[derive(Component)]
 pub struct Fog;
+
+/// Corner `i` of a flat-top hex of circumradius [`HEX_R`].
+fn hex_corner(centre: Vec2, i: usize) -> Vec2 {
+    let a = std::f32::consts::PI / 3.0 * i as f32;
+    centre + Vec2::new(HEX_R * a.cos(), HEX_R * a.sin())
+}
+
+/// Every tile centre covering the arena, in odd-q offset layout. Columns step by
+/// `1.5 * R` and odd ones drop half a row, which is what interlocks the grid.
+fn hex_centres() -> Vec<Vec2> {
+    let (dx, dy) = (HEX_R * 1.5, HEX_R * 3.0f32.sqrt());
+    let cols = ((ARENA_HALF_W as f32 * 2.0) / dx).ceil() as i32 + 2;
+    let rows = ((ARENA_HALF_H as f32 * 2.0) / dy).ceil() as i32 + 2;
+    let mut centres = Vec::with_capacity((cols * rows) as usize);
+    for col in -1..cols {
+        for row in -1..rows {
+            let c = Vec2::new(
+                -ARENA_HALF_W as f32 + col as f32 * dx,
+                -ARENA_HALF_H as f32 + row as f32 * dy + if col % 2 == 0 { 0.0 } else { dy * 0.5 },
+            );
+            // Stop at the walls. Past them there is no ground to shade, and a
+            // honeycomb hanging over the black outside the arena is the sort of
+            // thing that reads as a rendering bug.
+            if c.x.abs() < ARENA_HALF_W as f32 + HEX_R && c.y.abs() < ARENA_HALF_H as f32 {
+                centres.push(c);
+            }
+        }
+    }
+    centres
+}
 
 pub fn setup_fog(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<FogMaterial>>,
 ) {
+    let centres = hex_centres();
+    let (mut positions, mut colors, mut indices) = (Vec::new(), Vec::new(), Vec::new());
+    for centre in &centres {
+        // A fan: the centre plus its six corners. The tile gets ONE color, so
+        // its vertices are never shared with a neighbour — that hard edge
+        // between tiles is the whole point of the quantization.
+        let base = positions.len() as u32;
+        positions.push([centre.x, centre.y, 0.0]);
+        colors.push([0.0; 4]);
+        for i in 0..6 {
+            let p = hex_corner(*centre, i);
+            positions.push([p.x, p.y, 0.0]);
+            colors.push([0.0; 4]);
+            indices.extend([base, base + 1 + i as u32, base + 1 + ((i as u32 + 1) % 6)]);
+        }
+    }
     // RenderAssetUsages::default() keeps the mesh in the main world too, which
     // is what lets `update_fog` mutate it every frame.
-    let mut mesh = Mesh::new(
-        PrimitiveTopology::TriangleList,
-        RenderAssetUsages::default(),
-    );
-    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, Vec::<[f32; 3]>::new());
-    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, Vec::<[f32; 2]>::new());
-    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, Vec::<[f32; 4]>::new());
+    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+    mesh.insert_indices(Indices::U32(indices));
     let mesh = meshes.add(mesh);
     commands.spawn((
         Fog,
@@ -220,65 +270,112 @@ pub fn setup_fog(
         MeshMaterial2d(materials.add(FogMaterial::default())),
         Transform::from_xyz(0.0, 0.0, Z_FOG),
         Visibility::Hidden,
-        // The Aabb is computed once when Mesh2d is added; our vertices move
-        // every frame, so culling against that stale box would blink the fog
-        // out whenever the camera left the original bounds.
+        // The Aabb is computed once when Mesh2d is added. The geometry is static
+        // now, so this is belt and braces — but the box is only as good as the
+        // first frame's, and the cost of getting it wrong is the fog blinking out.
         bevy::camera::visibility::NoFrustumCulling,
     ));
-    commands.insert_resource(FogMesh(mesh));
+    commands.insert_resource(FogMesh { mesh, centres });
 }
 
-/// Rebuild the shadow mesh from the local player's point of view.
+/// Re-shade every tile from the local player's point of view.
+///
+/// The rays are unchanged — [`Cast`] cones from the shoulder cameras, plus the
+/// grass ray test — and are still evaluated at continuous points. What's
+/// quantized is only the *display*: each tile integrates the shadow over its own
+/// area (`HEX_PROBES` points) and paints the average across the whole hex.
 pub fn update_fog(
     fog: Res<FogMesh>,
     mut meshes: ResMut<Assets<Mesh>>,
     local_players: Option<Res<LocalPlayers>>,
-    players: Query<(&Player, &Pos)>,
+    players: Query<(&Player, &Pos, &Stance)>,
     rocks: Query<(&Rock, &Pos)>,
     bushes: Query<(&Bush, &Pos)>,
     mut fog_view: Query<&mut Visibility, With<Fog>>,
+    mut last: Local<Option<(Vec2, u8)>>,
 ) {
     let Ok(mut visibility) = fog_view.single_mut() else { return };
     let eye = local_players.as_deref().and_then(|local| {
         let handle = *local.0.first()?;
-        let (_, pos) = players.iter().find(|(p, _)| p.handle == handle)?;
+        let (_, pos, stance) = players.iter().find(|(p, _, _)| p.handle == handle)?;
         let (x, y) = pos.to_f32();
-        Some(Vec2::new(x, y))
+        Some((Vec2::new(x, y), eye_height(stance), stance.level))
     });
     // No pawn to see from (lobby warmup): show the whole field.
-    let Some(eye) = eye else {
+    let Some((eye, eye_h, eye_level)) = eye else {
         *visibility = Visibility::Hidden;
         return;
     };
-    let Some(mesh) = meshes.get_mut(&fog.0) else { return };
+    let Some(mesh) = meshes.get_mut(&fog.mesh) else { return };
+    *visibility = Visibility::Visible;
+    // Cover doesn't move and the grass field is fixed, so the whole picture is a
+    // function of where the viewer stands and how tall they are — and the answer
+    // is quantized to 32-unit tiles anyway, so it doesn't need recomputing for
+    // every pixel of walking. This is the cheap half of what quantizing bought:
+    // standing still costs nothing, and walking recomputes ~20 times a second
+    // instead of 60. The threshold has to stay well under a tile or shadows lag
+    // visibly behind the pawn.
+    if last.is_some_and(|(p, level)| level == eye_level && p.distance_squared(eye) < HEX_R * HEX_R / 9.0)
+    {
+        return;
+    }
+    *last = Some((eye, eye_level));
 
-    let mut buffers = ShadowMesh::default();
-    // Haze first, opaque grey over the top of it.
-    let (haze, grey) = (BUSH_FOG_COLOR.to_linear(), FOG_COLOR.to_linear());
-    for (bush, pos) in &bushes {
-        let (x, y) = pos.to_f32();
-        if let Some(cast) = Cast::new(eye, Vec2::new(x, y), bush.r as f32, BUSH_FOG_UMBRA, BUSH_BLUR_SCALE) {
-            buffers.push_caster(&cast, haze);
+    let casts = casts_from(eye, &rocks, &bushes);
+    let grey = FOG_COLOR.to_linear();
+    let mut colors: Vec<[f32; 4]> = Vec::with_capacity(fog.centres.len() * 7);
+    for centre in &fog.centres {
+        // Integrate over the tile rather than sampling its middle: a hex that
+        // straddles the edge of a shadow should come out half dark, not pick a
+        // side. The centre plus the six corner midpoints is enough for that.
+        // Grass once per tile, at the centre: the depth field is smooth over a
+        // 32-unit hex, so probing it four times costs four ray marches to say
+        // the same thing. Cover is the opposite — a shadow edge is hard, and
+        // catching it half way across a tile is the entire point of probing.
+        //
+        // What the grass term answers is "could I see someone STANDING here",
+        // which is the question the player asks of a tile — and it keeps open
+        // ground bright, instead of drowning it in the grass that hides the dirt
+        // but not a soldier.
+        let grass = grass_conceal(eye, eye_h, *centre, STANCE_HEIGHT[0] as f32);
+        let mut sum = 0.0;
+        for i in 0..HEX_PROBES {
+            let p = match i {
+                0 => *centre,
+                _ => centre.lerp(hex_corner(*centre, (i - 1) * 2), 0.62),
+            };
+            sum += 1.0 - (1.0 - coverage_at(&casts, p)) * (1.0 - grass);
+        }
+        // Tiles carry more of the shadow than the old swept mesh did: the whole
+        // point of quantizing is that the fog is the thing you read the map
+        // from, and at the soft version's `TERRAIN_SHADOW_SCALE` the tiles were
+        // too faint to tell apart over a busy grass texture. Still short of
+        // opaque, so a hidden hex is "no information", not a hole.
+        let alpha = sum / HEX_PROBES as f32 * TILE_SHADOW_SCALE;
+        for _ in 0..7 {
+            colors.push([grey.red, grey.green, grey.blue, alpha]);
         }
     }
-    for (rock, pos) in &rocks {
-        let (x, y) = pos.to_f32();
-        if let Some(cast) = Cast::new(eye, Vec2::new(x, y), rock.r as f32, FOG_UMBRA, ROCK_BLUR_SCALE) {
-            buffers.push_caster(&cast, grey);
-        }
-    }
-
-    *visibility = if buffers.indices.is_empty() {
-        Visibility::Hidden
-    } else {
-        Visibility::Visible
-    };
-    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, buffers.positions);
-    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, buffers.uvs);
-    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, buffers.colors);
-    mesh.insert_indices(Indices::U32(buffers.indices));
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
 }
 
+/// Every piece of cover's shadow cone, resolved against one viewpoint.
+fn casts_from(
+    eye: Vec2,
+    rocks: &Query<(&Rock, &Pos)>,
+    bushes: &Query<(&Bush, &Pos)>,
+) -> Vec<Cast> {
+    let mut casts = Vec::new();
+    for (bush, pos) in bushes {
+        let (x, y) = pos.to_f32();
+        casts.extend(Cast::new(eye, Vec2::new(x, y), bush.r as f32, BUSH_FOG_UMBRA, BUSH_BLUR_SCALE));
+    }
+    for (rock, pos) in rocks {
+        let (x, y) = pos.to_f32();
+        casts.extend(Cast::new(eye, Vec2::new(x, y), rock.r as f32, FOG_UMBRA, ROCK_BLUR_SCALE));
+    }
+    casts
+}
 
 /// One piece of cover's shadow, resolved against the viewer.
 ///
@@ -349,7 +446,6 @@ impl Cast {
         let enter = proj - half_chord;
         let exit = (proj + half_chord).max(enter + RIM_FEATHER);
         Ray {
-            t,
             origin,
             dir,
             enter,
@@ -413,92 +509,15 @@ fn coverage_at(casts: &[Cast], p: Vec2) -> f32 {
     1.0 - through
 }
 
-/// Vertex buffers under construction for the fog mesh.
-#[derive(Default)]
-struct ShadowMesh {
-    positions: Vec<[f32; 3]>,
-    uvs: Vec<[f32; 2]>,
-    colors: Vec<[f32; 4]>,
-    indices: Vec<u32>,
-}
-
-impl ShadowMesh {
-    /// Lay one caster's shadow into the mesh as a grid of quads: across the
-    /// sight lines, and along each of them through the terminator and then the
-    /// body. Vertex alpha carries the terminator only — the sideways falloff
-    /// travels in the UVs and is evaluated per pixel in `fog.wgsl`.
-    fn push_caster(&mut self, cast: &Cast, tint: LinearRgba) {
-        let rays: Vec<Ray> = (0..=CAST_RAYS)
-            .map(|i| cast.ray(-1.0 + 2.0 * i as f32 / CAST_RAYS as f32))
-            .collect();
-
-        // Every sight line is sampled at the same milestones so neighbouring
-        // lines pair up into quads.
-        let sample = |ray: &Ray, j: usize| {
-            if j <= TERMINATOR_STEPS {
-                let s = j as f32 / TERMINATOR_STEPS as f32;
-                (ray.at(s), smoothstep(s))
-            } else {
-                let f = (j - TERMINATOR_STEPS) as f32 / BODY_STEPS as f32;
-                (ray.point(ray.exit + (ray.end - ray.exit) * f), 1.0)
-            }
-        };
-
-        for i in 0..CAST_RAYS {
-            let (a, b) = (&rays[i], &rays[i + 1]);
-            for j in 0..TERMINATOR_STEPS + BODY_STEPS {
-                let corner = |ray: &Ray, j: usize| {
-                    let (p, depth) = sample(ray, j);
-                    let (_, edge) = cast.spread(p);
-                    // Terrain only takes a share of the shadow, so you keep a
-                    // sense of ground you can't see; the full strength is spent
-                    // on hiding whoever is standing in it (`fade_hidden`).
-                    (p, ray.t, edge, cast.umbra * depth * TERRAIN_SHADOW_SCALE)
-                };
-                let (p0, t0, e0, a0) = corner(a, j);
-                let (p1, t1, e1, a1) = corner(a, j + 1);
-                let (p2, t2, e2, a2) = corner(b, j + 1);
-                let (p3, t3, e3, a3) = corner(b, j);
-                let base = self.positions.len() as u32;
-                self.vertex(p0, t0, e0, tint, a0);
-                self.vertex(p1, t1, e1, tint, a1);
-                self.vertex(p2, t2, e2, tint, a2);
-                self.vertex(p3, t3, e3, tint, a3);
-                self.indices
-                    .extend([base, base + 1, base + 2, base, base + 2, base + 3]);
-            }
-        }
-    }
-
-    fn vertex(&mut self, p: Vec2, t: f32, edge: f32, tint: LinearRgba, alpha: f32) {
-        self.positions.push([p.x, p.y, 0.0]);
-        self.uvs.push([t, edge]);
-        self.colors.push([tint.red, tint.green, tint.blue, alpha]);
-    }
-}
-
 /// One sight line through a piece of cover.
 #[derive(Copy, Clone)]
 struct Ray {
-    /// Lateral fraction across the cover: -1 and +1 are the umbra boundaries.
-    t: f32,
     origin: Vec2,
     dir: Vec2,
     enter: f32,
     exit: f32,
     /// Where this line leaves the umbra: the shared apex, or off past the arena.
     end: f32,
-}
-
-impl Ray {
-    /// The point a fraction `s` of the way through the cover.
-    fn at(&self, s: f32) -> Vec2 {
-        self.point(self.enter + (self.exit - self.enter) * s)
-    }
-
-    fn point(&self, t: f32) -> Vec2 {
-        self.origin + self.dir * t
-    }
 }
 
 fn smoothstep(s: f32) -> f32 {

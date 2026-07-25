@@ -112,6 +112,30 @@ Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_SIGNALING` env vars.
   white line traces the shot to the first target it would hit, else the arena
   wall. The shift rides on `render::CameraFocus` (the follow target) so the
   camera's own lerp doesn't fight the aim ease.
+- **Character art** (`tools/gen_assets.py` `gen_soldier` + `client/src/render.rs`):
+  the soldier is modelled ONCE in 3D — capsules in character space, x right,
+  y forward, z up, origin on the ground between the feet — then rotated about z
+  per facing and projected `SOLDIER_TILT` (40 deg) off straight-down. That's the
+  3/4 view these games use: head up, feet down, upright on screen always. So
+  the sprite must NEVER be rotated (there is no `orient_players` any more);
+  `soldier.png` is a GRID, 13 animation columns x 16 facing rows, and
+  `animate_players` picks the row from `Facing` (bearing clockwise from
+  away-from-camera) and the column from gait. Orthographic projection keeps a
+  sphere a circle, so a 3D capsule projects to a 2D capsule and the rasteriser
+  stays cheap; parts paint far-to-near by depth along the view axis. The look
+  is deliberately low contrast: shades in a narrow band, NO dark outlines
+  between parts (roundness comes from a faked capsule normal), camo in
+  quantised bands in part-local coords so it travels with the limb, and a noise
+  jitter on the silhouette so nothing reads as a clean analytic curve.
+  Two knock-ons that are easy to miss:
+  * The sprite is anchored at the figure's ground point (`SOLDIER_GROUND`), so
+    feet stand on `Pos` and the body rises above it.
+  * Shots therefore have to be lifted `MUZZLE_LIFT` (22 px) or tracers and the
+    ADS aim line appear to leave the soldier's boots. Bullets, trails and the
+    aim line all apply it.
+  * `PLAYER_COLORS` are muted but kept well ABOVE the ground tile in value.
+    Muted is not invisible — tinting a camouflaged soldier down into the grass
+    range makes them genuinely impossible to see on it.
 - **Cover** (`sim/src/lib.rs`: `rock_layout` / `bush_layout`): two procedural
   fields, both pure integer rejection sampling from fixed seeds (`ROCK_SEED`,
   `BUSH_SEED`) — no floats, no RNG crate, so every peer builds the identical

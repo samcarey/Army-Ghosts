@@ -219,8 +219,10 @@ pub fn update_aim_line(
     *visibility = Visibility::Visible;
     sprite.custom_size = Some(Vec2::new(range.max(0.0), AIM_LINE_WIDTH));
     sprite.color = Color::srgba(1.0, 1.0, 1.0, AIM_LINE_ALPHA * amount);
+    // Lifted to weapon height like the tracers, so the shot line leaves the
+    // rifle rather than the soldier's boots (see `render::MUZZLE_LIFT`).
     let mid = start + dir * range / 2.0;
-    transform.translation = Vec3::new(mid.x, mid.y, Z_AIM_LINE);
+    transform.translation = Vec3::new(mid.x, mid.y + crate::render::MUZZLE_LIFT, Z_AIM_LINE);
     transform.rotation = Quat::from_rotation_z(dir.y.atan2(dir.x));
 }
 

@@ -4,6 +4,7 @@
 //! back into the sim.
 
 use bevy::prelude::*;
+use bevy::sprite::Anchor;
 use bevy_ggrs::LocalPlayers;
 
 use army_ghosts_sim::{
@@ -32,9 +33,14 @@ pub fn signal_game_ready(mut frames: Local<u32>) {
     }
 }
 
-/// The soldier sprite sheet (tools/gen_assets.py): 64px frames in one row,
-/// drawn facing UP so `orient_players`' rotation convention works unchanged.
-/// Frame 0 idle, 1-6 walk cycle, 7-12 run cycle.
+/// The soldier sprite sheet (tools/gen_assets.py): a grid of 64px frames.
+/// Columns are animation (0 idle, 1-6 walk, 7-12 run); rows are the 16 facings,
+/// clockwise from away-from-camera.
+///
+/// The soldier is drawn 3/4 — modelled in 3D and projected 40 degrees off
+/// top-down — so it must NEVER be rotated: head stays up and feet stay down,
+/// and the facing comes from picking a row. That's why there's no
+/// `orient_players` any more.
 #[derive(Resource)]
 pub struct SoldierSheet {
     image: Handle<Image>,
@@ -42,15 +48,27 @@ pub struct SoldierSheet {
 }
 
 const SOLDIER_FRAME_PX: u32 = 64;
-const SOLDIER_FRAMES: u32 = 13;
+const SOLDIER_COLS: u32 = 13;
+const SOLDIER_DIRS: u32 = 16;
+/// Where the figure's ground point sits in the frame, as a fraction from the
+/// top (`SOLDIER_GROUND_PY / SOLDIER_FRAME_PX` in the generator). The sprite is
+/// anchored there so the soldier's feet stand on its `Pos` and the body rises
+/// above it, instead of the collision circle cutting it in half.
+const SOLDIER_GROUND: f32 = 52.0 / 64.0;
 const IDLE_FRAME: usize = 0;
 const WALK_START: usize = 1;
 const RUN_START: usize = 7;
 const CYCLE_FRAMES: usize = 6;
-/// Rendered size (world px). 64 tex px map to 44 world px, which puts the
-/// drawn shoulders at ~22 px against the 24 px collision diameter and the
-/// muzzle right at the bullet spawn offset.
-const SOLDIER_SIZE: f32 = 44.0;
+/// Rendered size (world px). The figure fills most of the frame's height, so
+/// this draws a soldier about 42 px tall standing on the 24 px collision
+/// circle — roughly the proportions these games use.
+const SOLDIER_SIZE: f32 = 50.0;
+/// How far above a pawn's `Pos` its weapon is drawn, world px. The 3/4 sprite
+/// stands with its feet on the Pos, so the rifle sits about this far up the
+/// screen; shots have to be lifted to match or tracers appear to leave the
+/// soldier's boots. Derived from the rifle's height in the sheet: z 1.16 units
+/// x sin(40 deg) x 38 px/unit x (SOLDIER_SIZE / frame) ~= 22.
+pub const MUZZLE_LIFT: f32 = 22.0;
 
 /// Animation thresholds/cadence, world px/s. Full stick = 120 px/s (run);
 /// partial thumbstick deflection walks. One stride cycle per 36 px walked
@@ -124,16 +142,20 @@ pub struct TrailSegment {
     ttl: f32,
 }
 
-/// Per-handle player colors (army-men greens first — you are green).
+/// Per-handle tints, multiplied over the grayscale sheet. Desaturated — these
+/// are uniforms, not team jerseys — but kept well ABOVE the ground tile in
+/// value. Muted is not the same as invisible: the grass is a dark olive
+/// (62,74,42) and a soldier tinted down into that range vanishes into it, so
+/// the separation here is value, not saturation.
 const PLAYER_COLORS: [Color; 8] = [
-    Color::srgb(0.35, 0.65, 0.25), // green
-    Color::srgb(0.75, 0.65, 0.30), // tan
-    Color::srgb(0.55, 0.60, 0.75), // blue-gray
-    Color::srgb(0.70, 0.40, 0.30), // rust
-    Color::srgb(0.80, 0.75, 0.60), // sand
-    Color::srgb(0.45, 0.30, 0.55), // purple
-    Color::srgb(0.30, 0.60, 0.60), // teal
-    Color::srgb(0.85, 0.55, 0.20), // orange
+    Color::srgb(0.66, 0.74, 0.50), // olive drab
+    Color::srgb(0.82, 0.74, 0.54), // khaki
+    Color::srgb(0.62, 0.70, 0.76), // field grey
+    Color::srgb(0.78, 0.58, 0.48), // brick
+    Color::srgb(0.84, 0.78, 0.62), // sand
+    Color::srgb(0.62, 0.58, 0.70), // slate
+    Color::srgb(0.52, 0.72, 0.68), // teal drab
+    Color::srgb(0.84, 0.66, 0.44), // ochre
 ];
 
 const Z_GROUND: f32 = -10.0;
@@ -159,8 +181,8 @@ pub fn setup_scene(
         image: assets.load("soldier.png"),
         layout: layouts.add(TextureAtlasLayout::from_grid(
             UVec2::splat(SOLDIER_FRAME_PX),
-            SOLDIER_FRAMES,
-            1,
+            SOLDIER_COLS,
+            SOLDIER_DIRS,
             None,
             None,
         )),
@@ -224,6 +246,8 @@ pub fn attach_sprites(
         };
         commands.entity(entity).insert((
             sprite,
+            // Feet on the pawn's Pos, body rising above it.
+            Anchor(Vec2::new(0.0, 0.5 - SOLDIER_GROUND)),
             WalkAnim::default(),
             Transform::from_xyz(0.0, 0.0, Z_PLAYER),
         ));
@@ -307,31 +331,19 @@ fn cover_sprite(
     )
 }
 
-/// Rotate player pawns toward their sim `Facing` (render-only — the sim's
-/// notion of facing stays the raw integer vector).
-pub fn orient_players(mut players: Query<(&Facing, &mut Transform), With<Player>>) {
-    for (facing, mut transform) in &mut players {
-        if facing.x == 0 && facing.y == 0 {
-            continue;
-        }
-        let angle = (facing.y as f32).atan2(facing.x as f32);
-        transform.rotation = Quat::from_rotation_z(angle - std::f32::consts::FRAC_PI_2);
-    }
-}
-
 /// Advance each soldier's walk/run cycle from their *rendered* speed (Pos
 /// delta per frame — works for remote players too, and rollback corrections
 /// just read as a brief stutter). Stationary → idle frame; sub-max analog
 /// deflection → walk cycle; near-full speed → run cycle.
 pub fn animate_players(
     time: Res<Time>,
-    mut players: Query<(&Pos, &mut WalkAnim, &mut Sprite), With<Player>>,
+    mut players: Query<(&Pos, &Facing, &mut WalkAnim, &mut Sprite), With<Player>>,
 ) {
     let dt = time.delta_secs();
     if dt <= 0.0 {
         return;
     }
-    for (pos, mut anim, mut sprite) in &mut players {
+    for (pos, facing, mut anim, mut sprite) in &mut players {
         let (x, y) = pos.to_f32();
         let p = Vec2::new(x, y);
         let speed = match anim.last_pos {
@@ -342,7 +354,7 @@ pub fn animate_players(
         };
         anim.last_pos = Some(p);
         let Some(atlas) = sprite.texture_atlas.as_mut() else { continue };
-        let index = if speed < IDLE_BELOW {
+        let column = if speed < IDLE_BELOW {
             anim.phase = 0.0;
             IDLE_FRAME
         } else {
@@ -350,6 +362,12 @@ pub fn animate_players(
             let start = if speed > RUN_ABOVE { RUN_START } else { WALK_START };
             start + ((anim.phase * CYCLE_FRAMES as f32) as usize).min(CYCLE_FRAMES - 1)
         };
+        // Row = facing, measured clockwise from "away from the camera", which
+        // is how the generator lays the sheet out.
+        let bearing = (facing.x as f32).atan2(facing.y as f32);
+        let step = std::f32::consts::TAU / SOLDIER_DIRS as f32;
+        let row = (bearing / step).round().rem_euclid(SOLDIER_DIRS as f32) as usize;
+        let index = row * SOLDIER_COLS as usize + column;
         if atlas.index != index {
             atlas.index = index;
         }
@@ -368,7 +386,7 @@ pub fn bullet_trails(
     let dt = time.delta_secs();
     for (pos, mut state) in &mut bullets {
         let (x, y) = pos.to_f32();
-        let p = Vec2::new(x, y);
+        let p = Vec2::new(x, y + MUZZLE_LIFT); // match the lifted tracer
         if let Some(last) = state.last {
             let delta = p - last;
             let len = delta.length();
@@ -404,13 +422,20 @@ pub fn bullet_trails(
 /// Mirror integer sim positions into render transforms, and flash targets that
 /// were just hit.
 pub fn sync_transforms(
-    mut movers: Query<(&Pos, &mut Transform)>,
+    mut movers: Query<(&Pos, &mut Transform), Without<Bullet>>,
+    mut bullets: Query<(&Pos, &mut Transform), With<Bullet>>,
     mut targets: Query<(&Target, &mut Sprite)>,
 ) {
     for (pos, mut transform) in &mut movers {
         let (x, y) = pos.to_f32();
         transform.translation.x = x;
         transform.translation.y = y;
+    }
+    // Rounds fly at weapon height, not ankle height.
+    for (pos, mut transform) in &mut bullets {
+        let (x, y) = pos.to_f32();
+        transform.translation.x = x;
+        transform.translation.y = y + MUZZLE_LIFT;
     }
     for (target, mut sprite) in &mut targets {
         sprite.color = if target.flash > 0 {

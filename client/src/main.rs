@@ -103,7 +103,6 @@ fn main() {
                 ads::advance_ads,
                 ads::update_ads_button,
                 render::attach_sprites,
-                render::orient_players,
                 render::animate_players,
                 render::bullet_trails,
                 render::sync_transforms,

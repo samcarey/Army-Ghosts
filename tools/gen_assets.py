@@ -5,9 +5,12 @@ Outputs to client/assets/:
   ground.png  - 128x128 tileable grass/dirt noise tile (RGB)
   disc.png    - 128x128 white disc with soft edge (RGBA, tint via sprite color)
   ring.png    - 128x128 white ring outline (RGBA, joystick base)
-  soldier.png - 13x1 grid of 64x64 frames: top-down soldier facing UP,
-                grayscale (engine tints per player). Frame 0 idle,
-                1-6 walk cycle, 7-12 run cycle (longer stride + lean).
+  soldier.png - 13x16 grid of 64x64 frames: a 3/4-view soldier modelled in 3D
+                and projected 40 degrees off top-down, always upright (head up,
+                feet down). Columns are animation (0 idle, 1-6 walk, 7-12 run),
+                rows are the 16 facings clockwise from away-from-camera.
+                Grayscale (engine tints per player), low contrast, camouflaged,
+                no outlines.
   tracer.png  - 32x8 white tracer streak pointing RIGHT (+x): soft capsule
                 with a bright head and a tail fading to transparent. The
                 engine tints it and rotates it to the bullet's flight angle.
@@ -98,114 +101,225 @@ def gen_disc(path, size=128, inner=None):
 
 
 # ── Soldier sprite sheet ─────────────────────────────────────────────────────
-# Shapes are analytic (ellipses + capsules) rasterized with 3x3 subsampling;
-# grayscale shades multiply against the per-player sprite tint in the engine,
-# so the whole figure reads as one plastic color — the army-men look.
+# The soldier is modelled once in 3D — capsules in character space, x right,
+# y forward, z up, origin on the ground between the feet — then rotated about z
+# per facing and projected at SOLDIER_TILT off straight-down. That gives the
+# 3/4 view these games traditionally use: head up, feet down, always upright on
+# screen, with a different silhouette per direction rather than one sprite spun
+# around. So the sheet is a grid: one row per facing, one column per animation
+# frame, and the engine picks the row from `Facing` instead of rotating.
+#
+# Orthographic projection means a sphere stays a circle, so a 3D capsule
+# projects to a 2D capsule and the rasteriser stays cheap. Parts are painted
+# far-to-near by their depth along the view axis.
+#
+# Everything is grayscale (the engine tints per player) and deliberately low
+# contrast: shades sit in a narrow band, there are no dark outlines separating
+# parts, camouflage breaks up each part in muted bands, and the silhouette is
+# jittered by noise so nothing reads as a clean analytic curve.
+
+SOLDIER_TILT = math.radians(40.0)   # off straight-down
+SOLDIER_DIRS = 16                   # facings, clockwise from "away from camera"
+SOLDIER_SCALE = 38.0                # px per character unit
+SOLDIER_GROUND_PY = 52.0            # where the character's ground point lands
 
 
 def _seg_dist2(px, py, ax, ay, bx, by):
+    return _seg_nearest(px, py, ax, ay, bx, by)[0]
+
+
+def _seg_nearest(px, py, ax, ay, bx, by):
+    """Squared distance to the segment, plus how far along it the foot lies."""
     vx, vy = bx - ax, by - ay
     wx, wy = px - ax, py - ay
     denom = vx * vx + vy * vy
     t = 0.0 if denom == 0 else max(0.0, min(1.0, (wx * vx + wy * vy) / denom))
     dx, dy = px - (ax + vx * t), py - (ay + vy * t)
-    return dx * dx + dy * dy
+    return dx * dx + dy * dy, t
 
 
-def _hit(shape, x, y):
-    if shape[0] == 'ellipse':
-        _, cx, cy, rx, ry, _ = shape
-        dx, dy = (x - cx) / rx, (y - cy) / ry
-        return dx * dx + dy * dy <= 1.0
-    _, ax, ay, bx, by, r, _ = shape  # capsule
-    return _seg_dist2(x, y, ax, ay, bx, by) <= r * r
+def _noise_field(size, seed):
+    """Tileable value-noise lattice. Precomputed because the sheet is ~200
+    frames and hashing per pixel would dominate the runtime."""
+    rng = random.Random(seed)
+    return [[rng.random() for _ in range(size)] for _ in range(size)]
 
 
-def _render(shapes, size):
-    """Rasterize shapes (painter's order, last on top) to an RGBA pixel grid."""
-    sub = (1 / 6, 3 / 6, 5 / 6)
-    grid = []
-    for y in range(size):
-        row = []
-        for x in range(size):
-            cover, shade_sum = 0, 0.0
-            for oy in sub:
-                for ox in sub:
-                    shade = None
-                    for sh in shapes:
-                        if _hit(sh, x + ox, y + oy):
-                            shade = sh[-1]
-                    if shade is not None:
-                        cover += 1
-                        shade_sum += shade
-            if cover:
-                v = int(round(shade_sum / cover * 255))
-                row.append((v, v, v, int(round(cover / 9 * 255))))
-            else:
-                row.append((0, 0, 0, 0))
-        grid.append(row)
-    return grid
+def _sample(field, x, y):
+    n = len(field)
+    xi, yi = math.floor(x), math.floor(y)
+    xf, yf = x - xi, y - yi
+    x0, y0 = xi % n, yi % n
+    x1, y1 = (xi + 1) % n, (yi + 1) % n
+    u = xf * xf * (3 - 2 * xf)
+    v = yf * yf * (3 - 2 * yf)
+    a = field[y0][x0] * (1 - u) + field[y0][x1] * u
+    b = field[y1][x0] * (1 - u) + field[y1][x1] * u
+    return a * (1 - v) + b * v
 
 
-def _soldier_pose(size, stride_amp, sway_amp, lean, t):
-    """One frame's shape list. Texture y is DOWN; the soldier faces UP.
+_CAMO = _noise_field(32, 20260725)
+_CAMO_FINE = _noise_field(32, 777)
+_JITTER = _noise_field(32, 31337)
 
-    stride_amp: leg swing amplitude (px). sway_amp: torso/helmet lateral sway.
-    lean: forward body shift (run frames). t: 0..1 phase through the cycle.
+
+def _soldier_parts(t, stride, lean, crouch):
+    """The soldier in character space for one animation phase.
+
+    Each part is (ax, ay, az, bx, by, bz, radius, shade). `stride` is the leg
+    swing amplitude, `lean` pitches the upper body forward for the run cycle,
+    `crouch` drops it.
     """
-    stride = math.sin(2 * math.pi * t) * stride_amp
-    sway = math.sin(2 * math.pi * t) * sway_amp
-    cx, cy = size / 2, size / 2 + 3 - lean
-    shapes = []
+    s = math.sin(2 * math.pi * t)
+    bob = abs(math.sin(4 * math.pi * t)) * 0.012
+    parts = []
+    hip_z = 0.86 - crouch + bob
 
-    def add(shape, outline=True):
-        # A dark rim under each part separates it from what it overlaps
-        # (helmet from shoulders, boots from ground) — the toy-figure read.
-        if outline:
-            grow, rim = 1.6, 0.14
-            if shape[0] == 'ellipse':
-                _, ex, ey, rx, ry, _ = shape
-                shapes.append(('ellipse', ex, ey, rx + grow, ry + grow, rim))
-            else:
-                _, ax, ay, bx, by, r, _ = shape
-                shapes.append(('capsule', ax, ay, bx, by, r + grow, rim))
-        shapes.append(shape)
+    # Legs. The foot swings fore/aft and lifts on the forward half of its
+    # swing; the knee is the midpoint pushed slightly forward so it reads as a
+    # bend rather than a straight peg.
+    for side in (-1, 1):
+        swing = s * side
+        foot = (side * 0.11, swing * stride, 0.055 + max(0.0, swing) * 0.07)
+        hip = (side * 0.10, 0.0, hip_z)
+        knee = (
+            (hip[0] + foot[0]) * 0.5,
+            (hip[1] + foot[1]) * 0.5 + 0.055,
+            (hip[2] + foot[2]) * 0.5,
+        )
+        parts.append((*hip, *knee, 0.093, 0.52))          # thigh
+        parts.append((*knee, *foot, 0.075, 0.50))         # shin
+        parts.append((foot[0], foot[1] - 0.055, foot[2],
+                      foot[0], foot[1] + 0.085, foot[2], 0.072, 0.42))  # boot
 
-    # Boots: swing fore/aft in opposite phase; visible past the torso mid-stride.
-    for side, s in ((-1, -stride), (1, stride)):
-        bx, by = cx + side * 7.0, cy + 6 + s
-        add(('capsule', bx, by - 3.5, bx, by + 3.5, 4.2, 0.38))
-    # Torso (shoulders wide across x).
-    add(('ellipse', cx + sway * 0.5, cy, 16, 8.5, 0.62))
-    # Arms reaching to the rifle (left hand on foregrip, right on the stock).
-    add(('capsule', cx - 13, cy - 1, cx - 4, cy - 12, 3.0, 0.50))
-    add(('capsule', cx + 13, cy, cx + 4, cy - 7, 3.0, 0.50))
-    # Rifle: dark barrel pointing up (slightly right of center, right-handed).
-    add(('capsule', cx + 1.5, cy - 5, cx + 1.5, cy - 26, 2.0, 0.22))
-    # Hands on top of the rifle.
-    add(('ellipse', cx - 4, cy - 12, 2.8, 2.8, 0.55), outline=False)
-    add(('ellipse', cx + 4, cy - 7, 2.8, 2.8, 0.55), outline=False)
-    # Helmet with an off-center highlight.
-    add(('ellipse', cx + sway, cy - 2, 8.5, 8.5, 0.90))
-    add(('ellipse', cx + sway - 2.2, cy - 4.2, 4.2, 4.2, 1.0), outline=False)
-    return shapes
+    # Upper body, pitched forward by `lean`.
+    def up(y, z):
+        return (y + lean * (z - hip_z) * 1.5, z - crouch + bob)
+
+    hy, hz = up(0.0, hip_z + 0.03)
+    parts.append((-0.11, hy, hz, 0.11, hy, hz, 0.125, 0.55))          # hips
+    ty, tz = up(-0.01, 1.28)
+    parts.append((0.0, hy, hz, 0.0, ty, tz, 0.170, 0.58))             # torso
+    by, bz = up(-0.17, 1.20)
+    parts.append((0.0, by, bz - 0.08, 0.0, by, bz + 0.08, 0.125, 0.50))  # pack
+    sy, sz = up(0.0, 1.30)
+    parts.append((-0.20, sy, sz, 0.20, sy, sz, 0.122, 0.57))          # shoulders
+
+    # Arms bring both hands onto the weapon; it stays up at the ready rather
+    # than swinging, which is what you want in a shooter.
+    for side, hand in ((1, (0.05, 0.30, 1.16)), (-1, (-0.03, 0.43, 1.19))):
+        shy, shz = up(0.0, 1.29)
+        elbow_y, elbow_z = up(0.15, 1.13)
+        hand_y, hand_z = up(hand[1], hand[2])
+        parts.append((side * 0.21, shy, shz, side * 0.19, elbow_y, elbow_z, 0.072, 0.55))
+        parts.append((side * 0.19, elbow_y, elbow_z, hand[0], hand_y, hand_z, 0.062, 0.53))
+
+    # Weapon: stock back at the shoulder, barrel forward. Darkest thing on the
+    # figure, but only just — high contrast is what we're avoiding.
+    sty, stz = up(0.10, 1.12)
+    bry, brz = up(0.64, 1.20)
+    parts.append((0.06, sty, stz, 0.01, bry, brz, 0.033, 0.34))
+    gy, gz = up(0.05, 1.10)
+    parts.append((0.06, gy, gz, 0.05, sty + 0.04, stz + 0.02, 0.048, 0.38))
+
+    ny, nz = up(0.0, 1.36)
+    parts.append((0.0, ny, nz, 0.0, ny, nz + 0.06, 0.065, 0.54))      # neck
+    hly, hlz = up(0.01, 1.53)
+    parts.append((0.0, hly, hlz, 0.0, hly + 0.01, hlz + 0.035, 0.140, 0.60))  # helmet
+    return parts
+
+
+def _render_soldier_frame(parts, phi, size):
+    """Rotate to facing `phi`, project, depth sort and paint one frame."""
+    cos_p, sin_p = math.cos(phi), math.sin(phi)
+    cos_t, sin_t = math.cos(SOLDIER_TILT), math.sin(SOLDIER_TILT)
+
+    def place(x, y, z):
+        # Clockwise about z, so the model's +y (its forward) swings to the
+        # facing the sheet row stands for.
+        rx = x * cos_p + y * sin_p
+        ry = -x * sin_p + y * cos_p
+        px = size / 2 + rx * SOLDIER_SCALE
+        py = SOLDIER_GROUND_PY - (ry * cos_t + z * sin_t) * SOLDIER_SCALE
+        depth = ry * sin_t - z * cos_t          # bigger = further from camera
+        return px, py, depth
+
+    flat = []
+    for ax, ay, az, bx, by, bz, r, shade in parts:
+        pax, pay, da = place(ax, ay, az)
+        pbx, pby, db = place(bx, by, bz)
+        flat.append((max(da, db), pax, pay, pbx, pby, r * SOLDIER_SCALE, shade))
+    flat.sort(key=lambda p: -p[0])              # far to near
+
+    shade_buf = [[0.0] * size for _ in range(size)]
+    alpha_buf = [[0.0] * size for _ in range(size)]
+    light = (-0.42, -0.50, 0.76)                # screen x right, y down, z out
+
+    for idx, (_, ax, ay, bx, by, r, base) in enumerate(flat):
+        x0 = max(0, int(min(ax, bx) - r - 2))
+        x1 = min(size - 1, int(max(ax, bx) + r + 2))
+        y0 = max(0, int(min(ay, by) - r - 2))
+        y1 = min(size - 1, int(max(ay, by) + r + 2))
+        seed = idx * 13.0
+        for py in range(y0, y1 + 1):
+            for px in range(x0, x1 + 1):
+                fx, fy = px + 0.5, py + 0.5
+                d2, along = _seg_nearest(fx, fy, ax, ay, bx, by)
+                d = math.sqrt(d2)
+                # Ragged silhouette: nothing on a soldier is a clean curve.
+                jitter = (_sample(_JITTER, fx * 0.45 + seed, fy * 0.45) - 0.5) * 1.7
+                cover = max(0.0, min(1.0, r + jitter - d + 0.5))
+                if cover <= 0.0:
+                    continue
+                # Fake the surface normal off the capsule cross-section so the
+                # part reads as round without any outline to define it.
+                nx = (fx - (ax + (bx - ax) * along)) / r
+                ny = (fy - (ay + (by - ay) * along)) / r
+                nz = math.sqrt(max(0.0, 1.0 - nx * nx - ny * ny))
+                lam = nx * light[0] + ny * light[1] + nz * light[2]
+                # Camouflage: two octaves quantised into patches, in part-local
+                # coordinates so the pattern travels with the limb.
+                u = along * 24.0 + seed
+                v = (nx * 0.7 + 0.5) * 9.0
+                n = 0.62 * _sample(_CAMO, u * 0.5, v * 0.5) + 0.38 * _sample(_CAMO_FINE, u, v)
+                if n < 0.42:
+                    camo = -0.062
+                elif n < 0.60:
+                    camo = 0.004
+                else:
+                    camo = 0.070
+                shade = base * (0.90 + 0.20 * lam) + camo
+                shade = max(0.0, min(1.0, shade))
+                shade_buf[py][px] = shade_buf[py][px] * (1 - cover) + shade * cover
+                alpha_buf[py][px] = alpha_buf[py][px] + cover * (1 - alpha_buf[py][px])
+    return shade_buf, alpha_buf
 
 
 def gen_soldier(path, size=64):
-    poses = [_soldier_pose(size, 0, 0, 0, 0)]  # frame 0: idle, legs together
-    for i in range(6):  # frames 1-6: walk
-        poses.append(_soldier_pose(size, 6.5, 1.0, 0, i / 6))
-    for i in range(6):  # frames 7-12: run (longer stride, forward lean)
-        poses.append(_soldier_pose(size, 9.5, 2.0, 3, i / 6))
-    grids = [_render(shapes, size) for shapes in poses]
-    rows = []
-    for y in range(size):
-        row = bytearray()
-        for g in grids:
-            for px in g[y]:
-                row += bytes(px)
-        rows.append(row)
-    write_png(path, size * len(grids), size, rows, color_type=6)  # RGBA
+    """Grid sheet: SOLDIER_DIRS rows of facings x 13 columns of animation
+    (0 idle, 1-6 walk, 7-12 run)."""
+    cycles = [(0.0, 0.0, 0.0, 0.0)]                        # idle
+    cycles += [(i / 6, 0.20, 0.0, 0.0) for i in range(6)]  # walk
+    cycles += [(i / 6, 0.34, 0.16, 0.05) for i in range(6)]  # run, leaning
+    cols = len(cycles)
+
+    rows = [bytearray() for _ in range(size * SOLDIER_DIRS)]
+    for d in range(SOLDIER_DIRS):
+        phi = 2 * math.pi * d / SOLDIER_DIRS
+        for t, stride, lean, crouch in cycles:
+            shade_buf, alpha_buf = _render_soldier_frame(
+                _soldier_parts(t, stride, lean, crouch), phi, size
+            )
+            for y in range(size):
+                row = rows[d * size + y]
+                for x in range(size):
+                    a = alpha_buf[y][x]
+                    if a <= 0.004:
+                        row += b'\x00\x00\x00\x00'
+                    else:
+                        v = max(0, min(255, int(shade_buf[y][x] * 255)))
+                        row += bytes((v, v, v, int(a * 255)))
+    write_png(path, size * cols, size * SOLDIER_DIRS, rows, color_type=6)  # RGBA
 
 
 def gen_tracer(path, w=32, h=8):

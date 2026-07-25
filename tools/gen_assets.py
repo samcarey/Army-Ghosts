@@ -13,6 +13,13 @@ Outputs to client/assets/:
                 engine tints it and rotates it to the bullet's flight angle.
   crosshair.png - 128x128 white ring with four inward ticks and a center dot
                 (RGBA); the aim-down-sights button icon.
+  rocks.png   - 4x1 grid of 96x96 boulder variants (RGBA, grayscale): irregular
+                harmonic outlines, lit from the top-left, faceted + grainy. The
+                engine picks the variant/rotation/tint from each rock's seed.
+  bushes.png  - 4x1 grid of 96x96 bush variants (RGBA, grayscale): overlapping
+                leaf lobes with rimmed edges. Flat interior alpha on purpose —
+                the engine draws them translucent, so overlapping bushes stack
+                into cleanly denser cover.
 
 Run from anywhere: python3 tools/gen_assets.py
 Committed outputs are canonical; rerun only when tweaking the look.
@@ -245,6 +252,101 @@ def gen_crosshair(path, size=128):
     write_png(path, size, size, rows, color_type=6)  # RGBA
 
 
+# ── Boulders ─────────────────────────────────────────────────────────────────
+
+
+def gen_rocks(path, frame=96, variants=4, fill=40.0):
+    """Boulder sheet: one row of `variants` frames, each an irregular blob whose
+    mean radius is `fill` px (the engine scales 2r/fill to match the sim's
+    collision circle). Grayscale — rocks are tinted per-seed at draw time."""
+    half = frame / 2
+    rows = [bytearray() for _ in range(frame)]
+    for v in range(variants):
+        rng = random.Random(900 + v)
+        # Outline: mean radius modulated by a few low-frequency harmonics, so
+        # every variant is lumpy in its own way but still roughly circular.
+        harmonics = [
+            (k, rng.uniform(0.03, 0.09), rng.uniform(0, 2 * math.pi))
+            for k in (2, 3, 5, 7)
+        ]
+        # Interior facets: wedges of slightly different shade, so the blob
+        # reads as chipped stone rather than a ball.
+        facets = [
+            (rng.uniform(0, 2 * math.pi), rng.uniform(0.3, 0.8), rng.uniform(-18, 18))
+            for _ in range(3)
+        ]
+        for y in range(frame):
+            for x in range(frame):
+                px, py = x + 0.5 - half, y + 0.5 - half
+                dist = math.hypot(px, py)
+                theta = math.atan2(py, px)
+                r = fill * (1 + sum(a * math.cos(k * theta + p) for k, a, p in harmonics))
+                alpha = max(0.0, min(1.0, r - dist + 0.5))
+                if alpha <= 0.0:
+                    rows[y] += b'\x00\x00\x00\x00'
+                    continue
+                # Lit from the top-left (image y is down, so -x-y faces the sun).
+                shade = 132 + 54 * max(-1.0, min(1.0, (-px - py) / (fill * 1.6)))
+                for center, width, amount in facets:
+                    if abs(((theta - center + math.pi) % (2 * math.pi)) - math.pi) < width:
+                        shade += amount
+                shade += rng.randint(-9, 9)  # grain
+                # Dark rim: separates the boulder from the ground underneath.
+                shade -= 48 * max(0.0, min(1.0, 3.5 - (r - dist)))
+                c = max(0, min(255, int(shade)))
+                rows[y] += bytes((c, c, c, int(alpha * 255)))
+    write_png(path, frame * variants, frame, rows, color_type=6)  # RGBA
+
+
+# ── Bushes ───────────────────────────────────────────────────────────────────
+
+
+def gen_bushes(path, frame=96, variants=4, fill=40.0):
+    """Bush sheet: one row of `variants` frames, each a clump of leaf lobes
+    covering a `fill`-radius canopy. Painter's order with a dark rim per lobe so
+    the clumps stay legible; interior alpha is flat (1.0) because the engine
+    draws bushes translucent and overlapping canopies must stack evenly."""
+    half = frame / 2
+    rows = [bytearray() for _ in range(frame)]
+    for v in range(variants):
+        rng = random.Random(1300 + v)
+        lobes = []
+        # Many small clumps rather than a few big ones: a handful of large
+        # lobes reads as a pile of balloons, a scatter of small ones reads as
+        # leaves. Bias placement outward (sqrt) so the canopy fills its circle.
+        for _ in range(34):
+            angle = rng.uniform(0, 2 * math.pi)
+            d = fill * 0.62 * math.sqrt(rng.random())
+            lobes.append((
+                math.cos(angle) * d,
+                math.sin(angle) * d,
+                rng.uniform(fill * 0.17, fill * 0.30),
+                rng.uniform(-26, 26),  # per-lobe tone
+            ))
+        for y in range(frame):
+            for x in range(frame):
+                px, py = x + 0.5 - half, y + 0.5 - half
+                alpha = 0.0
+                shade = None
+                for lx, ly, lr, tone in lobes:  # painter's order: last on top
+                    d = math.hypot(px - lx, py - ly)
+                    a = max(0.0, min(1.0, lr - d + 0.5))
+                    if a <= 0.0:
+                        continue
+                    alpha = max(alpha, a)
+                    # A gentle top-left lift plus a dark rim on this clump's
+                    # edge. Keep the gradient shallow — a strong one turns each
+                    # lobe back into a sphere.
+                    lit = 16 * max(-1.0, min(1.0, (-(px - lx) - (py - ly)) / lr))
+                    shade = 140 + tone + lit - 40 * max(0.0, min(1.0, 2.0 - (lr - d)))
+                if shade is None:
+                    rows[y] += b'\x00\x00\x00\x00'
+                    continue
+                c = max(0, min(255, int(shade + rng.randint(-10, 10))))
+                rows[y] += bytes((c, c, c, int(alpha * 255)))
+    write_png(path, frame * variants, frame, rows, color_type=6)  # RGBA
+
+
 if __name__ == '__main__':
     out = os.path.join(os.path.dirname(__file__), '..', 'client', 'assets')
     os.makedirs(out, exist_ok=True)
@@ -254,3 +356,5 @@ if __name__ == '__main__':
     gen_soldier(os.path.join(out, 'soldier.png'))
     gen_tracer(os.path.join(out, 'tracer.png'))
     gen_crosshair(os.path.join(out, 'crosshair.png'))
+    gen_rocks(os.path.join(out, 'rocks.png'))
+    gen_bushes(os.path.join(out, 'bushes.png'))

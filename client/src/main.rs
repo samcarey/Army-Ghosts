@@ -9,6 +9,7 @@ mod menu;
 mod net;
 mod render;
 mod touch;
+mod vision;
 
 pub use net::LaunchConfig;
 
@@ -54,6 +55,7 @@ fn main() {
                 ..default()
             }),
     )
+    .add_plugins(vision::VisionPlugin)
     .add_plugins(GgrsPlugin::<SessionConfig>::default())
     .add_plugins(SimPlugin::<SessionConfig>::default())
     .add_systems(ReadInputs, input::read_local_inputs)
@@ -72,6 +74,7 @@ fn main() {
             hud::setup_hud,
             menu::setup_menu,
             ads::setup_ads,
+            vision::setup_fog,
         )
             .chain(),
     )
@@ -105,6 +108,7 @@ fn main() {
                 render::bullet_trails,
                 render::sync_transforms,
                 ads::update_aim_line,
+                vision::update_fog,
                 render::camera_follow,
             )
                 .chain(),

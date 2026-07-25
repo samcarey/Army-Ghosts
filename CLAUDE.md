@@ -112,6 +112,43 @@ Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_SIGNALING` env vars.
   white line traces the shot to the first target it would hit, else the arena
   wall. The shift rides on `render::CameraFocus` (the follow target) so the
   camera's own lerp doesn't fight the aim ease.
+- **Cover** (`sim/src/lib.rs`: `rock_layout` / `bush_layout`): two procedural
+  fields, both pure integer rejection sampling from fixed seeds (`ROCK_SEED`,
+  `BUSH_SEED`) — no floats, no RNG crate, so every peer builds the identical
+  arena before the first tick, and `Pos` checksums catch it instantly if one
+  doesn't. **Rocks** are solid: `push_out_of_cover` shoves the player back out
+  along the surface normal, cancelling only the into-the-rock part of the step
+  (so an angled approach deflects around instead of stopping dead), and bullets
+  despawn on contact. **Bushes** stop nothing — they're concealment only, and
+  come in overlapping clusters. Layout constants keep every gap walkable
+  (`ROCK_GAP`/`ROCK_WALL_GAP` > the 24-unit player diameter) and keep the
+  spawn→practice-dummy lane clear so `TARGET_POINTS` stays "dead ahead".
+  `cargo test -p army-ghosts-sim` asserts both.
+- **Line of sight** (`client/src/vision.rs` + `client/assets/fog.wgsl`):
+  render-only — the sim never computes visibility (it can't; every peer
+  simulates every pawn). Each piece of cover casts a soft shadow away from the
+  local player into ONE `Mesh2d` triangle mesh rebuilt every frame.
+  `push_caster` sweeps rays across the angle the cover subtends and ramps alpha
+  from nothing where a ray *enters* the circle to full where it *leaves*, so
+  every rock and bush is lit on the player's side and rolls into darkness over
+  its back like a sphere lit from one side — and a thicket darkens bush by bush
+  from the inside instead of going flat at its front. Cover sprites therefore
+  draw UNDER the fog (rocks z 0.5, bushes 2.5, fog 5.0): the fog is what shades
+  them. Both flanks get a penumbra skirt fading to zero alpha, narrow at the
+  silhouette and widening with distance *past the caster* (an area-light
+  stand-in) — measuring that from the eye instead makes the skirt balloon
+  around the near side and halo over the lit flanks of its own rock. Bushes
+  blur ~1.8x wider than rocks, and `RIM_FEATHER` gives grazing rays a minimum
+  terminator so rocks don't get a hard rim where the ramp would otherwise
+  collapse to zero width. `BLUR_NEAR` (the floor) is the knob that controls the
+  softness you actually see, since most on-screen shadow edges sit close to
+  their caster; raising `BLUR_PER_UNIT` past ~0.3 instead just merges every
+  distant penumbra into mush. Rocks are opaque grey (anything in it is
+  genuinely hidden, not dimmed); bushes are 0.34 alpha and *stack*, since
+  overlapping triangles in one alpha-blended draw each multiply what gets
+  through. Bush shadows are emitted first so opaque rock shadows paint over
+  them. `NoFrustumCulling` is required: the Aabb is computed once when `Mesh2d`
+  is added, and the stale box blinks the fog out as the camera moves.
 
 ## Gotchas already hit (don't rediscover)
 
@@ -182,6 +219,24 @@ Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_SIGNALING` env vars.
 - **HUD**: bevy_ui needs `bevy_ui_render` (same render-split trap as
   sprites) + `bevy_text` + `default_font`. The embedded default font has no
   `…` glyph (renders as a box) — use ASCII `...`.
+- **`ColorMaterial` silently ignores vertex colors on a mesh that gains its
+  `ATTRIBUTE_COLOR` after spawn.** bevy gates them behind a `VERTEX_COLORS`
+  shader def decided at *first* specialization, and
+  `specialize_material2d_meshes` only re-specializes on `Changed<Mesh2d>` /
+  `Changed<MeshMaterial2d>` — never because the mesh asset grew an attribute.
+  A mesh spawned empty and filled in later therefore keeps a pipeline compiled
+  without the def forever. Symptom is maddening: geometry is perfect (the
+  vertex stride comes from the packed buffer either way), the mesh really does
+  report `contains_attribute(ATTRIBUTE_COLOR) == true`, there are no shader
+  errors, and every triangle just renders flat at the material color with
+  vertex alpha discarded. Seeding the attributes at spawn and calling
+  `set_changed()` on `Mesh2d` every frame both failed to fix it. The fix that
+  works is a custom `Material2d` whose `specialize` forces the vertex layout
+  (`layout.0.get_layout(&[POSITION.at_shader_location(0),
+  COLOR.at_shader_location(4)])`) with a shader that declares `@location(4)`
+  unconditionally — see `FogMaterial`. Also: `LinearRgba::rgb(v)` is NOT
+  `Color::srgb(v)`; feeding sRGB numbers to a shader as linear gives a washed
+  out, far paler color (`.to_linear()` on the way in).
 
 ## Public dev serving (caddy vhost on this Mac)
 
@@ -207,6 +262,8 @@ need a TURN server eventually.
 
 ## Testing
 
+- `cargo test -p army-ghosts-sim` — pure-integer layout/collision checks
+  (rock + bush fields land and stay walkable, cover deflects an angled walk).
 - Native smoke: run without a room (synctest re-simulates every frame — it
   catches nondeterminism AND rollback-unsafe state immediately).
 - Web smoke: `tools/build-web.sh` + local http.server + headless chromium

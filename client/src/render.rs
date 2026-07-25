@@ -7,7 +7,7 @@ use bevy::prelude::*;
 use bevy_ggrs::LocalPlayers;
 
 use army_ghosts_sim::{
-    Bullet, Facing, Player, Pos, Target, ARENA_HALF_H, ARENA_HALF_W, TARGET_R,
+    Bullet, Bush, Facing, Player, Pos, Rock, Target, ARENA_HALF_H, ARENA_HALF_W, TARGET_R,
 };
 
 use crate::ads::Ads;
@@ -71,6 +71,33 @@ pub struct WalkAnim {
 #[derive(Resource)]
 pub struct TracerImage(Handle<Image>);
 
+/// The boulder sheet (tools/gen_assets.py): one row of 96px grayscale blob
+/// variants whose outlines average `ROCK_FILL_PX` of the frame, so a rock of
+/// sim radius `r` draws at `2r * FRAME / FILL`.
+#[derive(Resource)]
+pub struct RockSheet {
+    image: Handle<Image>,
+    layout: Handle<TextureAtlasLayout>,
+}
+
+/// The bush sheet, laid out exactly like the boulder sheet.
+#[derive(Resource)]
+pub struct BushSheet {
+    image: Handle<Image>,
+    layout: Handle<TextureAtlasLayout>,
+}
+
+/// Both cover sheets share these: 96px frames whose blobs average 40px radius,
+/// so a piece of cover with sim radius `r` draws at `2r * FRAME / (2 * FILL)`.
+const COVER_FRAME_PX: u32 = 96;
+const COVER_VARIANTS: u32 = 4;
+const COVER_FILL_PX: f32 = 40.0;
+
+/// Canopy opacity. Deliberately partial: one bush is a smudge you can still
+/// make out a soldier through, and overlapping bushes stack toward solid — the
+/// same stacking the shadow layer does in `vision.rs`.
+const BUSH_ALPHA: f32 = 0.62;
+
 /// Bullet look: an elongated tracer rotated to its velocity angle.
 const BULLET_COLOR: Color = Color::srgb(1.0, 0.9, 0.4);
 const BULLET_LEN: f32 = 14.0;
@@ -111,9 +138,16 @@ const PLAYER_COLORS: [Color; 8] = [
 
 const Z_GROUND: f32 = -10.0;
 const Z_TARGET: f32 = 0.0;
+/// Boulders sit under the pawns, so you can walk in front of one.
+const Z_ROCK: f32 = 0.5;
 const Z_PLAYER: f32 = 1.0;
 const Z_TRAIL: f32 = 1.9;
 const Z_BULLET: f32 = 2.0;
+/// Cover draws *below* the fog mesh at z=5.0 (`vision.rs`) — on purpose: each
+/// shadow starts inside its own caster and rolls over its back, so the fog is
+/// what shades every rock and bush from the player's side. Canopies go over
+/// the boulders and the pawns — you hide *under* a bush.
+const Z_BUSH: f32 = 2.5;
 
 pub fn setup_scene(
     mut commands: Commands,
@@ -132,6 +166,17 @@ pub fn setup_scene(
         )),
     });
     commands.insert_resource(TracerImage(assets.load("tracer.png")));
+    let cover_grid = || {
+        TextureAtlasLayout::from_grid(UVec2::splat(COVER_FRAME_PX), COVER_VARIANTS, 1, None, None)
+    };
+    commands.insert_resource(RockSheet {
+        image: assets.load("rocks.png"),
+        layout: layouts.add(cover_grid()),
+    });
+    commands.insert_resource(BushSheet {
+        image: assets.load("bushes.png"),
+        layout: layouts.add(cover_grid()),
+    });
     commands.insert_resource(ClearColor(Color::srgb(0.08, 0.10, 0.06)));
     // Tiled grass/dirt ground across the arena (texture from tools/gen_assets.py).
     commands.spawn((
@@ -155,9 +200,13 @@ pub fn attach_sprites(
     mut commands: Commands,
     soldier: Res<SoldierSheet>,
     tracer: Res<TracerImage>,
+    rock_sheet: Res<RockSheet>,
+    bush_sheet: Res<BushSheet>,
     new_players: Query<(Entity, &Player), Added<Player>>,
     new_bullets: Query<(Entity, &Bullet), Added<Bullet>>,
     new_targets: Query<Entity, Added<Target>>,
+    new_rocks: Query<(Entity, &Rock), Added<Rock>>,
+    new_bushes: Query<(Entity, &Bush), Added<Bush>>,
 ) {
     for (entity, player) in &new_players {
         // Grayscale soldier sheet x per-player tint = one-color plastic
@@ -201,6 +250,61 @@ pub fn attach_sprites(
             Transform::from_xyz(0.0, 0.0, Z_TARGET),
         ));
     }
+    for (entity, rock) in &new_rocks {
+        let shade = 0.38 + (rock.seed / 1024 % 64) as f32 * 0.0022;
+        commands.entity(entity).insert(cover_sprite(
+            &rock_sheet.image,
+            &rock_sheet.layout,
+            rock.r,
+            rock.seed,
+            Color::srgb(shade, shade * 0.98, shade * 0.92),
+            Z_ROCK,
+        ));
+    }
+    for (entity, bush) in &new_bushes {
+        // Brighter and greener than the ground tile on purpose: at 60%-ish
+        // opacity over grass, anything subtler just reads as a dark patch of
+        // dirt, and cover you can't see is cover you can't use.
+        let shade = 0.52 + (bush.seed / 1024 % 64) as f32 * 0.0032;
+        commands.entity(entity).insert(cover_sprite(
+            &bush_sheet.image,
+            &bush_sheet.layout,
+            bush.r,
+            bush.seed,
+            Color::srgba(shade * 0.75, shade * 1.45, shade * 0.55, BUSH_ALPHA),
+            Z_BUSH,
+        ));
+    }
+}
+
+/// One piece of cover's look. Variant, spin and shade all come off its own
+/// seed, so a dozen rocks out of four textures still read as a dozen different
+/// boulders — and every peer draws the same field (cosmetic, but it keeps
+/// screenshots comparable across machines).
+fn cover_sprite(
+    image: &Handle<Image>,
+    layout: &Handle<TextureAtlasLayout>,
+    radius: i32,
+    seed: u32,
+    color: Color,
+    z: f32,
+) -> (Sprite, Transform) {
+    let angle = (seed / COVER_VARIANTS % 360) as f32 * std::f32::consts::PI / 180.0;
+    (
+        Sprite {
+            image: image.clone(),
+            texture_atlas: Some(TextureAtlas {
+                layout: layout.clone(),
+                index: (seed % COVER_VARIANTS) as usize,
+            }),
+            color,
+            custom_size: Some(Vec2::splat(
+                (radius * 2) as f32 * COVER_FRAME_PX as f32 / (COVER_FILL_PX * 2.0),
+            )),
+            ..default()
+        },
+        Transform::from_xyz(0.0, 0.0, z).with_rotation(Quat::from_rotation_z(angle)),
+    )
 }
 
 /// Rotate player pawns toward their sim `Facing` (render-only — the sim's

@@ -57,10 +57,10 @@ use army_ghosts_sim::{Bush, Player, Pos, Rock, PLAYER_R};
 /// per rebuild (`LinearRgba::rgb(0.14, ..)` would be a *much* paler grey).
 const FOG_COLOR: Color = Color::srgb(0.14, 0.145, 0.15);
 const FOG_UMBRA: f32 = 1.0;
-/// Per-bush haze. A lone bush already smudges what's behind it and two are
-/// most of the way to cover (1 - 0.39^2 ≈ 0.85), so a thicket is a wall.
+/// Per-bush haze. A lone bush nearly hides what's behind it and two are all but
+/// solid (1 - 0.085^2 ≈ 0.99), so a thicket is a wall.
 const BUSH_FOG_COLOR: Color = Color::srgb(0.13, 0.15, 0.12);
-const BUSH_FOG_UMBRA: f32 = 0.61;
+const BUSH_FOG_UMBRA: f32 = 0.915;
 /// How far a shadow is extended past its caster, world units. Anything past
 /// the arena diagonal is off-screen at any sane zoom.
 const FOG_FAR: f32 = 1600.0;

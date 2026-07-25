@@ -98,23 +98,31 @@ pub struct RockSheet {
     layout: Handle<TextureAtlasLayout>,
 }
 
-/// The bush sheet, laid out exactly like the boulder sheet.
+/// The bush sheet: same 96px frames, but the bushes are *colour* (fractal
+/// branches and leaves, see `tools/gen_assets.py`) and modelled in 3D at the
+/// soldiers' viewing angle — so unlike boulders they have a definite up and
+/// must never be spun by their seed.
 #[derive(Resource)]
 pub struct BushSheet {
     image: Handle<Image>,
     layout: Handle<TextureAtlasLayout>,
 }
 
-/// Both cover sheets share these: 96px frames whose blobs average 40px radius,
-/// so a piece of cover with sim radius `r` draws at `2r * FRAME / (2 * FILL)`.
+/// Both cover sheets use 96px frames; a piece of cover with sim radius `r`
+/// draws at `2r * FRAME / (2 * FILL)`, where `FILL` is the mean radius the
+/// generator fills its frame to.
 const COVER_FRAME_PX: u32 = 96;
-const COVER_VARIANTS: u32 = 4;
-const COVER_FILL_PX: f32 = 40.0;
+const ROCK_VARIANTS: u32 = 4;
+const ROCK_FILL_PX: f32 = 40.0;
+const BUSH_VARIANTS: u32 = 6;
+const BUSH_FILL_PX: f32 = 30.0;
 
 /// Canopy opacity. Deliberately partial: one bush is a smudge you can still
 /// make out a soldier through, and overlapping bushes stack toward solid — the
-/// same stacking the shadow layer does in `vision.rs`.
-const BUSH_ALPHA: f32 = 0.62;
+/// same stacking the shadow layer does in `vision.rs`. Higher than it used to
+/// be because the canopy now has real gaps in it: the leaves do some of the
+/// see-through that a flat alpha used to have to do alone.
+const BUSH_ALPHA: f32 = 0.90;
 
 /// Bullet look: an elongated tracer rotated to its velocity angle.
 const BULLET_COLOR: Color = Color::srgb(1.0, 0.9, 0.4);
@@ -188,16 +196,16 @@ pub fn setup_scene(
         )),
     });
     commands.insert_resource(TracerImage(assets.load("tracer.png")));
-    let cover_grid = || {
-        TextureAtlasLayout::from_grid(UVec2::splat(COVER_FRAME_PX), COVER_VARIANTS, 1, None, None)
+    let cover_grid = |variants| {
+        TextureAtlasLayout::from_grid(UVec2::splat(COVER_FRAME_PX), variants, 1, None, None)
     };
     commands.insert_resource(RockSheet {
         image: assets.load("rocks.png"),
-        layout: layouts.add(cover_grid()),
+        layout: layouts.add(cover_grid(ROCK_VARIANTS)),
     });
     commands.insert_resource(BushSheet {
         image: assets.load("bushes.png"),
-        layout: layouts.add(cover_grid()),
+        layout: layouts.add(cover_grid(BUSH_VARIANTS)),
     });
     commands.insert_resource(ClearColor(Color::srgb(0.08, 0.10, 0.06)));
     // Tiled grass/dirt ground across the arena (texture from tools/gen_assets.py).
@@ -275,60 +283,53 @@ pub fn attach_sprites(
         ));
     }
     for (entity, rock) in &new_rocks {
+        // Variant, spin and shade all come off the rock's own seed, so a dozen
+        // boulders out of four textures still read as a dozen boulders — and
+        // every peer draws the same field (cosmetic, but it keeps screenshots
+        // comparable across machines).
         let shade = 0.38 + (rock.seed / 1024 % 64) as f32 * 0.0022;
-        commands.entity(entity).insert(cover_sprite(
-            &rock_sheet.image,
-            &rock_sheet.layout,
-            rock.r,
-            rock.seed,
-            Color::srgb(shade, shade * 0.98, shade * 0.92),
-            Z_ROCK,
+        let angle = (rock.seed / ROCK_VARIANTS % 360) as f32 * std::f32::consts::PI / 180.0;
+        commands.entity(entity).insert((
+            Sprite {
+                image: rock_sheet.image.clone(),
+                texture_atlas: Some(TextureAtlas {
+                    layout: rock_sheet.layout.clone(),
+                    index: (rock.seed % ROCK_VARIANTS) as usize,
+                }),
+                color: Color::srgb(shade, shade * 0.98, shade * 0.92),
+                custom_size: Some(cover_size(rock.r, ROCK_FILL_PX)),
+                ..default()
+            },
+            Transform::from_xyz(0.0, 0.0, Z_ROCK).with_rotation(Quat::from_rotation_z(angle)),
         ));
     }
     for (entity, bush) in &new_bushes {
-        // Brighter and greener than the ground tile on purpose: at 60%-ish
-        // opacity over grass, anything subtler just reads as a dark patch of
-        // dirt, and cover you can't see is cover you can't use.
-        let shade = 0.52 + (bush.seed / 1024 % 64) as f32 * 0.0032;
-        commands.entity(entity).insert(cover_sprite(
-            &bush_sheet.image,
-            &bush_sheet.layout,
-            bush.r,
-            bush.seed,
-            Color::srgba(shade * 0.75, shade * 1.45, shade * 0.55, BUSH_ALPHA),
-            Z_BUSH,
+        // The bush frames carry their own greens, so the tint is near-white —
+        // just enough per-seed value drift that neighbours in a thicket don't
+        // look stamped. No rotation (a 3/4-view bush spun on its z tips over);
+        // variety comes from six variants plus a mirror.
+        let shade = 0.86 + (bush.seed / 1024 % 32) as f32 * 0.0075;
+        commands.entity(entity).insert((
+            Sprite {
+                image: bush_sheet.image.clone(),
+                texture_atlas: Some(TextureAtlas {
+                    layout: bush_sheet.layout.clone(),
+                    index: (bush.seed % BUSH_VARIANTS) as usize,
+                }),
+                color: Color::srgba(shade * 0.97, shade, shade * 0.93, BUSH_ALPHA),
+                custom_size: Some(cover_size(bush.r, BUSH_FILL_PX)),
+                flip_x: bush.seed / BUSH_VARIANTS % 2 == 1,
+                ..default()
+            },
+            Transform::from_xyz(0.0, 0.0, Z_BUSH),
         ));
     }
 }
 
-/// One piece of cover's look. Variant, spin and shade all come off its own
-/// seed, so a dozen rocks out of four textures still read as a dozen different
-/// boulders — and every peer draws the same field (cosmetic, but it keeps
-/// screenshots comparable across machines).
-fn cover_sprite(
-    image: &Handle<Image>,
-    layout: &Handle<TextureAtlasLayout>,
-    radius: i32,
-    seed: u32,
-    color: Color,
-    z: f32,
-) -> (Sprite, Transform) {
-    let angle = (seed / COVER_VARIANTS % 360) as f32 * std::f32::consts::PI / 180.0;
-    (
-        Sprite {
-            image: image.clone(),
-            texture_atlas: Some(TextureAtlas {
-                layout: layout.clone(),
-                index: (seed % COVER_VARIANTS) as usize,
-            }),
-            color,
-            custom_size: Some(Vec2::splat(
-                (radius * 2) as f32 * COVER_FRAME_PX as f32 / (COVER_FILL_PX * 2.0),
-            )),
-            ..default()
-        },
-        Transform::from_xyz(0.0, 0.0, z).with_rotation(Quat::from_rotation_z(angle)),
-    )
+/// On-screen size of a piece of cover: scale the frame so the blob the
+/// generator filled it to (`fill` px mean radius) lands on the sim radius.
+fn cover_size(radius: i32, fill: f32) -> Vec2 {
+    Vec2::splat((radius * 2) as f32 * COVER_FRAME_PX as f32 / (fill * 2.0))
 }
 
 /// Advance each soldier's walk/run cycle from their *rendered* speed (Pos

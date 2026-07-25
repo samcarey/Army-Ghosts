@@ -19,10 +19,11 @@ Outputs to client/assets/:
   rocks.png   - 4x1 grid of 96x96 boulder variants (RGBA, grayscale): irregular
                 harmonic outlines, lit from the top-left, faceted + grainy. The
                 engine picks the variant/rotation/tint from each rock's seed.
-  bushes.png  - 4x1 grid of 96x96 bush variants (RGBA, grayscale): overlapping
-                leaf lobes with rimmed edges. Flat interior alpha on purpose —
-                the engine draws them translucent, so overlapping bushes stack
-                into cleanly denser cover.
+  bushes.png  - 6x1 grid of 96x96 bush variants (RGBA, COLOUR): fractal
+                branches with leaf capsules, modelled in 3D and projected at the
+                same 40 degrees off top-down as the soldier, so cover is seen
+                from the figures' angle. The engine tints these near-white,
+                draws them translucent (they stack), and must NOT rotate them.
 
 Run from anywhere: python3 tools/gen_assets.py
 Committed outputs are canonical; rerun only when tweaking the look.
@@ -413,51 +414,203 @@ def gen_rocks(path, frame=96, variants=4, fill=40.0):
 
 
 # ── Bushes ───────────────────────────────────────────────────────────────────
+# Like the soldier, a bush is modelled ONCE in 3D (x right, y forward, z up,
+# origin on the ground at the stem) and projected at the same `SOLDIER_TILT`,
+# so cover is seen from the same 3/4 angle the figures are: canopy above, a
+# little trunk showing below, and a silhouette with real vertical extent rather
+# than a top-down splat. Because the projection is orthonormal a sphere stays a
+# circle, so a canopy of radius 1 still fills a circle of `BUSH_SCALE` px around
+# the frame centre — which is what lets the sprite keep matching the sim's
+# collision/concealment circle.
+#
+# The structure is a small L-system: stems from the base recursively split into
+# shorter, thinner, paler, more transparent children, with leaf capsules
+# scattered over the last two generations. Everything is COLOUR here (unlike
+# the grayscale rock/soldier sheets) — the engine only applies a near-white
+# per-bush tint — because the point of the fractal is the variation *within* a
+# bush: bark against leaf, lit top against shaded underside.
+#
+# Knock-on: these frames have a definite up, so bushes must NEVER be spun by a
+# per-seed rotation the way boulders are. Variety comes from more variants plus
+# a horizontal flip.
+
+BUSH_SCALE = 34.0        # px per bush unit; canopy radius ≈ 1 unit
+BUSH_CANOPY_Z = 0.98     # canopy centre height — the frame is centred on it
+BUSH_LEAF_Z = 0.38       # no leaves below this: bare stems make the angle read
+BUSH_DEPTH = 4           # branch generations below the stem
+
+# Bark: thick lower wood is dark and warm, twigs pale toward the leaf greens.
+_BARK_THICK = (0.25, 0.20, 0.14)
+_BARK_THIN = (0.38, 0.35, 0.21)
+# Leaf greens, deliberately spread in value AND hue so the canopy never reads
+# as one flat colour once it's shrunk to ~30 px on screen.
+_LEAF_GREENS = [
+    (0.20, 0.31, 0.12),
+    (0.26, 0.39, 0.15),
+    (0.33, 0.47, 0.18),
+    (0.40, 0.53, 0.22),
+    (0.44, 0.50, 0.20),
+]
 
 
-def gen_bushes(path, frame=96, variants=4, fill=40.0):
-    """Bush sheet: one row of `variants` frames, each a clump of leaf lobes
-    covering a `fill`-radius canopy. Painter's order with a dark rim per lobe so
-    the clumps stay legible; interior alpha is flat (1.0) because the engine
-    draws bushes translucent and overlapping canopies must stack evenly."""
-    half = frame / 2
+def _norm3(v):
+    m = math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) or 1.0
+    return (v[0] / m, v[1] / m, v[2] / m)
+
+
+def _cross3(a, b):
+    return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0])
+
+
+def _spread(d, tilt, azim):
+    """`d` tipped `tilt` radians away from itself, rolled to `azim` around it."""
+    ref = (0.0, 0.0, 1.0) if abs(d[2]) < 0.9 else (1.0, 0.0, 0.0)
+    u = _norm3(_cross3(d, ref))
+    v = _cross3(d, u)
+    st, ct = math.sin(tilt), math.cos(tilt)
+    ca, sa = math.cos(azim), math.sin(azim)
+    return _norm3(tuple(d[i] * ct + (u[i] * ca + v[i] * sa) * st for i in range(3)))
+
+
+def _mix(a, b, t):
+    return tuple(a[i] + (b[i] - a[i]) * t for i in range(3))
+
+
+def _bush_parts(rng):
+    """One bush in bush space: capsules `(a, b, radius, rgb, alpha, leaf)`."""
+    parts = []
+
+    def leaves(base, direction, count, size):
+        for _ in range(count):
+            # Splay hard off the twig and let gravity pull the tip down, so
+            # leaves fan and droop instead of bristling straight out.
+            d = _spread(direction, rng.uniform(0.6, 1.6), rng.uniform(0, 2 * math.pi))
+            d = _norm3((d[0], d[1], d[2] - rng.uniform(0.15, 0.75)))
+            length = size * rng.uniform(0.75, 1.5)
+            tip = tuple(base[i] + d[i] * length for i in range(3))
+            if tip[2] < BUSH_LEAF_Z:              # bare wood below the canopy
+                continue
+            colour = _LEAF_GREENS[rng.randrange(len(_LEAF_GREENS))]
+            # Sunlit crown, shaded skirt: a straight value ramp with height
+            # does more for the dome read than any per-leaf shading trick.
+            dome = 0.66 + 0.52 * max(0.0, min(1.0, (tip[2] - BUSH_LEAF_Z) / 1.05))
+            colour = tuple(
+                max(0.0, min(1.0, c * dome + rng.uniform(-0.02, 0.02))) for c in colour
+            )
+            parts.append((
+                base, tip, size * rng.uniform(0.30, 0.46),
+                colour, rng.uniform(0.55, 0.95), True,
+            ))
+
+    def grow(p, d, length, radius, depth):
+        # A touch of droop per generation keeps branches from looking welded.
+        d = _norm3((d[0], d[1], d[2] - 0.10 * (BUSH_DEPTH - depth)))
+        end = tuple(p[i] + d[i] * length for i in range(3))
+        thin = 1.0 - depth / BUSH_DEPTH
+        parts.append((
+            p, end, radius,
+            _mix(_BARK_THICK, _BARK_THIN, thin * rng.uniform(0.7, 1.2)),
+            0.95 - 0.35 * thin,                   # twigs read as wisps, not wire
+            False,
+        ))
+        if depth <= 1:
+            leaves(end, d, rng.randint(4, 7), 0.105)
+            at = tuple(p[i] + (end[i] - p[i]) * 0.55 for i in range(3))
+            leaves(at, d, rng.randint(2, 4), 0.092)
+        if depth == 0:
+            return
+        children = rng.randint(2, 3)
+        roll = rng.uniform(0, 2 * math.pi)
+        for i in range(children):
+            azim = roll + 2 * math.pi * i / children + rng.uniform(-0.5, 0.5)
+            child = _spread(d, rng.uniform(0.35, 0.85), azim)
+            grow(end, child, length * rng.uniform(0.62, 0.80),
+                 radius * rng.uniform(0.55, 0.70), depth - 1)
+
+    stems = rng.randint(3, 5)
+    roll = rng.uniform(0, 2 * math.pi)
+    for i in range(stems):
+        azim = roll + 2 * math.pi * i / stems + rng.uniform(-0.4, 0.4)
+        foot = (math.cos(azim) * 0.05, math.sin(azim) * 0.05, 0.0)
+        d = _spread((0.0, 0.0, 1.0), rng.uniform(0.16, 0.42), azim)
+        grow(foot, d, rng.uniform(0.46, 0.62), rng.uniform(0.045, 0.068), BUSH_DEPTH)
+    return parts
+
+
+def _render_bush_frame(parts, size):
+    """Project, depth sort and composite one bush into (rgb, alpha) buffers."""
+    cos_t, sin_t = math.cos(SOLDIER_TILT), math.sin(SOLDIER_TILT)
+    ground_py = size / 2 + BUSH_CANOPY_Z * sin_t * BUSH_SCALE
+
+    def place(p):
+        px = size / 2 + p[0] * BUSH_SCALE
+        py = ground_py - (p[1] * cos_t + p[2] * sin_t) * BUSH_SCALE
+        return px, py, p[1] * sin_t - p[2] * cos_t   # bigger = further away
+
+    flat = []
+    for a, b, r, colour, alpha, leaf in parts:
+        pax, pay, da = place(a)
+        pbx, pby, db = place(b)
+        flat.append((max(da, db), pax, pay, pbx, pby, r * BUSH_SCALE, colour, alpha, leaf))
+    flat.sort(key=lambda p: -p[0])                    # far to near
+
+    # Premultiplied accumulation, so parts of different opacity composite
+    # correctly instead of the near one simply winning.
+    prem = [[[0.0, 0.0, 0.0] for _ in range(size)] for _ in range(size)]
+    acc = [[0.0] * size for _ in range(size)]
+    light = (-0.42, -0.50, 0.76)                      # screen x right, y down, z out
+
+    for idx, (_, ax, ay, bx, by, r, colour, alpha, leaf) in enumerate(flat):
+        x0 = max(0, int(min(ax, bx) - r - 2))
+        x1 = min(size - 1, int(max(ax, bx) + r + 2))
+        y0 = max(0, int(min(ay, by) - r - 2))
+        y1 = min(size - 1, int(max(ay, by) + r + 2))
+        seed = idx * 7.0
+        wobble = min(1.4, r * 0.55)                   # leaves are tiny — scale it
+        for py in range(y0, y1 + 1):
+            for px in range(x0, x1 + 1):
+                fx, fy = px + 0.5, py + 0.5
+                d2, along = _seg_nearest(fx, fy, ax, ay, bx, by)
+                d = math.sqrt(d2)
+                jitter = (_sample(_JITTER, fx * 0.6 + seed, fy * 0.6) - 0.5) * wobble
+                geom = max(0.0, min(1.0, r + jitter - d + 0.5))
+                if geom <= 0.0:
+                    continue
+                nx = (fx - (ax + (bx - ax) * along)) / r
+                ny = (fy - (ay + (by - ay) * along)) / r
+                nz = math.sqrt(max(0.0, 1.0 - nx * nx - ny * ny))
+                lam = nx * light[0] + ny * light[1] + nz * light[2]
+                # Leaves are near-flat blades; wood is round. Same normal, very
+                # different amount of it.
+                shade = (0.93 + 0.14 * lam) if leaf else (0.82 + 0.34 * lam)
+                if leaf:
+                    shade += 0.10 * (_sample(_CAMO_FINE, fx * 0.5, fy * 0.5) - 0.5)
+                cov = geom * alpha
+                for c in range(3):
+                    lit = max(0.0, min(1.0, colour[c] * shade))
+                    prem[py][px][c] = prem[py][px][c] * (1 - cov) + lit * cov
+                acc[py][px] = acc[py][px] * (1 - cov) + cov
+    return prem, acc
+
+
+def gen_bushes(path, frame=96, variants=6):
+    """Bush sheet: one row of `variants` fractal bushes, each modelled in 3D and
+    projected at `SOLDIER_TILT`. Colour, not grayscale (see the note above)."""
     rows = [bytearray() for _ in range(frame)]
     for v in range(variants):
-        rng = random.Random(1300 + v)
-        lobes = []
-        # Many small clumps rather than a few big ones: a handful of large
-        # lobes reads as a pile of balloons, a scatter of small ones reads as
-        # leaves. Bias placement outward (sqrt) so the canopy fills its circle.
-        for _ in range(34):
-            angle = rng.uniform(0, 2 * math.pi)
-            d = fill * 0.62 * math.sqrt(rng.random())
-            lobes.append((
-                math.cos(angle) * d,
-                math.sin(angle) * d,
-                rng.uniform(fill * 0.17, fill * 0.30),
-                rng.uniform(-26, 26),  # per-lobe tone
-            ))
+        prem, acc = _render_bush_frame(_bush_parts(random.Random(1300 + v)), frame)
         for y in range(frame):
+            row = rows[y]
             for x in range(frame):
-                px, py = x + 0.5 - half, y + 0.5 - half
-                alpha = 0.0
-                shade = None
-                for lx, ly, lr, tone in lobes:  # painter's order: last on top
-                    d = math.hypot(px - lx, py - ly)
-                    a = max(0.0, min(1.0, lr - d + 0.5))
-                    if a <= 0.0:
-                        continue
-                    alpha = max(alpha, a)
-                    # A gentle top-left lift plus a dark rim on this clump's
-                    # edge. Keep the gradient shallow — a strong one turns each
-                    # lobe back into a sphere.
-                    lit = 16 * max(-1.0, min(1.0, (-(px - lx) - (py - ly)) / lr))
-                    shade = 140 + tone + lit - 40 * max(0.0, min(1.0, 2.0 - (lr - d)))
-                if shade is None:
-                    rows[y] += b'\x00\x00\x00\x00'
+                a = acc[y][x]
+                if a <= 0.004:
+                    row += b'\x00\x00\x00\x00'
                     continue
-                c = max(0, min(255, int(shade + rng.randint(-10, 10))))
-                rows[y] += bytes((c, c, c, int(alpha * 255)))
+                px = prem[y][x]
+                row += bytes(
+                    tuple(max(0, min(255, int(px[c] / a * 255))) for c in range(3))
+                    + (int(min(1.0, a) * 255),)
+                )
     write_png(path, frame * variants, frame, rows, color_type=6)  # RGBA
 
 

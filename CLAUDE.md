@@ -148,6 +148,21 @@ Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_SIGNALING` env vars.
   (`ROCK_GAP`/`ROCK_WALL_GAP` > the 24-unit player diameter) and keep the
   spawn→practice-dummy lane clear so `TARGET_POINTS` stays "dead ahead".
   `cargo test -p army-ghosts-sim` asserts both.
+  Art-wise the two are opposites. Boulders are grayscale top-down blobs, tinted
+  and *spun* by their seed. Bushes (`gen_bushes`) are modelled in 3D exactly
+  like the soldier — a small L-system of tapering branch capsules, each
+  generation shorter, thinner, paler and more transparent, with leaf capsules
+  on the last two — and projected at the same `SOLDIER_TILT`, so cover is seen
+  from the figures' angle instead of straight down. Consequences:
+  * The frames carry their own greens (the only COLOUR sheet), so the per-bush
+    tint is near-white; and a 3/4-view bush must NEVER be rotated (it tips
+    over), so variety is 6 variants + `flip_x` instead of a seed angle.
+  * Orthographic projection keeps a sphere a circle, so the canopy still fills
+    a circle around the frame centre and lines up with the sim's concealment
+    circle — but it only fills `BUSH_FILL_PX` (30) of the 96px frame, not the
+    boulders' 40, and `cover_size` scales each sheet by its own fill.
+  * Leaves stop at `BUSH_LEAF_Z`: bare stems under the canopy are what makes
+    the viewing angle read at all. Without them it's a green ball again.
 - **Line of sight** (`client/src/vision.rs` + `client/assets/fog.wgsl`):
   render-only — the sim never computes visibility (it can't; every peer
   simulates every pawn). Each piece of cover casts a soft shadow away from the

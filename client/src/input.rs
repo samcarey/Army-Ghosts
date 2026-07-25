@@ -1,7 +1,8 @@
 //! Local input collection → the `PlayerInput` structs GGRS sends each tick.
-//! Milestone 1 adds the touch joystick + fire buttons; for the scaffold this
-//! is keyboard only (WASD/arrows to move, Space to fire) so the desktop dev
-//! loop works.
+//! Touch (joystick + fire button + the bevy_ui buttons) is the real control
+//! scheme; the keyboard equivalents keep the desktop dev loop and the headless
+//! tests usable: WASD/arrows move, Space fires, Shift toggles sights, C goes
+//! down a stance and V gets back up.
 
 use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
@@ -10,6 +11,7 @@ use bevy_ggrs::{LocalInputs, LocalPlayers};
 use army_ghosts_sim::{PlayerInput, BTN_ADS, BTN_FIRE};
 
 use crate::ads::Ads;
+use crate::stance::StanceControl;
 use crate::touch::TouchControls;
 use crate::SessionConfig;
 
@@ -18,6 +20,7 @@ pub fn read_local_inputs(
     keys: Res<ButtonInput<KeyCode>>,
     touch: Res<TouchControls>,
     ads: Res<Ads>,
+    stance: Res<StanceControl>,
     local_players: Res<LocalPlayers>,
 ) {
     let mut local_inputs = HashMap::new();
@@ -57,6 +60,10 @@ pub fn read_local_inputs(
             if ads.active {
                 input.buttons |= BTN_ADS;
             }
+            // Same deal for the stance the player is asking for (`stance.rs`):
+            // an absolute level, re-sent every tick, so replaying a frame
+            // re-applies it identically.
+            input.set_stance(stance.wanted);
             first = false;
         }
         local_inputs.insert(*handle, input);

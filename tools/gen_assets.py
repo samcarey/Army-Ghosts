@@ -5,10 +5,11 @@ Outputs to client/assets/:
   ground.png  - 128x128 tileable grass/dirt noise tile (RGB)
   disc.png    - 128x128 white disc with soft edge (RGBA, tint via sprite color)
   ring.png    - 128x128 white ring outline (RGBA, joystick base)
-  soldier.png - 13x16 grid of 64x64 frames: a 3/4-view soldier modelled in 3D
+  soldier.png - 39x16 grid of 72x72 frames: a 3/4-view soldier modelled in 3D
                 and projected 40 degrees off top-down, always upright (head up,
-                feet down). Columns are animation (0 idle, 1-6 walk, 7-12 run),
-                rows are the 16 facings clockwise from away-from-camera.
+                feet down). Rows are the 16 facings clockwise from
+                away-from-camera; columns are three 13-column stance blocks
+                (standing, crouching, prone), each 0 idle, 1-6 walk, 7-12 run.
                 Grayscale (engine tints per player), low contrast, camouflaged,
                 no outlines.
   tracer.png  - 32x8 white tracer streak pointing RIGHT (+x): soft capsule
@@ -16,6 +17,8 @@ Outputs to client/assets/:
                 engine tints it and rotates it to the bullet's flight angle.
   crosshair.png - 128x128 white ring with four inward ticks and a center dot
                 (RGBA); the aim-down-sights button icon.
+  chevron.png - 128x128 white chevron pointing UP (RGBA); the stance buttons
+                use it as-is to stand up and flipped to get down.
   rocks.png   - 4x1 grid of 96x96 boulder variants (RGBA, grayscale): irregular
                 harmonic outlines, lit from the top-left, faceted + grainy. The
                 engine picks the variant/rotation/tint from each rock's seed.
@@ -118,11 +121,24 @@ def gen_disc(path, size=128, inner=None):
 # contrast: shades sit in a narrow band, there are no dark outlines separating
 # parts, camouflage breaks up each part in muted bands, and the silhouette is
 # jittered by noise so nothing reads as a clean analytic curve.
+#
+# Three stances share the model: standing and crouching are the same figure with
+# the hips dropped (and the knees driven out to match), prone is its own layout
+# lying along +y. Prone is why the frame is 72px and not 64: a soldier seen
+# side-on while prone is as long as they are tall standing up, with no
+# foreshortening to shrink it, so the widest frame in the sheet is a crawling
+# figure facing due east.
 
 SOLDIER_TILT = math.radians(40.0)   # off straight-down
 SOLDIER_DIRS = 16                   # facings, clockwise from "away from camera"
+SOLDIER_FRAME = 72                  # px per frame
 SOLDIER_SCALE = 38.0                # px per character unit
-SOLDIER_GROUND_PY = 52.0            # where the character's ground point lands
+SOLDIER_GROUND_PY = 58.5            # where an upright figure's ground point lands
+# Prone frames are centred instead: the origin is mid-body (roughly under the
+# ribs), because that is where the pawn's `Pos` is and the figure has to be able
+# to swing around it in any of the 16 facings without leaving the frame.
+SOLDIER_PRONE_PY = 36.0
+STANCE_COLS = 13                    # animation columns per stance block
 
 
 def _seg_dist2(px, py, ax, ay, bx, by):
@@ -174,18 +190,24 @@ def _soldier_parts(t, stride, lean, crouch):
     s = math.sin(2 * math.pi * t)
     bob = abs(math.sin(4 * math.pi * t)) * 0.012
     parts = []
-    hip_z = 0.86 - crouch + bob
+    # Everything above the waist is authored at standing height and dropped by
+    # `crouch` exactly once, in `up()`. HIP_Z is that reference height; `hip_z`
+    # is where the hips actually end up.
+    HIP_Z = 0.86
+    hip_z = HIP_Z - crouch + bob
 
     # Legs. The foot swings fore/aft and lifts on the forward half of its
     # swing; the knee is the midpoint pushed slightly forward so it reads as a
-    # bend rather than a straight peg.
+    # bend rather than a straight peg. Crouching drives the knee further
+    # forward and out to the side — without that the dropped hips just read as
+    # a short soldier instead of a folded one.
     for side in (-1, 1):
         swing = s * side
         foot = (side * 0.11, swing * stride, 0.055 + max(0.0, swing) * 0.07)
         hip = (side * 0.10, 0.0, hip_z)
         knee = (
-            (hip[0] + foot[0]) * 0.5,
-            (hip[1] + foot[1]) * 0.5 + 0.055,
+            (hip[0] + foot[0]) * 0.5 + side * crouch * 0.30,
+            (hip[1] + foot[1]) * 0.5 + 0.055 + crouch * 0.55,
             (hip[2] + foot[2]) * 0.5,
         )
         parts.append((*hip, *knee, 0.093, 0.52))          # thigh
@@ -193,11 +215,14 @@ def _soldier_parts(t, stride, lean, crouch):
         parts.append((foot[0], foot[1] - 0.055, foot[2],
                       foot[0], foot[1] + 0.085, foot[2], 0.072, 0.42))  # boot
 
-    # Upper body, pitched forward by `lean`.
+    # Upper body, pitched forward by `lean` and dropped by `crouch`. `z` is a
+    # standing height — feeding it `hip_z` (which has already paid the crouch)
+    # would drop the torso twice, which reads as fine at the run cycle's 0.05
+    # and puts the shoulders through the knees at a real crouch.
     def up(y, z):
-        return (y + lean * (z - hip_z) * 1.5, z - crouch + bob)
+        return (y + lean * (z - HIP_Z) * 1.5, z - crouch + bob)
 
-    hy, hz = up(0.0, hip_z + 0.03)
+    hy, hz = up(0.0, HIP_Z + 0.03)
     parts.append((-0.11, hy, hz, 0.11, hy, hz, 0.125, 0.55))          # hips
     ty, tz = up(-0.01, 1.28)
     parts.append((0.0, hy, hz, 0.0, ty, tz, 0.170, 0.58))             # torso
@@ -230,7 +255,57 @@ def _soldier_parts(t, stride, lean, crouch):
     return parts
 
 
-def _render_soldier_frame(parts, phi, size):
+def _prone_parts(t, amp):
+    """The soldier lying down, in the same character space (x right, y forward,
+    z up) — but the origin is mid-body rather than on the ground between the
+    feet, because that is where the pawn's `Pos` is once it is horizontal.
+
+    `amp` scales the crawl: 0 is lying still, 1 is a full low-crawl stroke. The
+    stroke is contralateral (left knee drives while the right arm reaches),
+    which is how anyone actually moves on their belly.
+    """
+    s = math.sin(2 * math.pi * t) * amp
+    parts = []
+
+    # Legs, splayed and drawn up one at a time. They stay flat on the ground —
+    # a knee raised into the air is the tell of a soldier who is not really
+    # prone.
+    for side in (-1, 1):
+        pull = max(0.0, s * side)
+        hip = (side * 0.11, -0.20, 0.12)
+        knee = (side * (0.22 + 0.16 * pull), -0.46 + 0.20 * pull, 0.11)
+        foot = (side * (0.15 + 0.12 * pull), -0.70 + 0.26 * pull, 0.09)
+        parts.append((*hip, *knee, 0.093, 0.52))          # thigh
+        parts.append((*knee, *foot, 0.075, 0.50))         # shin
+        parts.append((foot[0], foot[1] - 0.02, foot[2],
+                      foot[0], foot[1] + 0.07, foot[2] + 0.02, 0.070, 0.42))  # boot
+
+    parts.append((-0.12, -0.20, 0.13, 0.12, -0.20, 0.13, 0.125, 0.55))   # hips
+    parts.append((0.0, -0.18, 0.14, 0.0, 0.20, 0.15, 0.155, 0.58))       # torso
+    parts.append((0.0, -0.04, 0.25, 0.0, 0.08, 0.26, 0.115, 0.50))       # pack
+    parts.append((-0.19, 0.21, 0.15, 0.19, 0.21, 0.15, 0.115, 0.57))     # shoulders
+
+    # Arms: both hands stay on the weapon, the leading one creeping forward on
+    # the reach half of the stroke.
+    for side, hand in ((1, (0.06, 0.50, 0.14)), (-1, (-0.02, 0.60, 0.15))):
+        reach = max(0.0, -s * side)
+        parts.append((side * 0.19, 0.20, 0.15,
+                      side * 0.27, 0.34 + 0.06 * reach, 0.11, 0.072, 0.55))
+        parts.append((side * 0.27, 0.34 + 0.06 * reach, 0.11,
+                      hand[0], hand[1] + 0.04 * reach, hand[2], 0.062, 0.53))
+
+    # Weapon: forward, past the head, resting where a bipod would be.
+    parts.append((0.07, 0.26, 0.15, 0.02, 0.74, 0.14, 0.033, 0.34))
+    parts.append((0.06, 0.40, 0.12, 0.06, 0.34, 0.15, 0.048, 0.38))      # grip
+
+    parts.append((0.0, 0.26, 0.18, 0.0, 0.31, 0.19, 0.062, 0.54))        # neck
+    # Head up and looking over the sights — the one part that lifts clear of
+    # the ground, and what tells a prone soldier apart from a dropped pack.
+    parts.append((0.0, 0.36, 0.19, 0.0, 0.42, 0.19, 0.135, 0.60))        # helmet
+    return parts
+
+
+def _render_soldier_frame(parts, phi, size, ground_py=SOLDIER_GROUND_PY):
     """Rotate to facing `phi`, project, depth sort and paint one frame."""
     cos_p, sin_p = math.cos(phi), math.sin(phi)
     cos_t, sin_t = math.cos(SOLDIER_TILT), math.sin(SOLDIER_TILT)
@@ -241,7 +316,7 @@ def _render_soldier_frame(parts, phi, size):
         rx = x * cos_p + y * sin_p
         ry = -x * sin_p + y * cos_p
         px = size / 2 + rx * SOLDIER_SCALE
-        py = SOLDIER_GROUND_PY - (ry * cos_t + z * sin_t) * SOLDIER_SCALE
+        py = ground_py - (ry * cos_t + z * sin_t) * SOLDIER_SCALE
         depth = ry * sin_t - z * cos_t          # bigger = further from camera
         return px, py, depth
 
@@ -296,23 +371,48 @@ def _render_soldier_frame(parts, phi, size):
     return shade_buf, alpha_buf
 
 
-def gen_soldier(path, size=64):
-    """Grid sheet: SOLDIER_DIRS rows of facings x 13 columns of animation
-    (0 idle, 1-6 walk, 7-12 run)."""
-    cycles = [(0.0, 0.0, 0.0, 0.0)]                        # idle
-    cycles += [(i / 6, 0.20, 0.0, 0.0) for i in range(6)]  # walk
-    cycles += [(i / 6, 0.34, 0.16, 0.05) for i in range(6)]  # run, leaning
-    cols = len(cycles)
+def gen_soldier(path, size=SOLDIER_FRAME):
+    """Grid sheet: SOLDIER_DIRS rows of facings x three STANCE_COLS-wide stance
+    blocks (standing, crouching, prone), each 0 idle, 1-6 walk, 7-12 run.
 
+    Crouching and crawling cap out well below the run threshold in
+    `render.rs`, so their run columns are never picked in play — they are
+    filled with the walk frames anyway (a straight buffer reuse, no extra
+    rasterising) so that a rollback correction, which can briefly read as a
+    supersonic Pos delta, can't land on an empty frame.
+    """
+    stand = [(0.0, 0.0, 0.0, 0.0)]                          # idle
+    stand += [(i / 6, 0.20, 0.0, 0.0) for i in range(6)]    # walk
+    stand += [(i / 6, 0.34, 0.16, 0.05) for i in range(6)]  # run, leaning
+    # Crouched: hips dropped hard, short shuffling stride, weight forward.
+    crouch = [(0.0, 0.0, 0.10, 0.42)]
+    crouch += [(i / 6, 0.13, 0.10, 0.42) for i in range(6)]
+    prone = [0.0] + [i / 6 for i in range(6)]               # crawl phases
+
+    def stance_frames(phi):
+        """The 3 x STANCE_COLS frames of one facing, left to right."""
+        upright = [
+            _render_soldier_frame(_soldier_parts(*c), phi, size) for c in stand
+        ]
+        low = [_render_soldier_frame(_soldier_parts(*c), phi, size) for c in crouch]
+        flat = [
+            _render_soldier_frame(_prone_parts(t, 0.0 if i == 0 else 1.0), phi, size,
+                                  SOLDIER_PRONE_PY)
+            for i, t in enumerate(prone)
+        ]
+        # Walk frames stand in for the (unreachable) run columns.
+        low += low[1:STANCE_COLS - len(low) + 1]
+        flat += flat[1:STANCE_COLS - len(flat) + 1]
+        return upright + low + flat
+
+    cols = 3 * STANCE_COLS
     rows = [bytearray() for _ in range(size * SOLDIER_DIRS)]
     for d in range(SOLDIER_DIRS):
-        phi = 2 * math.pi * d / SOLDIER_DIRS
-        for t, stride, lean, crouch in cycles:
-            shade_buf, alpha_buf = _render_soldier_frame(
-                _soldier_parts(t, stride, lean, crouch), phi, size
-            )
-            for y in range(size):
-                row = rows[d * size + y]
+        frames = stance_frames(2 * math.pi * d / SOLDIER_DIRS)
+        assert len(frames) == cols, f'{len(frames)} frames, expected {cols}'
+        for y in range(size):
+            row = rows[d * size + y]
+            for shade_buf, alpha_buf in frames:
                 for x in range(size):
                     a = alpha_buf[y][x]
                     if a <= 0.004:
@@ -362,6 +462,28 @@ def gen_crosshair(path, size=128):
                 ) ** 0.5
                 a = max(a, max(0.0, min(1.0, t - seg + 0.5)))
             a = max(a, max(0.0, min(1.0, 3.5 - d + 0.5)))  # center dot
+            row += bytes((255, 255, 255, int(a * 255)))
+        rows.append(row)
+    write_png(path, size, size, rows, color_type=6)  # RGBA
+
+
+def gen_chevron(path, size=128):
+    """Stance-button icon: a fat chevron pointing UP. The engine flips it
+    vertically for the get-down button, so there is only ever one of these."""
+    t = 9.0  # half-stroke width
+    apex = (size / 2, size * 0.34)
+    left = (size * 0.20, size * 0.68)
+    right = (size * 0.80, size * 0.68)
+    rows = []
+    for y in range(size):
+        row = bytearray()
+        for x in range(size):
+            px, py = x + 0.5, y + 0.5
+            d = min(
+                _seg_dist2(px, py, *left, *apex) ** 0.5,
+                _seg_dist2(px, py, *apex, *right) ** 0.5,
+            )
+            a = max(0.0, min(1.0, t - d + 0.5))
             row += bytes((255, 255, 255, int(a * 255)))
         rows.append(row)
     write_png(path, size, size, rows, color_type=6)  # RGBA
@@ -623,5 +745,6 @@ if __name__ == '__main__':
     gen_soldier(os.path.join(out, 'soldier.png'))
     gen_tracer(os.path.join(out, 'tracer.png'))
     gen_crosshair(os.path.join(out, 'crosshair.png'))
+    gen_chevron(os.path.join(out, 'chevron.png'))
     gen_rocks(os.path.join(out, 'rocks.png'))
     gen_bushes(os.path.join(out, 'bushes.png'))

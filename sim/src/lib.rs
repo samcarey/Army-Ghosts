@@ -32,8 +32,22 @@ pub const MAX_PLAYERS: usize = 8;
 pub const ARENA_HALF_W: i32 = 400;
 pub const ARENA_HALF_H: i32 = 300;
 
-/// Player movement speed, subunits per tick (2 px/tick = 120 px/s).
+/// Player movement speed standing, subunits per tick (2 px/tick = 120 px/s).
 pub const PLAYER_SPEED: i32 = 2 * FP;
+/// Movement speed per stance, subunits per tick. Going lower buys a smaller
+/// profile with speed: a crouch costs ~45%, a crawl ~70%. Indexed by
+/// [`Stance::level`], so it must have [`STANCE_COUNT`] entries.
+pub const STANCE_SPEED: [i32; STANCE_COUNT] = [
+    PLAYER_SPEED,
+    PLAYER_SPEED * 9 / 16,
+    PLAYER_SPEED * 5 / 16,
+];
+/// Ticks to drop one stance level, and to climb back up one. You are rooted
+/// for the whole transition (the stick still turns you) — that dead time is
+/// what makes going prone in the open a commitment rather than a free hide.
+/// Getting up is the slower half, as it is in life.
+pub const STANCE_DOWN_TICKS: u16 = 16;
+pub const STANCE_UP_TICKS: u16 = 26;
 /// Bullet speed, subunits per tick (16 px/tick = 960 px/s).
 pub const BULLET_SPEED: i32 = 16 * FP;
 /// Ticks between shots while holding fire (12 ticks = 5 shots/s).
@@ -46,6 +60,13 @@ pub const BULLET_R: i32 = 2;
 pub const TARGET_R: i32 = 14;
 /// Ticks a target stays "flashed" after a hit (render feedback).
 pub const HIT_FLASH_TICKS: u16 = 8;
+
+/// Stance levels, tallest first. Also indexes [`STANCE_SPEED`] and the stance
+/// blocks of the sprite sheet.
+pub const STANCE_STAND: u8 = 0;
+pub const STANCE_CROUCH: u8 = 1;
+pub const STANCE_PRONE: u8 = 2;
+pub const STANCE_COUNT: usize = 3;
 
 /// The only thing that crosses the network: one player's input for one tick.
 /// Kept tiny (ggrs serializes it with serde every tick). Joystick axes are
@@ -60,6 +81,13 @@ pub struct PlayerInput {
 pub const BTN_FIRE: u8 = 1 << 0;
 /// Aiming down sights: the shooter plants their feet (stick only turns them).
 pub const BTN_ADS: u8 = 1 << 1;
+/// Bits 2-3 carry the stance the player *wants* (0 stand, 1 crouch, 2 prone) —
+/// an absolute level, not a "go down" edge. Edge-triggered inputs would need
+/// the sim to remember last tick's buttons, which is exactly the kind of hidden
+/// state rollback punishes; a level re-sent every tick re-applies identically no
+/// matter how often the frame is replayed.
+pub const BTN_STANCE_SHIFT: u8 = 2;
+pub const BTN_STANCE_MASK: u8 = 0b11 << BTN_STANCE_SHIFT;
 
 impl PlayerInput {
     pub fn fire(&self) -> bool {
@@ -67,6 +95,15 @@ impl PlayerInput {
     }
     pub fn ads(&self) -> bool {
         self.buttons & BTN_ADS != 0
+    }
+    /// The requested stance, clamped: a peer sending 3 must not index anything
+    /// out of range on our side.
+    pub fn stance(&self) -> u8 {
+        ((self.buttons & BTN_STANCE_MASK) >> BTN_STANCE_SHIFT).min(STANCE_PRONE)
+    }
+    pub fn set_stance(&mut self, level: u8) {
+        self.buttons &= !BTN_STANCE_MASK;
+        self.buttons |= (level.min(STANCE_PRONE)) << BTN_STANCE_SHIFT;
     }
 }
 
@@ -113,6 +150,49 @@ impl Default for Facing {
 /// Ticks until this player may fire again.
 #[derive(Component, Copy, Clone, Default, Debug, Hash)]
 pub struct Cooldown(pub u16);
+
+/// How low the pawn is carrying itself: [`STANCE_STAND`] / [`STANCE_CROUCH`] /
+/// [`STANCE_PRONE`]. Sim state (it gates movement speed), so it rolls back with
+/// everything else.
+///
+/// `level` commits the moment the change starts — the figure drops or rises
+/// straight away — and `change` is the dead time bought with it. Keeping the
+/// destination in `level` means the sprite reacts on the frame you tap, which
+/// is what makes the button feel connected; the cost is paid in movement, not
+/// in animation lag.
+#[derive(Component, Copy, Clone, Default, Debug, Hash)]
+pub struct Stance {
+    pub level: u8,
+    /// Ticks left before the pawn can move again.
+    pub change: u16,
+}
+
+impl Stance {
+    /// Advance one tick toward `wanted`, one level at a time (stand → prone
+    /// pays for both legs of the trip). Pure so it can be tested without a
+    /// session; the caller roots movement whenever `change` is non-zero.
+    pub fn advance(&mut self, wanted: u8) {
+        if self.change > 0 {
+            self.change -= 1;
+            return;
+        }
+        let wanted = wanted.min(STANCE_PRONE);
+        if wanted == self.level {
+            return;
+        }
+        if wanted > self.level {
+            self.level += 1;
+            self.change = STANCE_DOWN_TICKS;
+        } else {
+            self.level -= 1;
+            self.change = STANCE_UP_TICKS;
+        }
+    }
+
+    pub fn speed(&self) -> i32 {
+        STANCE_SPEED[(self.level as usize).min(STANCE_COUNT - 1)]
+    }
+}
 
 /// A live bullet; `owner` is the firing player's handle (no self-hits).
 #[derive(Component, Copy, Clone, Default, Debug, Hash)]
@@ -362,6 +442,7 @@ pub fn spawn_world(commands: &mut Commands, num_players: usize) {
                 Pos::from_units(x, y),
                 Facing::default(),
                 Cooldown::default(),
+                Stance::default(),
             ))
             .add_rollback();
     }
@@ -427,6 +508,7 @@ impl<C: Config<Input = PlayerInput>> Plugin for SimPlugin<C> {
             .rollback_component_with_copy::<Player>()
             .rollback_component_with_copy::<Facing>()
             .rollback_component_with_copy::<Cooldown>()
+            .rollback_component_with_copy::<Stance>()
             .rollback_component_with_copy::<Bullet>()
             .rollback_component_with_copy::<Target>()
             .rollback_component_with_copy::<Rock>()
@@ -435,6 +517,10 @@ impl<C: Config<Input = PlayerInput>> Plugin for SimPlugin<C> {
             // nondeterminism bug surfaces as a GGRS desync event immediately,
             // not as subtly diverged worlds.
             .checksum_component_with_hash::<Pos>()
+            // Stance too: a divergent stance eventually shows up in `Pos`
+            // anyway (it scales movement), but only once that player moves —
+            // checksumming it catches the disagreement on the tick it happens.
+            .checksum_component_with_hash::<Stance>()
             .add_systems(
                 GgrsSchedule,
                 (
@@ -453,7 +539,7 @@ impl<C: Config<Input = PlayerInput>> Plugin for SimPlugin<C> {
 
 fn move_players<C: Config<Input = PlayerInput>>(
     inputs: Res<PlayerInputs<C>>,
-    mut players: Query<(&Player, &mut Pos, &mut Facing)>,
+    mut players: Query<(&Player, &mut Pos, &mut Facing, &mut Stance)>,
     rocks: Query<(&Rock, &Pos), Without<Player>>,
 ) {
     // Sorted: resolving overlaps in a different order could land a pinched
@@ -465,8 +551,11 @@ fn move_players<C: Config<Input = PlayerInput>>(
         .collect();
     cover.sort_unstable();
 
-    for (player, mut pos, mut facing) in &mut players {
+    for (player, mut pos, mut facing, mut stance) in &mut players {
         let (input, _status) = inputs[player.handle];
+        // Stance first: the requested level rides in the input bits, so every
+        // peer starts (and finishes) the same transition on the same tick.
+        stance.advance(input.stance());
         let (mx, my) = (input.move_x as i32, input.move_y as i32);
         if mx == 0 && my == 0 {
             continue;
@@ -475,17 +564,19 @@ fn move_players<C: Config<Input = PlayerInput>>(
         facing.y = my;
         // Aiming down sights roots the shooter in place — the stick still
         // turns them (that's the aim), it just doesn't carry them anywhere.
-        // The bit rides in the input stream, so every peer agrees.
-        if input.ads() {
+        // The bit rides in the input stream, so every peer agrees. Changing
+        // stance roots them the same way, for as long as it takes.
+        if input.ads() || stance.change > 0 {
             continue;
         }
-        // Scale the joystick vector to at most PLAYER_SPEED, preserving
+        // Scale the joystick vector to at most the stance's speed, preserving
         // direction: v = m * SPEED / max(len, 127). Dividing by the *longer*
         // of len/127 keeps sub-max joystick deflections proportional while
         // capping diagonals at full speed.
+        let speed = stance.speed();
         let len = isqrt((mx * mx + my * my) as i64).max(127) as i32;
-        pos.x += mx * PLAYER_SPEED / len;
-        pos.y += my * PLAYER_SPEED / len;
+        pos.x += mx * speed / len;
+        pos.y += my * speed / len;
         push_out_of_cover(&mut pos, &cover);
         pos.x = pos.x.clamp(-(ARENA_HALF_W - PLAYER_R) * FP, (ARENA_HALF_W - PLAYER_R) * FP);
         pos.y = pos.y.clamp(-(ARENA_HALF_H - PLAYER_R) * FP, (ARENA_HALF_H - PLAYER_R) * FP);
@@ -630,6 +721,55 @@ mod tests {
         let mut clear = Pos { x: 200 * FP, y: 0 };
         push_out_of_cover(&mut clear, &cover);
         assert_eq!((clear.x, clear.y), (200 * FP, 0));
+    }
+
+    /// Stance changes go one level at a time, root the pawn for the whole
+    /// transition, and cost speed for as long as you stay down.
+    #[test]
+    fn stance_steps_one_level_at_a_time() {
+        let mut stance = Stance::default();
+        assert_eq!(stance.speed(), PLAYER_SPEED);
+
+        // Asking for prone from standing passes through crouch, paying the
+        // dead time for each leg.
+        stance.advance(STANCE_PRONE);
+        assert_eq!((stance.level, stance.change), (STANCE_CROUCH, STANCE_DOWN_TICKS));
+        for _ in 0..STANCE_DOWN_TICKS {
+            stance.advance(STANCE_PRONE);
+        }
+        assert_eq!(stance.change, 0, "transition must end on its own tick count");
+        stance.advance(STANCE_PRONE);
+        assert_eq!((stance.level, stance.change), (STANCE_PRONE, STANCE_DOWN_TICKS));
+
+        // Holding the request steady once you're there is a no-op.
+        for _ in 0..STANCE_DOWN_TICKS + 5 {
+            stance.advance(STANCE_PRONE);
+        }
+        assert_eq!((stance.level, stance.change), (STANCE_PRONE, 0));
+
+        // Getting up is the slower half.
+        stance.advance(STANCE_STAND);
+        assert_eq!((stance.level, stance.change), (STANCE_CROUCH, STANCE_UP_TICKS));
+
+        // A garbage level from a peer must not index out of the table.
+        let mut input = PlayerInput::default();
+        input.set_stance(9);
+        assert_eq!(input.stance(), STANCE_PRONE);
+        assert!(STANCE_SPEED[STANCE_PRONE as usize] < STANCE_SPEED[STANCE_CROUCH as usize]);
+        assert!(STANCE_SPEED[STANCE_CROUCH as usize] < STANCE_SPEED[STANCE_STAND as usize]);
+    }
+
+    /// The stance bits have to survive a round trip alongside the other
+    /// buttons — they share one byte with fire and sights.
+    #[test]
+    fn stance_bits_do_not_collide() {
+        let mut input = PlayerInput { buttons: BTN_FIRE | BTN_ADS, ..default() };
+        input.set_stance(STANCE_CROUCH);
+        assert!(input.fire() && input.ads());
+        assert_eq!(input.stance(), STANCE_CROUCH);
+        input.set_stance(STANCE_STAND);
+        assert!(input.fire() && input.ads());
+        assert_eq!(input.stance(), STANCE_STAND);
     }
 
     /// Thickets have to actually land: the per-bush rejections (round the

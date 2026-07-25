@@ -8,7 +8,8 @@ use bevy::sprite::Anchor;
 use bevy_ggrs::LocalPlayers;
 
 use army_ghosts_sim::{
-    Bullet, Bush, Facing, Player, Pos, Rock, Target, ARENA_HALF_H, ARENA_HALF_W, TARGET_R,
+    Bullet, Bush, Facing, Player, Pos, Rock, Stance, Target, ARENA_HALF_H, ARENA_HALF_W,
+    STANCE_COUNT, STANCE_STAND, TARGET_R,
 };
 
 use crate::ads::Ads;
@@ -33,9 +34,10 @@ pub fn signal_game_ready(mut frames: Local<u32>) {
     }
 }
 
-/// The soldier sprite sheet (tools/gen_assets.py): a grid of 64px frames.
-/// Columns are animation (0 idle, 1-6 walk, 7-12 run); rows are the 16 facings,
-/// clockwise from away-from-camera.
+/// The soldier sprite sheet (tools/gen_assets.py): a grid of 72px frames.
+/// Rows are the 16 facings, clockwise from away-from-camera; columns are three
+/// stance blocks (standing, crouching, prone) of 13 animation frames each
+/// (0 idle, 1-6 walk, 7-12 run).
 ///
 /// The soldier is drawn 3/4 — modelled in 3D and projected 40 degrees off
 /// top-down — so it must NEVER be rotated: head stays up and feet stay down,
@@ -47,14 +49,21 @@ pub struct SoldierSheet {
     layout: Handle<TextureAtlasLayout>,
 }
 
-const SOLDIER_FRAME_PX: u32 = 64;
-const SOLDIER_COLS: u32 = 13;
+const SOLDIER_FRAME_PX: u32 = 72;
+/// Animation columns per stance, and the full sheet width in columns.
+const STANCE_COLS: u32 = 13;
+const SOLDIER_COLS: u32 = STANCE_COLS * STANCE_COUNT as u32;
 const SOLDIER_DIRS: u32 = 16;
-/// Where the figure's ground point sits in the frame, as a fraction from the
-/// top (`SOLDIER_GROUND_PY / SOLDIER_FRAME_PX` in the generator). The sprite is
-/// anchored there so the soldier's feet stand on its `Pos` and the body rises
-/// above it, instead of the collision circle cutting it in half.
-const SOLDIER_GROUND: f32 = 52.0 / 64.0;
+/// Where the pawn's `Pos` sits in the frame, as a fraction from the top (the
+/// generator's `SOLDIER_GROUND_PY` / `SOLDIER_PRONE_PY` over the frame size),
+/// per stance. Upright figures are anchored at the ground between their feet,
+/// so they stand on their `Pos` and rise above it; a prone figure is anchored
+/// mid-body, because that is what it pivots around when it turns.
+const STANCE_ANCHOR: [f32; STANCE_COUNT] = [
+    58.5 / 72.0,
+    58.5 / 72.0,
+    36.0 / 72.0,
+];
 const IDLE_FRAME: usize = 0;
 const WALK_START: usize = 1;
 const RUN_START: usize = 7;
@@ -62,13 +71,25 @@ const CYCLE_FRAMES: usize = 6;
 /// Rendered size (world px). The figure fills most of the frame's height, so
 /// this draws a soldier about 42 px tall standing on the 24 px collision
 /// circle — roughly the proportions these games use.
-const SOLDIER_SIZE: f32 = 50.0;
-/// How far above a pawn's `Pos` its weapon is drawn, world px. The 3/4 sprite
-/// stands with its feet on the Pos, so the rifle sits about this far up the
-/// screen; shots have to be lifted to match or tracers appear to leave the
-/// soldier's boots. Derived from the rifle's height in the sheet: z 1.16 units
-/// x sin(40 deg) x 38 px/unit x (SOLDIER_SIZE / frame) ~= 22.
-pub const MUZZLE_LIFT: f32 = 22.0;
+const SOLDIER_SIZE: f32 = 56.25;
+/// How far above a pawn's `Pos` its weapon is drawn, world px, per stance. The
+/// 3/4 sprite stands with its feet on the Pos, so the rifle sits this far up
+/// the screen; shots have to be lifted to match or tracers appear to leave the
+/// soldier's boots. Derived from the rifle's height in the sheet: z units x
+/// sin(40 deg) x 38 px/unit x (SOLDIER_SIZE / frame). A crawling soldier's
+/// rifle is all but on the ground, hence the near-zero third entry.
+const STANCE_MUZZLE_LIFT: [f32; STANCE_COUNT] = [22.0, 14.0, 3.0];
+
+pub fn muzzle_lift(level: u8) -> f32 {
+    STANCE_MUZZLE_LIFT[(level as usize).min(STANCE_COUNT - 1)]
+}
+
+/// Render-only: the height a bullet's tracer flies at, fixed when it spawns
+/// from the stance its shooter fired in. Rollback re-spawns bullets, which
+/// re-runs `attach_sprites` against the rolled-back stance, so this stays
+/// correct through corrections.
+#[derive(Component)]
+pub struct MuzzleLift(f32);
 
 /// Animation thresholds/cadence, world px/s. Full stick = 120 px/s (run);
 /// partial thumbstick deflection walks. One stride cycle per 36 px walked
@@ -234,6 +255,7 @@ pub fn attach_sprites(
     bush_sheet: Res<BushSheet>,
     new_players: Query<(Entity, &Player), Added<Player>>,
     new_bullets: Query<(Entity, &Bullet), Added<Bullet>>,
+    stances: Query<(&Player, &Stance)>,
     new_targets: Query<Entity, Added<Target>>,
     new_rocks: Query<(Entity, &Rock), Added<Rock>>,
     new_bushes: Query<(Entity, &Bush), Added<Bush>>,
@@ -254,8 +276,9 @@ pub fn attach_sprites(
         };
         commands.entity(entity).insert((
             sprite,
-            // Feet on the pawn's Pos, body rising above it.
-            Anchor(Vec2::new(0.0, 0.5 - SOLDIER_GROUND)),
+            // Feet on the pawn's Pos, body rising above it (`animate_players`
+            // re-anchors when the stance changes).
+            Anchor(stance_anchor(STANCE_STAND)),
             WalkAnim::default(),
             Transform::from_xyz(0.0, 0.0, Z_PLAYER),
         ));
@@ -264,6 +287,14 @@ pub fn attach_sprites(
         // Velocity is constant for a bullet's whole life, so the flight-angle
         // rotation is set once here; `sync_transforms` only writes translation.
         let angle = (bullet.vy as f32).atan2(bullet.vx as f32);
+        // Fired from the shooter's rifle, wherever that was: a crawling
+        // soldier's rounds skim the ground, a standing one's fly at chest
+        // height. Frozen at spawn — the shooter may stand up mid-flight.
+        let lift = stances
+            .iter()
+            .find(|(p, _)| p.handle == bullet.owner)
+            .map(|(_, stance)| muzzle_lift(stance.level))
+            .unwrap_or(STANCE_MUZZLE_LIFT[0]);
         commands.entity(entity).insert((
             Sprite {
                 image: tracer.0.clone(),
@@ -271,6 +302,7 @@ pub fn attach_sprites(
                 custom_size: Some(Vec2::new(BULLET_LEN, BULLET_WIDTH)),
                 ..default()
             },
+            MuzzleLift(lift),
             TrailState::default(),
             Transform::from_xyz(0.0, 0.0, Z_BULLET)
                 .with_rotation(Quat::from_rotation_z(angle)),
@@ -332,19 +364,32 @@ fn cover_size(radius: i32, fill: f32) -> Vec2 {
     Vec2::splat((radius * 2) as f32 * COVER_FRAME_PX as f32 / (fill * 2.0))
 }
 
+/// Where a stance's sprite hangs relative to the pawn's `Pos`.
+fn stance_anchor(level: u8) -> Vec2 {
+    Vec2::new(0.0, 0.5 - STANCE_ANCHOR[(level as usize).min(STANCE_COUNT - 1)])
+}
+
 /// Advance each soldier's walk/run cycle from their *rendered* speed (Pos
 /// delta per frame — works for remote players too, and rollback corrections
 /// just read as a brief stutter). Stationary → idle frame; sub-max analog
-/// deflection → walk cycle; near-full speed → run cycle.
+/// deflection → walk cycle; near-full speed → run cycle. The stance picks
+/// which block of columns all of that indexes into.
 pub fn animate_players(
     time: Res<Time>,
-    mut players: Query<(&Pos, &Facing, &mut WalkAnim, &mut Sprite), With<Player>>,
+    mut players: Query<
+        (&Pos, &Facing, &Stance, &mut WalkAnim, &mut Sprite, &mut Anchor),
+        With<Player>,
+    >,
 ) {
     let dt = time.delta_secs();
     if dt <= 0.0 {
         return;
     }
-    for (pos, facing, mut anim, mut sprite) in &mut players {
+    for (pos, facing, stance, mut anim, mut sprite, mut anchor) in &mut players {
+        let wanted = stance_anchor(stance.level);
+        if anchor.0 != wanted {
+            anchor.0 = wanted;
+        }
         let (x, y) = pos.to_f32();
         let p = Vec2::new(x, y);
         let speed = match anim.last_pos {
@@ -360,15 +405,21 @@ pub fn animate_players(
             IDLE_FRAME
         } else {
             anim.phase = (anim.phase + speed * dt / CYCLE_LEN_PX).fract();
-            let start = if speed > RUN_ABOVE { RUN_START } else { WALK_START };
+            // Only a standing soldier can outrun the walk cycle: crouching and
+            // crawling top out below the threshold, and the sheet's run
+            // columns for those stances just repeat the walk.
+            let running = speed > RUN_ABOVE && stance.level == STANCE_STAND;
+            let start = if running { RUN_START } else { WALK_START };
             start + ((anim.phase * CYCLE_FRAMES as f32) as usize).min(CYCLE_FRAMES - 1)
         };
         // Row = facing, measured clockwise from "away from the camera", which
-        // is how the generator lays the sheet out.
+        // is how the generator lays the sheet out; the stance selects which
+        // 13-column block of that row to read.
         let bearing = (facing.x as f32).atan2(facing.y as f32);
         let step = std::f32::consts::TAU / SOLDIER_DIRS as f32;
         let row = (bearing / step).round().rem_euclid(SOLDIER_DIRS as f32) as usize;
-        let index = row * SOLDIER_COLS as usize + column;
+        let block = (stance.level as usize).min(STANCE_COUNT - 1) * STANCE_COLS as usize;
+        let index = row * SOLDIER_COLS as usize + block + column;
         if atlas.index != index {
             atlas.index = index;
         }
@@ -381,13 +432,13 @@ pub fn animate_players(
 pub fn bullet_trails(
     mut commands: Commands,
     time: Res<Time>,
-    mut bullets: Query<(&Pos, &mut TrailState), With<Bullet>>,
+    mut bullets: Query<(&Pos, &MuzzleLift, &mut TrailState), With<Bullet>>,
     mut segments: Query<(Entity, &mut TrailSegment, &mut Sprite)>,
 ) {
     let dt = time.delta_secs();
-    for (pos, mut state) in &mut bullets {
+    for (pos, lift, mut state) in &mut bullets {
         let (x, y) = pos.to_f32();
-        let p = Vec2::new(x, y + MUZZLE_LIFT); // match the lifted tracer
+        let p = Vec2::new(x, y + lift.0); // match the lifted tracer
         if let Some(last) = state.last {
             let delta = p - last;
             let len = delta.length();
@@ -424,7 +475,7 @@ pub fn bullet_trails(
 /// were just hit.
 pub fn sync_transforms(
     mut movers: Query<(&Pos, &mut Transform), Without<Bullet>>,
-    mut bullets: Query<(&Pos, &mut Transform), With<Bullet>>,
+    mut bullets: Query<(&Pos, &MuzzleLift, &mut Transform), With<Bullet>>,
     mut targets: Query<(&Target, &mut Sprite)>,
 ) {
     for (pos, mut transform) in &mut movers {
@@ -432,11 +483,11 @@ pub fn sync_transforms(
         transform.translation.x = x;
         transform.translation.y = y;
     }
-    // Rounds fly at weapon height, not ankle height.
-    for (pos, mut transform) in &mut bullets {
+    // Rounds fly at the weapon height they were fired from, not ankle height.
+    for (pos, lift, mut transform) in &mut bullets {
         let (x, y) = pos.to_f32();
         transform.translation.x = x;
-        transform.translation.y = y + MUZZLE_LIFT;
+        transform.translation.y = y + lift.0;
     }
     for (target, mut sprite) in &mut targets {
         sprite.color = if target.flash > 0 {

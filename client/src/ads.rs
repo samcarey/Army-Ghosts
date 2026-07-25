@@ -11,7 +11,8 @@ use bevy::prelude::*;
 use bevy_ggrs::LocalPlayers;
 
 use army_ghosts_sim::{
-    Facing, Player, Pos, Rock, Target, ARENA_HALF_H, ARENA_HALF_W, BULLET_R, PLAYER_R, TARGET_R,
+    Facing, Player, Pos, Rock, Stance, Target, ARENA_HALF_H, ARENA_HALF_W, BULLET_R, PLAYER_R,
+    TARGET_R,
 };
 
 /// How far the camera slides toward what you're aiming at, world units (=
@@ -26,8 +27,6 @@ const ADS_EASE_SECS: f32 = 0.5;
 const AIM_TURN_TAU: f32 = 0.12;
 
 /// Button diameter / icon size / distance above the bottom edge, logical px.
-/// `BUTTON_SIZE` and `BOTTOM_OFFSET` also drive [`over_ads_button`] — keep
-/// them in step with the `Node` layout below.
 const BUTTON_SIZE: f32 = 76.0;
 const ICON_SIZE: f32 = 54.0;
 const BOTTOM_OFFSET: f32 = 22.0;
@@ -182,7 +181,7 @@ fn local_facing(
 pub fn update_aim_line(
     ads: Res<Ads>,
     local_players: Option<Res<LocalPlayers>>,
-    players: Query<(&Player, &Pos, &Facing)>,
+    players: Query<(&Player, &Pos, &Facing, &Stance)>,
     targets: Query<&Pos, With<Target>>,
     rocks: Query<(&Rock, &Pos)>,
     mut lines: Query<(&mut Transform, &mut Sprite, &mut Visibility), With<AimLine>>,
@@ -193,14 +192,18 @@ pub fn update_aim_line(
         .as_deref()
         .and_then(|local| {
             let handle = *local.0.first()?;
-            let (_, pos, facing) = players.iter().find(|(p, _, _)| p.handle == handle)?;
+            let (_, pos, facing, stance) = players.iter().find(|(p, ..)| p.handle == handle)?;
             let dir = Vec2::new(facing.x as f32, facing.y as f32).try_normalize()?;
             let (x, y) = pos.to_f32();
             // Same muzzle offset `fire_bullets` spawns the bullet at, so the
             // line starts exactly where the tracer will.
-            Some((Vec2::new(x, y) + dir * (PLAYER_R + BULLET_R + 2) as f32, dir))
+            Some((
+                Vec2::new(x, y) + dir * (PLAYER_R + BULLET_R + 2) as f32,
+                dir,
+                crate::render::muzzle_lift(stance.level),
+            ))
         });
-    let Some((start, dir)) = aim.filter(|_| amount > 0.001) else {
+    let Some((start, dir, lift)) = aim.filter(|_| amount > 0.001) else {
         *visibility = Visibility::Hidden;
         return;
     };
@@ -220,9 +223,9 @@ pub fn update_aim_line(
     sprite.custom_size = Some(Vec2::new(range.max(0.0), AIM_LINE_WIDTH));
     sprite.color = Color::srgba(1.0, 1.0, 1.0, AIM_LINE_ALPHA * amount);
     // Lifted to weapon height like the tracers, so the shot line leaves the
-    // rifle rather than the soldier's boots (see `render::MUZZLE_LIFT`).
+    // rifle rather than the soldier's boots (see `render::muzzle_lift`).
     let mid = start + dir * range / 2.0;
-    transform.translation = Vec3::new(mid.x, mid.y + crate::render::MUZZLE_LIFT, Z_AIM_LINE);
+    transform.translation = Vec3::new(mid.x, mid.y + lift, Z_AIM_LINE);
     transform.rotation = Quat::from_rotation_z(dir.y.atan2(dir.x));
 }
 
@@ -280,16 +283,4 @@ pub fn update_ads_button(
             Color::srgba(0.85, 0.92, 0.75, 0.65)
         };
     }
-}
-
-/// Is this window position (y-down, origin top-left) on the ADS button? The
-/// touch handler uses it to keep a sights tap out of the fire button's
-/// generous bottom-right hit zone, which reaches the screen center on narrow
-/// phones.
-pub fn over_ads_button(pos: Vec2, window_size: Vec2) -> bool {
-    let center = Vec2::new(
-        window_size.x / 2.0,
-        window_size.y - BOTTOM_OFFSET - BUTTON_SIZE / 2.0,
-    );
-    pos.distance(center) < BUTTON_SIZE / 2.0 + 8.0
 }

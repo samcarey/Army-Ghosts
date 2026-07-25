@@ -29,13 +29,22 @@ pub struct TouchControls {
 
 /// Read raw touches into [`TouchControls`]. Touch positions are window
 /// coordinates with y down, origin top-left.
+///
+/// Taps that land on a bevy_ui `Button` are skipped outright: bevy_ui already
+/// turns those into `Interaction::Pressed`, and the joystick/fire zones below
+/// are deliberately generous enough to swallow the sights and stance buttons
+/// otherwise. Asking the UI where its buttons actually are beats keeping a
+/// second copy of their geometry here in step with the layout.
 pub fn read_touches(
     touches: Res<Touches>,
     windows: Query<&Window, With<PrimaryWindow>>,
+    ui_buttons: Query<(&ComputedNode, &UiGlobalTransform, &InheritedVisibility), With<Button>>,
     mut controls: ResMut<TouchControls>,
 ) {
     let Ok(window) = windows.single() else { return };
     let size = Vec2::new(window.width(), window.height());
+    // `ComputedNode` works in physical pixels; touches arrive in logical ones.
+    let scale = window.scale_factor();
 
     controls.move_vec = Vec2::ZERO;
     controls.firing = false;
@@ -45,9 +54,7 @@ pub fn read_touches(
         controls.touch_seen = true;
         let start = touch.start_position();
         let pos = touch.position();
-        if crate::ads::over_ads_button(start, size) {
-            // bevy_ui already handles the sights toggle; don't also read the
-            // tap as fire (the fire zone below is deliberately generous).
+        if on_ui_button(&ui_buttons, start * scale) {
             continue;
         }
         if start.x < size.x * 0.45 {
@@ -67,6 +74,16 @@ pub fn read_touches(
             }
         }
     }
+}
+
+/// Is this physical-pixel point inside a visible bevy_ui button?
+fn on_ui_button(
+    buttons: &Query<(&ComputedNode, &UiGlobalTransform, &InheritedVisibility), With<Button>>,
+    physical: Vec2,
+) -> bool {
+    buttons
+        .iter()
+        .any(|(node, transform, visible)| visible.get() && node.contains_point(*transform, physical))
 }
 
 // ── Overlay rendering ───────────────────────────────────────────────────────

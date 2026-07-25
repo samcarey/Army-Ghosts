@@ -8,6 +8,7 @@ mod input;
 mod menu;
 mod net;
 mod render;
+mod stance;
 mod touch;
 mod vision;
 
@@ -62,6 +63,7 @@ fn main() {
     .insert_resource(launch)
     .init_resource::<touch::TouchControls>()
     .init_resource::<ads::Ads>()
+    .init_resource::<stance::StanceControl>()
     .init_resource::<render::CameraFocus>()
     .init_resource::<net::Lobby>()
     .init_state::<AppState>()
@@ -74,6 +76,7 @@ fn main() {
             hud::setup_hud,
             menu::setup_menu,
             ads::setup_ads,
+            stance::setup_stance,
             vision::setup_fog,
         )
             .chain(),
@@ -102,6 +105,8 @@ fn main() {
                 ads::toggle_ads,
                 ads::advance_ads,
                 ads::update_ads_button,
+                stance::read_stance_input,
+                stance::update_stance_buttons,
                 render::attach_sprites,
                 render::animate_players,
                 render::bullet_trails,

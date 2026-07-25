@@ -5,7 +5,6 @@
 use bevy::prelude::*;
 use bevy_ggrs::{LocalPlayers, Session};
 
-use crate::ads::AdsButton;
 use crate::net::Lobby;
 use crate::{AppState, LaunchConfig, SessionConfig};
 
@@ -258,16 +257,17 @@ pub fn read_start_input(
     mouse: Res<ButtonInput<MouseButton>>,
     touches: Res<Touches>,
     windows: Query<&Window>,
-    ads_buttons: Query<&Interaction, With<AdsButton>>,
+    ui_buttons: Query<&Interaction, With<Button>>,
     mut lobby: ResMut<Lobby>,
 ) {
     if keys.just_pressed(KeyCode::Enter) {
         lobby.start_requested = true;
         return;
     }
-    // The ADS button sits inside the band; toggling sights must not start the
-    // match. (`ui_focus_system` has already stamped this frame's Interaction.)
-    if ads_buttons.iter().any(|i| *i == Interaction::Pressed) {
+    // The sights and stance buttons sit inside the band; working the controls
+    // must not start the match. (`ui_focus_system` has already stamped this
+    // frame's Interaction.)
+    if ui_buttons.iter().any(|i| *i == Interaction::Pressed) {
         return;
     }
     let Ok(window) = windows.single() else { return };

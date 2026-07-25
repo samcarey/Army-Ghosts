@@ -93,6 +93,7 @@ fn main() {
                 render::attach_sprites,
                 render::orient_players,
                 render::animate_players,
+                render::bullet_trails,
                 render::sync_transforms,
                 render::camera_follow,
             )

@@ -65,6 +65,36 @@ pub struct WalkAnim {
     last_pos: Option<Vec2>,
 }
 
+/// The tracer streak texture (drawn pointing +x; rotated to flight angle).
+#[derive(Resource)]
+pub struct TracerImage(Handle<Image>);
+
+/// Bullet look: an elongated tracer rotated to its velocity angle.
+const BULLET_COLOR: Color = Color::srgb(1.0, 0.9, 0.4);
+const BULLET_LEN: f32 = 14.0;
+const BULLET_WIDTH: f32 = 2.0;
+
+/// Trail: each frame a bullet leaves a fading segment behind it. Render-only
+/// entities/state, never rollback-registered.
+const TRAIL_TTL: f32 = 0.15;
+const TRAIL_WIDTH: f32 = 1.25;
+const TRAIL_ALPHA: f32 = 0.45;
+/// A bullet moves 16 px/frame at 60 fps; anything much longer than a few
+/// frames' travel is a rollback teleport — skip it rather than streak it.
+const TRAIL_MAX_SEG: f32 = 48.0;
+
+/// Render-only per-bullet trail bookkeeping.
+#[derive(Component, Default)]
+pub struct TrailState {
+    last: Option<Vec2>,
+}
+
+/// One fading trail segment (independent entity; outlives its bullet).
+#[derive(Component)]
+pub struct TrailSegment {
+    ttl: f32,
+}
+
 /// Per-handle player colors (army-men greens first — you are green).
 const PLAYER_COLORS: [Color; 8] = [
     Color::srgb(0.35, 0.65, 0.25), // green
@@ -80,6 +110,7 @@ const PLAYER_COLORS: [Color; 8] = [
 const Z_GROUND: f32 = -10.0;
 const Z_TARGET: f32 = 0.0;
 const Z_PLAYER: f32 = 1.0;
+const Z_TRAIL: f32 = 1.9;
 const Z_BULLET: f32 = 2.0;
 
 pub fn setup_scene(
@@ -98,6 +129,7 @@ pub fn setup_scene(
             None,
         )),
     });
+    commands.insert_resource(TracerImage(assets.load("tracer.png")));
     commands.insert_resource(ClearColor(Color::srgb(0.08, 0.10, 0.06)));
     // Tiled grass/dirt ground across the arena (texture from tools/gen_assets.py).
     commands.spawn((
@@ -120,8 +152,9 @@ pub fn setup_scene(
 pub fn attach_sprites(
     mut commands: Commands,
     soldier: Res<SoldierSheet>,
+    tracer: Res<TracerImage>,
     new_players: Query<(Entity, &Player), Added<Player>>,
-    new_bullets: Query<Entity, Added<Bullet>>,
+    new_bullets: Query<(Entity, &Bullet), Added<Bullet>>,
     new_targets: Query<Entity, Added<Target>>,
 ) {
     for (entity, player) in &new_players {
@@ -144,10 +177,20 @@ pub fn attach_sprites(
             Transform::from_xyz(0.0, 0.0, Z_PLAYER),
         ));
     }
-    for entity in &new_bullets {
+    for (entity, bullet) in &new_bullets {
+        // Velocity is constant for a bullet's whole life, so the flight-angle
+        // rotation is set once here; `sync_transforms` only writes translation.
+        let angle = (bullet.vy as f32).atan2(bullet.vx as f32);
         commands.entity(entity).insert((
-            Sprite::from_color(Color::srgb(1.0, 0.9, 0.4), Vec2::splat(4.0)),
-            Transform::from_xyz(0.0, 0.0, Z_BULLET),
+            Sprite {
+                image: tracer.0.clone(),
+                color: BULLET_COLOR,
+                custom_size: Some(Vec2::new(BULLET_LEN, BULLET_WIDTH)),
+                ..default()
+            },
+            TrailState::default(),
+            Transform::from_xyz(0.0, 0.0, Z_BULLET)
+                .with_rotation(Quat::from_rotation_z(angle)),
         ));
     }
     for entity in &new_targets {
@@ -203,6 +246,51 @@ pub fn animate_players(
         };
         if atlas.index != index {
             atlas.index = index;
+        }
+    }
+}
+
+/// Leave a fading streak behind each bullet: one segment per frame from its
+/// last rendered position, and age out old segments. Segments are independent
+/// entities so they linger (and fade) after the bullet despawns.
+pub fn bullet_trails(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut bullets: Query<(&Pos, &mut TrailState), With<Bullet>>,
+    mut segments: Query<(Entity, &mut TrailSegment, &mut Sprite)>,
+) {
+    let dt = time.delta_secs();
+    for (pos, mut state) in &mut bullets {
+        let (x, y) = pos.to_f32();
+        let p = Vec2::new(x, y);
+        if let Some(last) = state.last {
+            let delta = p - last;
+            let len = delta.length();
+            if len > 0.5 && len <= TRAIL_MAX_SEG {
+                let mid = (p + last) / 2.0;
+                commands.spawn((
+                    // Slight overlength so consecutive segments overlap into
+                    // one continuous streak.
+                    Sprite::from_color(
+                        BULLET_COLOR.with_alpha(TRAIL_ALPHA),
+                        Vec2::new(len + 1.5, TRAIL_WIDTH),
+                    ),
+                    Transform::from_xyz(mid.x, mid.y, Z_TRAIL)
+                        .with_rotation(Quat::from_rotation_z(delta.y.atan2(delta.x))),
+                    TrailSegment { ttl: TRAIL_TTL },
+                ));
+            }
+        }
+        state.last = Some(p);
+    }
+    for (entity, mut segment, mut sprite) in &mut segments {
+        segment.ttl -= dt;
+        if segment.ttl <= 0.0 {
+            commands.entity(entity).despawn();
+        } else {
+            sprite
+                .color
+                .set_alpha(TRAIL_ALPHA * segment.ttl / TRAIL_TTL);
         }
     }
 }

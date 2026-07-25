@@ -34,8 +34,8 @@ pub const ARENA_HALF_H: i32 = 300;
 
 /// Player movement speed, subunits per tick (2 px/tick = 120 px/s).
 pub const PLAYER_SPEED: i32 = 2 * FP;
-/// Bullet speed, subunits per tick (8 px/tick = 480 px/s).
-pub const BULLET_SPEED: i32 = 8 * FP;
+/// Bullet speed, subunits per tick (16 px/tick = 960 px/s).
+pub const BULLET_SPEED: i32 = 16 * FP;
 /// Ticks between shots while holding fire (12 ticks = 5 shots/s).
 pub const FIRE_COOLDOWN: u16 = 12;
 /// Bullet lifetime in ticks.

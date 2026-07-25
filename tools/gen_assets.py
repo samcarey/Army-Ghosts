@@ -8,6 +8,9 @@ Outputs to client/assets/:
   soldier.png - 13x1 grid of 64x64 frames: top-down soldier facing UP,
                 grayscale (engine tints per player). Frame 0 idle,
                 1-6 walk cycle, 7-12 run cycle (longer stride + lean).
+  tracer.png  - 32x8 white tracer streak pointing RIGHT (+x): soft capsule
+                with a bright head and a tail fading to transparent. The
+                engine tints it and rotates it to the bullet's flight angle.
 
 Run from anywhere: python3 tools/gen_assets.py
 Committed outputs are canonical; rerun only when tweaking the look.
@@ -196,6 +199,24 @@ def gen_soldier(path, size=64):
     write_png(path, size * len(grids), size, rows, color_type=6)  # RGBA
 
 
+def gen_tracer(path, w=32, h=8):
+    """Tracer streak pointing +x: bright rounded head, tail fades out."""
+    cy = h / 2
+    r = h / 2 - 1
+    tail_x, head_x = r + 1, w - r - 1
+    rows = []
+    for y in range(h):
+        row = bytearray()
+        for x in range(w):
+            px, py = x + 0.5, y + 0.5
+            d = _seg_dist2(px, py, tail_x, cy, head_x, cy) ** 0.5
+            edge = max(0.0, min(1.0, r - d + 0.5))  # soft capsule edge
+            f = max(0.0, min(1.0, (px - tail_x) / (head_x - tail_x)))
+            row += bytes((255, 255, 255, int(edge * f ** 1.5 * 255)))
+        rows.append(row)
+    write_png(path, w, h, rows, color_type=6)  # RGBA
+
+
 if __name__ == '__main__':
     out = os.path.join(os.path.dirname(__file__), '..', 'client', 'assets')
     os.makedirs(out, exist_ok=True)
@@ -203,3 +224,4 @@ if __name__ == '__main__':
     gen_disc(os.path.join(out, 'disc.png'))
     gen_disc(os.path.join(out, 'ring.png'), inner=0.82)
     gen_soldier(os.path.join(out, 'soldier.png'))
+    gen_tracer(os.path.join(out, 'tracer.png'))

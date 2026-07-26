@@ -8,7 +8,7 @@ use bevy::sprite::Anchor;
 use bevy_ggrs::LocalPlayers;
 
 use army_ghosts_sim::{
-    Bullet, Bush, Facing, Player, Pos, Rock, Stance, Target, ARENA_HALF_H, ARENA_HALF_W,
+    Bullet, Bush, Facing, Health, Player, Pos, Rock, Stance, Target, ARENA_HALF_H, ARENA_HALF_W,
     STANCE_COUNT, STANCE_STAND, TARGET_R,
 };
 
@@ -198,6 +198,13 @@ const PLAYER_COLORS: [Color; 8] = [
     Color::srgb(0.52, 0.72, 0.68), // teal drab
     Color::srgb(0.84, 0.66, 0.44), // ochre
 ];
+
+/// The colour a pawn flashes toward when a round lands on it, and how far. Not
+/// all the way to red: the tint has to read as "that one just got hit" at a
+/// glance across the field without repainting the figure into a different
+/// player.
+const HURT_COLOR: Color = Color::srgb(1.0, 0.32, 0.24);
+const HURT_MIX: f32 = 0.65;
 
 const Z_GROUND: f32 = -10.0;
 /// Bullets and their trails ride ABOVE the y-sorted band: a round in flight is
@@ -442,6 +449,34 @@ pub fn animate_players(
         if atlas.index != index {
             atlas.index = index;
         }
+    }
+}
+
+/// Show what the sim's [`Health`] is doing to a pawn: flash it toward
+/// [`HURT_COLOR`] for the few ticks after it takes a round, and hide it
+/// entirely while it's down.
+///
+/// Must run BEFORE `vision::fade_hidden`, which owns the same sprites' alpha —
+/// this writes rgb only and leaves the alpha where concealment put it. Hiding
+/// goes through `Visibility` for the same reason: an alpha of zero here would
+/// be overwritten a system later.
+pub fn update_health_visuals(
+    mut players: Query<(&Player, &Health, &mut Sprite, &mut Visibility), With<Player>>,
+) {
+    for (player, health, mut sprite, mut visibility) in &mut players {
+        let wanted = if health.alive() { Visibility::Inherited } else { Visibility::Hidden };
+        if *visibility != wanted {
+            *visibility = wanted;
+        }
+        let base = PLAYER_COLORS[player.handle % PLAYER_COLORS.len()];
+        let tint = if health.hurt > 0 {
+            base.mix(&HURT_COLOR, HURT_MIX)
+        } else {
+            base
+        };
+        // Alpha belongs to `fade_hidden`; only the color is ours.
+        let alpha = sprite.color.alpha();
+        sprite.color = tint.with_alpha(alpha);
     }
 }
 

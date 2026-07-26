@@ -98,6 +98,7 @@ fn main() {
                 hud::update_status_text,
                 hud::update_start_button,
                 hud::update_copy_button,
+                hud::update_health_bar,
             ),
             (hud::copy_link_pressed, hud::tick_copied_flash).chain(),
             menu::menu_interactions,
@@ -113,6 +114,8 @@ fn main() {
                 render::attach_sprites,
                 grass::attach_grass_shade,
                 render::animate_players,
+                // Owns the pawns' rgb; `fade_hidden` below owns their alpha.
+                render::update_health_visuals,
                 render::bullet_trails,
                 render::sync_transforms,
                 grass::update_grass_shade,

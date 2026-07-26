@@ -1,15 +1,39 @@
 //! HUD overlays (bevy_ui). The player list (upper right: auto-numbered
-//! players, "(you)" on the local one, per-peer ping in a p2p session, lobby
-//! status while the room is open) and the host's START button.
+//! players, "(you)" on the local one, death count, per-peer ping in a p2p
+//! session, lobby status while the room is open), the local player's health
+//! bar, and the host's START button.
 
 use bevy::prelude::*;
 use bevy_ggrs::{LocalPlayers, Session};
+
+use army_ghosts_sim::{Deaths, Health, Player, FP};
 
 use crate::net::Lobby;
 use crate::{AppState, LaunchConfig, SessionConfig};
 
 #[derive(Component)]
 pub struct PlayerListText;
+
+/// The health bar's track (the dark trough) and the fill inside it. Top-center:
+/// the corners are taken (MENU upper-left, roster upper-right) and the bottom
+/// belongs to the thumbs.
+#[derive(Component)]
+pub struct HealthBar;
+
+#[derive(Component)]
+pub struct HealthFill;
+
+const HEALTH_BAR_W: f32 = 168.0;
+const HEALTH_BAR_H: f32 = 12.0;
+/// Distance from the top edge. The roster hangs off the bottom of this, so the
+/// two never share a line.
+const HEALTH_BAR_TOP: f32 = 10.0;
+/// The fill runs from green through amber to red as the bar empties. Read off
+/// the fraction rather than off thresholds, so the colour is a continuous
+/// reading of how much trouble you're in.
+const HEALTH_FULL: Color = Color::srgb(0.44, 0.76, 0.30);
+const HEALTH_HALF: Color = Color::srgb(0.90, 0.72, 0.20);
+const HEALTH_LOW: Color = Color::srgb(0.88, 0.24, 0.18);
 
 #[derive(Component)]
 pub struct StartButton;
@@ -39,11 +63,13 @@ const START_BAND_Y: f32 = 0.62;
 
 pub fn setup_hud(mut commands: Commands) {
     // Top-right row: [COPY LINK] beside the roster text (top-aligned; the
-    // roster grows downward as players join).
+    // roster grows downward as players join). Sits *below* the health bar's
+    // bottom edge — on a narrow screen the bar's right end and the roster's
+    // left end would otherwise meet in the middle.
     commands
         .spawn(Node {
             position_type: PositionType::Absolute,
-            top: Val::Px(8.0),
+            top: Val::Px(HEALTH_BAR_TOP + HEALTH_BAR_H + 8.0),
             right: Val::Px(10.0),
             column_gap: Val::Px(10.0),
             align_items: AlignItems::FlexStart,
@@ -76,6 +102,43 @@ pub fn setup_hud(mut commands: Commands) {
                 TextColor(Color::srgba(0.92, 0.96, 0.85, 0.9)),
                 TextLayout::new_with_justify(Justify::Right),
             ));
+        });
+
+    // Top-center health bar (hidden until there's a local pawn to report on).
+    commands
+        .spawn(Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(HEALTH_BAR_TOP),
+            left: Val::Px(0.0),
+            right: Val::Px(0.0),
+            justify_content: JustifyContent::Center,
+            ..default()
+        })
+        .with_children(|row| {
+            row.spawn((
+                HealthBar,
+                Node {
+                    width: Val::Px(HEALTH_BAR_W),
+                    height: Val::Px(HEALTH_BAR_H),
+                    border_radius: BorderRadius::all(Val::Px(HEALTH_BAR_H / 2.0)),
+                    padding: UiRect::all(Val::Px(2.0)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.05, 0.07, 0.04, 0.75)),
+                Visibility::Hidden,
+            ))
+            .with_children(|track| {
+                track.spawn((
+                    HealthFill,
+                    Node {
+                        width: Val::Percent(100.0),
+                        height: Val::Percent(100.0),
+                        border_radius: BorderRadius::all(Val::Px(HEALTH_BAR_H / 2.0)),
+                        ..default()
+                    },
+                    BackgroundColor(HEALTH_FULL),
+                ));
+            });
         });
 
     // Bottom-center status line, stacked above the ADS button.
@@ -131,15 +194,71 @@ pub fn setup_hud(mut commands: Commands) {
         });
 }
 
+/// The local pawn's health. Hidden whenever there isn't one to report on (the
+/// lobby, or while you're dead — the respawn countdown in [`StatusText`] is the
+/// message then, and an empty bar sitting there would just be noise).
+pub fn update_health_bar(
+    local: Option<Res<LocalPlayers>>,
+    players: Query<(&Player, &Health)>,
+    mut tracks: Query<&mut Visibility, With<HealthBar>>,
+    mut fills: Query<(&mut Node, &mut BackgroundColor), With<HealthFill>>,
+) {
+    let health = local
+        .as_deref()
+        .and_then(|l| l.0.first().copied())
+        .and_then(|handle| players.iter().find(|(p, _)| p.handle == handle))
+        .map(|(_, health)| *health)
+        .filter(|health| health.alive());
+
+    for mut visibility in &mut tracks {
+        let wanted = if health.is_some() { Visibility::Inherited } else { Visibility::Hidden };
+        if *visibility != wanted {
+            *visibility = wanted;
+        }
+    }
+    let Some(health) = health else { return };
+    let fraction = health.fraction() as f32 / FP as f32;
+    // Green -> amber over the top half, amber -> red over the bottom.
+    let color = if fraction > 0.5 {
+        HEALTH_HALF.mix(&HEALTH_FULL, (fraction - 0.5) * 2.0)
+    } else {
+        HEALTH_LOW.mix(&HEALTH_HALF, fraction * 2.0)
+    };
+    for (mut node, mut background) in &mut fills {
+        node.width = Val::Percent(fraction * 100.0);
+        background.0 = color;
+    }
+}
+
 /// The bottom-center lobby status. The host with company gets no line — the
 /// START button right above it IS the message.
 pub fn update_status_text(
     state: Res<State<AppState>>,
     launch: Res<LaunchConfig>,
     lobby: Res<Lobby>,
+    local: Option<Res<LocalPlayers>>,
+    players: Query<(&Player, &Health)>,
     mut texts: Query<&mut Text, With<StatusText>>,
 ) {
     let Ok(mut text) = texts.single_mut() else { return };
+    // Being dead outranks any lobby message: it's the only line that answers a
+    // question you're asking right now ("how long?").
+    let down = local
+        .as_deref()
+        .and_then(|l| l.0.first().copied())
+        .and_then(|handle| players.iter().find(|(p, _)| p.handle == handle))
+        .map(|(_, health)| health.down)
+        .filter(|down| *down > 0);
+    if let Some(down) = down {
+        // Round up, so the count reads 1 for the whole final second rather
+        // than sitting on 0 while you wait.
+        let seconds = (down as usize).div_ceil(army_ghosts_sim::TICK_HZ);
+        let line = format!("HIT - RESPAWNING IN {seconds}");
+        if text.0 != line {
+            text.0 = line;
+        }
+        return;
+    }
     // ASCII dots — the embedded default font has no "…" glyph.
     let status = match state.get() {
         AppState::Connecting if launch.room.is_some() => {
@@ -289,11 +408,22 @@ pub fn read_start_input(
     }
 }
 
+/// "3 deaths" / "1 death" — the board is a scoreboard, so everyone carries a
+/// count from the first tick rather than sprouting one the moment they die.
+fn deaths_label(count: u32) -> String {
+    if count == 1 {
+        "1 death".into()
+    } else {
+        format!("{count} deaths")
+    }
+}
+
 pub fn update_player_list(
     state: Res<State<AppState>>,
     lobby: Res<Lobby>,
     session: Option<Res<Session<SessionConfig>>>,
     local_players: Option<Res<LocalPlayers>>,
+    scores: Query<(&Player, &Deaths)>,
     mut texts: Query<&mut Text, With<PlayerListText>>,
 ) {
     let Ok(mut text) = texts.single_mut() else { return };
@@ -327,7 +457,20 @@ pub fn update_player_list(
                         .unwrap_or_default(),
                     _ => String::new(),
                 };
-                lines.push(format!("Player {}{}{}", handle + 1, you, ping));
+                // Deaths come out of the sim, so every peer's board agrees
+                // without anyone sending a score message.
+                let deaths = scores
+                    .iter()
+                    .find(|(p, _)| p.handle == handle)
+                    .map(|(_, d)| d.0)
+                    .unwrap_or(0);
+                lines.push(format!(
+                    "Player {}{}  {}{}",
+                    handle + 1,
+                    you,
+                    deaths_label(deaths),
+                    ping
+                ));
             }
         }
     }

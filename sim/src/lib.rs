@@ -61,6 +61,30 @@ pub const TARGET_R: i32 = 14;
 /// Ticks a target stays "flashed" after a hit (render feedback).
 pub const HIT_FLASH_TICKS: u16 = 8;
 
+/// Hit points a pawn spawns with.
+pub const MAX_HEALTH: i32 = 100;
+/// Damage of a perfect round: dead center, point blank. Three of those kill,
+/// which at [`FIRE_COOLDOWN`] is 0.6s of holding the trigger on someone —
+/// short enough to punish standing in the open, long enough that the first
+/// round is a warning rather than a verdict.
+pub const HIT_DAMAGE_MAX: i32 = 42;
+/// What's left of that at the very edge of the hitbox, as a fraction of `FP`.
+/// A graze is worth having (it still costs the target a third of a good hit)
+/// without being worth aiming for.
+pub const DAMAGE_EDGE_FRAC: i32 = FP * 30 / 100;
+/// Range falloff, world units: full damage out to `NEAR`, then linearly down
+/// to `FAR_FRAC` at `FAR` and flat beyond. `FAR` is a little under the arena's
+/// long diagonal, so a cross-map round always lands in the floor.
+pub const DAMAGE_NEAR: i32 = 120;
+pub const DAMAGE_FAR: i32 = 520;
+pub const DAMAGE_FAR_FRAC: i32 = FP * 45 / 100;
+/// Ticks between dying and standing back up at your spawn (1.5s). You are
+/// frozen, unhittable and hidden for the whole count.
+pub const RESPAWN_TICKS: u16 = 90;
+/// Ticks a pawn flashes after taking a round (render feedback, like
+/// [`HIT_FLASH_TICKS`] on the dummies).
+pub const HURT_FLASH_TICKS: u16 = 9;
+
 /// Stance levels, tallest first. Also indexes [`STANCE_SPEED`] and the stance
 /// blocks of the sprite sheet.
 pub const STANCE_STAND: u8 = 0;
@@ -205,6 +229,45 @@ impl Stance {
         STANCE_SPEED[(self.level as usize).min(STANCE_COUNT - 1)]
     }
 }
+
+/// A pawn's condition. `hp` runs to zero, `down` is the respawn countdown that
+/// starts when it gets there, and `hurt` is render feedback.
+///
+/// While `down > 0` the pawn is out of the game entirely: it can't move, fire,
+/// change stance or be hit, and the client hides it. That's deliberately one
+/// flag rather than despawning the entity — a rollback that un-kills someone
+/// then only has to restore a component, instead of resurrecting an entity
+/// whose identity the renderer has already forgotten.
+#[derive(Component, Copy, Clone, Debug, Hash)]
+pub struct Health {
+    pub hp: i32,
+    /// Ticks until respawn; 0 means alive.
+    pub down: u16,
+    /// Ticks left of the hit flash.
+    pub hurt: u16,
+}
+
+impl Default for Health {
+    fn default() -> Self {
+        Self { hp: MAX_HEALTH, down: 0, hurt: 0 }
+    }
+}
+
+impl Health {
+    pub fn alive(&self) -> bool {
+        self.down == 0
+    }
+    /// 0..=FP — what the health bar draws.
+    pub fn fraction(&self) -> i32 {
+        (self.hp.max(0) * FP / MAX_HEALTH).min(FP)
+    }
+}
+
+/// How many times this pawn has been killed. Sim state (it's decided by hits,
+/// which are decided by the input stream), so every peer's scoreboard agrees
+/// without anyone sending a score message.
+#[derive(Component, Copy, Clone, Default, Debug, Hash)]
+pub struct Deaths(pub u32);
 
 /// A live bullet; `owner` is the firing player's handle (no self-hits).
 #[derive(Component, Copy, Clone, Default, Debug, Hash)]
@@ -555,6 +618,8 @@ pub fn spawn_world(commands: &mut Commands, num_players: usize) {
                 Facing::default(),
                 Cooldown::default(),
                 Stance::default(),
+                Health::default(),
+                Deaths::default(),
             ))
             .add_rollback();
     }
@@ -591,14 +656,115 @@ pub fn isqrt(n: i64) -> i64 {
     x
 }
 
-fn dist2(a: Pos, b: Pos) -> i64 {
-    let dx = (a.x - b.x) as i64;
-    let dy = (a.y - b.y) as i64;
-    dx * dx + dy * dy
-}
-
 fn radius_fp(r_units: i32) -> i64 {
     (r_units * FP) as i64
+}
+
+// ── Ballistics ──────────────────────────────────────────────────────────────
+//
+// A bullet covers 16 world units per tick and a pawn is 24 across, so where the
+// round *is* at the end of a tick says very little about what it went through
+// during one: sampling the endpoint clips the near edge of anyone it passes
+// diagonally, and would let a round skip a target that was never more than a
+// few units off its line. Both matter more here than they did against the
+// practice dummies, because the damage now depends on *how* centered the hit
+// was — so the whole tick's travel is treated as a segment and swept.
+
+/// The segment a bullet swept this tick, plus the constants every test against
+/// it needs. `from` is the start (this tick's `Pos` minus one tick of
+/// velocity); `d` is the step; `dd` its squared length; `len` its length.
+#[derive(Copy, Clone)]
+struct Sweep {
+    from: Pos,
+    dx: i64,
+    dy: i64,
+    dd: i64,
+    len: i64,
+}
+
+impl Sweep {
+    /// The step a bullet at `pos` just took.
+    fn of(bullet: &Bullet, pos: Pos) -> Option<Self> {
+        let (dx, dy) = (bullet.vx as i64, bullet.vy as i64);
+        let dd = dx * dx + dy * dy;
+        if dd == 0 {
+            return None;
+        }
+        let from = Pos { x: pos.x - bullet.vx, y: pos.y - bullet.vy };
+        Some(Self { from, dx, dy, dd, len: isqrt(dd) })
+    }
+
+    /// Where the sweep first touches the circle at `center` of `radius` world
+    /// units, as `t * dd` — an integer in `0..=dd`, comparable between
+    /// candidates because every candidate shares this sweep. `None` if it
+    /// misses, or the circle is behind the round.
+    ///
+    /// Standard ray/circle solve, halved (`b/2`) so nothing overflows: the
+    /// early bounding reject also keeps `f` inside a step plus a radius, which
+    /// is what makes the squares here small.
+    fn entry(&self, center: Pos, radius: i32) -> Option<i64> {
+        let r = radius_fp(radius);
+        let fx = (self.from.x - center.x) as i64;
+        let fy = (self.from.y - center.y) as i64;
+        let ff = fx * fx + fy * fy;
+        // Nothing further than a step plus a radius away can be swept.
+        let reach = self.len + r;
+        if ff > reach * reach {
+            return None;
+        }
+        let c = ff - r * r;
+        if c <= 0 {
+            return Some(0); // started inside it
+        }
+        let half_b = fx * self.dx + fy * self.dy;
+        if half_b >= 0 {
+            return None; // moving away from it
+        }
+        let disc = half_b * half_b - self.dd * c;
+        if disc < 0 {
+            return None;
+        }
+        let entry = -half_b - isqrt(disc);
+        (0..=self.dd).contains(&entry).then_some(entry)
+    }
+
+    /// How far the sweep's *line* passes from a point, in subunits. This is the
+    /// "how centered was it" measure, and it deliberately isn't the distance at
+    /// the moment of contact: a round that enters a pawn's edge at the very end
+    /// of a tick is still a dead-center shot, it just hasn't got there yet.
+    fn miss(&self, center: Pos) -> i64 {
+        let fx = (self.from.x - center.x) as i64;
+        let fy = (self.from.y - center.y) as i64;
+        let cross = fx * self.dy - fy * self.dx;
+        cross.abs() / self.len
+    }
+}
+
+/// What a round takes off, from how centered it was and how far it flew.
+///
+/// `miss` is the perpendicular distance from the pawn's center to the shot line
+/// and `reach` the radius at which that stops being a hit (both subunits);
+/// `travelled` is the distance from the muzzle, also subunits. Two independent
+/// scalings of [`HIT_DAMAGE_MAX`], each with a floor, so the worst possible
+/// hit still does about a tenth of the best one and a hit is never worth
+/// nothing.
+pub fn bullet_damage(miss: i64, reach: i64, travelled: i64) -> i32 {
+    let fp = FP as i64;
+    // Centered: FP dead center, 0 at the rim.
+    let centered = if reach <= 0 { fp } else { (reach - miss.clamp(0, reach)) * fp / reach };
+    let center_scale = DAMAGE_EDGE_FRAC as i64 + (fp - DAMAGE_EDGE_FRAC as i64) * centered / fp;
+
+    let units = travelled / fp;
+    let (near, far, floor) = (DAMAGE_NEAR as i64, DAMAGE_FAR as i64, DAMAGE_FAR_FRAC as i64);
+    let range_scale = if units <= near {
+        fp
+    } else if units >= far {
+        floor
+    } else {
+        fp - (fp - floor) * (units - near) / (far - near)
+    };
+
+    (HIT_DAMAGE_MAX as i64 * center_scale / fp * range_scale / fp).max(1) as i32
 }
 
 // ── The plugin ──────────────────────────────────────────────────────────────
@@ -621,6 +787,8 @@ impl<C: Config<Input = PlayerInput>> Plugin for SimPlugin<C> {
             .rollback_component_with_copy::<Facing>()
             .rollback_component_with_copy::<Cooldown>()
             .rollback_component_with_copy::<Stance>()
+            .rollback_component_with_copy::<Health>()
+            .rollback_component_with_copy::<Deaths>()
             .rollback_component_with_copy::<Bullet>()
             .rollback_component_with_copy::<Target>()
             .rollback_component_with_copy::<Rock>()
@@ -633,6 +801,12 @@ impl<C: Config<Input = PlayerInput>> Plugin for SimPlugin<C> {
             // anyway (it scales movement), but only once that player moves —
             // checksumming it catches the disagreement on the tick it happens.
             .checksum_component_with_hash::<Stance>()
+            // Health too: a disagreement about who is alive diverges the whole
+            // match, and it can happen a long way from anyone's position (two
+            // peers resolving the same round against different pawns), so
+            // waiting for it to show up in `Pos` would be waiting for a
+            // respawn.
+            .checksum_component_with_hash::<Health>()
             .add_systems(
                 GgrsSchedule,
                 (
@@ -641,6 +815,7 @@ impl<C: Config<Input = PlayerInput>> Plugin for SimPlugin<C> {
                     move_bullets,
                     resolve_hits,
                     tick_targets,
+                    respawn_players,
                 )
                     .chain(),
             );
@@ -651,7 +826,7 @@ impl<C: Config<Input = PlayerInput>> Plugin for SimPlugin<C> {
 
 fn move_players<C: Config<Input = PlayerInput>>(
     inputs: Res<PlayerInputs<C>>,
-    mut players: Query<(&Player, &mut Pos, &mut Facing, &mut Stance)>,
+    mut players: Query<(&Player, &mut Pos, &mut Facing, &mut Stance, &Health)>,
     rocks: Query<(&Rock, &Pos), Without<Player>>,
 ) {
     // Sorted: resolving overlaps in a different order could land a pinched
@@ -663,7 +838,12 @@ fn move_players<C: Config<Input = PlayerInput>>(
         .collect();
     cover.sort_unstable();
 
-    for (player, mut pos, mut facing, mut stance) in &mut players {
+    for (player, mut pos, mut facing, mut stance, health) in &mut players {
+        // The dead hold still: no drifting, no turning, no getting up out of
+        // prone while you wait. `respawn_players` puts them back.
+        if !health.alive() {
+            continue;
+        }
         let (input, _status) = inputs[player.handle];
         // Stance first: the requested level rides in the input bits, so every
         // peer starts (and finishes) the same transition on the same tick.
@@ -726,14 +906,14 @@ fn push_out_of_cover(pos: &mut Pos, cover: &[(i32, i32, i32)]) {
 fn fire_bullets<C: Config<Input = PlayerInput>>(
     mut commands: Commands,
     inputs: Res<PlayerInputs<C>>,
-    mut players: Query<(&Player, &Pos, &Facing, &mut Cooldown)>,
+    mut players: Query<(&Player, &Pos, &Facing, &mut Cooldown, &Health)>,
 ) {
-    for (player, pos, facing, mut cooldown) in &mut players {
+    for (player, pos, facing, mut cooldown, health) in &mut players {
         if cooldown.0 > 0 {
             cooldown.0 -= 1;
         }
         let (input, _status) = inputs[player.handle];
-        if !input.fire() || cooldown.0 > 0 {
+        if !input.fire() || cooldown.0 > 0 || !health.alive() {
             continue;
         }
         cooldown.0 = FIRE_COOLDOWN;
@@ -759,40 +939,131 @@ fn fire_bullets<C: Config<Input = PlayerInput>>(
 fn move_bullets(
     mut commands: Commands,
     mut bullets: Query<(Entity, &mut Bullet, &mut Pos)>,
-    rocks: Query<(&Rock, &Pos), Without<Bullet>>,
 ) {
     for (entity, mut bullet, mut pos) in &mut bullets {
         pos.x += bullet.vx;
         pos.y += bullet.vy;
         bullet.ttl = bullet.ttl.saturating_sub(1);
         let out = pos.x.abs() > ARENA_HALF_W * FP || pos.y.abs() > ARENA_HALF_H * FP;
-        // Rounds stop in cover, same as sight does. Order-independent (the
-        // outcome is just "despawned"), so no sort needed here.
-        let blocked = rocks.iter().any(|(rock, rock_pos)| {
-            let reach = radius_fp(rock.r + BULLET_R);
-            dist2(*pos, *rock_pos) <= reach * reach
-        });
-        if bullet.ttl == 0 || out || blocked {
+        if bullet.ttl == 0 || out {
             commands.entity(entity).despawn();
         }
     }
 }
 
+/// What a round ran into first.
+#[derive(Copy, Clone)]
+enum Impact {
+    /// Handle hit, and how far off center the shot line passed (subunits).
+    Player(usize, i64),
+    /// The dummy standing here (matched back by position — they never move).
+    Target(Pos),
+    /// Stopped in cover. Nothing to apply; the round just dies.
+    Rock,
+}
+
+/// Resolve every round against everything it could have swept through this
+/// tick, and apply only the *first* thing along its path — so cover really
+/// does stop a bullet that would otherwise have carried on into someone behind
+/// it, rather than both happening because they were checked in different
+/// systems.
 fn resolve_hits(
     mut commands: Commands,
-    bullets: Query<(Entity, &Pos), With<Bullet>>,
+    bullets: Query<(Entity, &Bullet, &Pos)>,
+    mut players: Query<(&Player, &Pos, &mut Health, &mut Deaths)>,
     mut targets: Query<(&mut Target, &Pos)>,
+    rocks: Query<(&Rock, &Pos)>,
 ) {
-    for (bullet_entity, bullet_pos) in &bullets {
-        for (mut target, target_pos) in &mut targets {
-            let reach = radius_fp(TARGET_R + BULLET_R);
-            if dist2(*bullet_pos, *target_pos) <= reach * reach {
-                target.hits += 1;
-                target.flash = HIT_FLASH_TICKS;
-                commands.entity(bullet_entity).despawn();
-                break;
+    for (bullet_entity, bullet, bullet_pos) in &bullets {
+        let Some(sweep) = Sweep::of(bullet, *bullet_pos) else { continue };
+
+        // Sorted, not first-found: query iteration order is not a determinism
+        // guarantee, and "which of these did the round reach first" has to come
+        // out the same on every peer. The key is (distance along the sweep,
+        // position, handle) — position alone would tie between two pawns
+        // standing on the same subunit, which nothing prevents.
+        let mut hits: Vec<(i64, i32, i32, usize, Impact)> = Vec::new();
+        for (player, pos, health, _) in &players {
+            if player.handle == bullet.owner || !health.alive() {
+                continue;
+            }
+            if let Some(entry) = sweep.entry(*pos, PLAYER_R + BULLET_R) {
+                hits.push((entry, pos.x, pos.y, player.handle + 1, Impact::Player(player.handle, sweep.miss(*pos))));
             }
         }
+        for (_, pos) in &targets {
+            if let Some(entry) = sweep.entry(*pos, TARGET_R + BULLET_R) {
+                hits.push((entry, pos.x, pos.y, 0, Impact::Target(*pos)));
+            }
+        }
+        for (rock, pos) in &rocks {
+            if let Some(entry) = sweep.entry(*pos, rock.r + BULLET_R) {
+                hits.push((entry, pos.x, pos.y, 0, Impact::Rock));
+            }
+        }
+        hits.sort_unstable_by_key(|&(entry, x, y, tie, _)| (entry, x, y, tie));
+        let Some(&(.., impact)) = hits.first() else { continue };
+
+        match impact {
+            Impact::Rock => {}
+            Impact::Target(at) => {
+                for (mut target, pos) in &mut targets {
+                    if *pos == at {
+                        target.hits += 1;
+                        target.flash = HIT_FLASH_TICKS;
+                        break;
+                    }
+                }
+            }
+            Impact::Player(handle, miss) => {
+                // Distance flown: every round travels at the same speed, so the
+                // ticks it has burned are its range — no extra state to roll
+                // back. Plus the muzzle offset it was born at.
+                let flown = (PLAYER_R + BULLET_R + 2) as i64 * FP as i64
+                    + (BULLET_TTL - bullet.ttl) as i64 * BULLET_SPEED as i64;
+                let damage = bullet_damage(miss, radius_fp(PLAYER_R + BULLET_R), flown);
+                for (player, _, mut health, mut deaths) in &mut players {
+                    if player.handle != handle {
+                        continue;
+                    }
+                    health.hp -= damage;
+                    health.hurt = HURT_FLASH_TICKS;
+                    if health.hp <= 0 {
+                        health.hp = 0;
+                        health.down = RESPAWN_TICKS;
+                        deaths.0 += 1;
+                    }
+                    break;
+                }
+            }
+        }
+        commands.entity(bullet_entity).despawn();
+    }
+}
+
+/// Count the dead back in. Everything about the pawn resets — position, facing,
+/// stance, trigger — so a respawn is a clean start and not a corpse teleporting
+/// home still lying down.
+fn respawn_players(
+    mut players: Query<(&Player, &mut Pos, &mut Facing, &mut Stance, &mut Cooldown, &mut Health)>,
+) {
+    for (player, mut pos, mut facing, mut stance, mut cooldown, mut health) in &mut players {
+        if health.hurt > 0 {
+            health.hurt -= 1;
+        }
+        if health.down == 0 {
+            continue;
+        }
+        health.down -= 1;
+        if health.down > 0 {
+            continue;
+        }
+        let (x, y) = SPAWN_POINTS[player.handle % MAX_PLAYERS];
+        *pos = Pos::from_units(x, y);
+        *facing = Facing::default();
+        *stance = Stance::default();
+        *cooldown = Cooldown::default();
+        health.hp = MAX_HEALTH;
     }
 }
 
@@ -992,6 +1263,85 @@ mod tests {
         println!("fully hidden: prone {prone_hidden}, standing {stand_hidden} of {sampled}");
         assert!(prone_hidden * 2 > sampled, "crawling should hide you over most of the map");
         assert!(stand_hidden * 20 < sampled, "standing should almost never be free cover");
+    }
+
+    /// A round travelling right along y=0, one tick's worth of step, starting
+    /// `units` to the left of the origin and offset `off` units on y.
+    fn shot(units: i32, off: i32) -> (Bullet, Pos) {
+        let bullet = Bullet { owner: 0, ttl: BULLET_TTL - 1, vx: BULLET_SPEED, vy: 0 };
+        (bullet, Pos::from_units(-units + BULLET_SPEED / FP, off))
+    }
+
+    /// The sweep is what makes "how centered" mean anything: a round is tested
+    /// against the whole tick of travel, not against wherever it happened to
+    /// stop, and the miss distance is the shot *line's*, not the contact
+    /// point's.
+    #[test]
+    fn bullets_sweep_their_whole_step() {
+        let reach = PLAYER_R + BULLET_R;
+
+        // A round that ends the tick short of the pawn but crosses it during
+        // one still hits. (16 units per tick against a 24-unit pawn: sampling
+        // the endpoint would let this through.)
+        let (bullet, pos) = shot(reach + 4, 0);
+        let sweep = Sweep::of(&bullet, pos).unwrap();
+        assert!(sweep.entry(Pos::from_units(0, 0), reach).is_some(), "swept round must hit");
+
+        // Dead center is dead center even when contact is at the very end of
+        // the step — the miss is measured off the line.
+        assert_eq!(sweep.miss(Pos::from_units(0, 0)), 0);
+
+        // Passing the pawn's shoulder: hit, and the miss is the real offset.
+        let (bullet, pos) = shot(reach + 4, 10);
+        let sweep = Sweep::of(&bullet, pos).unwrap();
+        assert!(sweep.entry(Pos::from_units(0, 0), reach).is_some());
+        let miss = sweep.miss(Pos::from_units(0, 0));
+        assert!((miss - 10 * FP as i64).abs() <= 2, "miss should read ~10 units, got {miss}");
+
+        // Wide, and behind: neither is a hit.
+        let (bullet, pos) = shot(reach + 4, reach + 6);
+        assert!(Sweep::of(&bullet, pos).unwrap().entry(Pos::from_units(0, 0), reach).is_none());
+        let (bullet, pos) = shot(-200, 0); // already 200 units past, moving away
+        assert!(Sweep::of(&bullet, pos).unwrap().entry(Pos::from_units(0, 0), reach).is_none());
+    }
+
+    /// The damage curve has to stay monotone in both arguments and keep its
+    /// floors — an edge hit at range must still be worth firing, and a perfect
+    /// round must not one-shot.
+    #[test]
+    fn damage_falls_off_with_center_and_range() {
+        let reach = radius_fp(PLAYER_R + BULLET_R);
+        let at = |off_units: i32, range_units: i32| {
+            bullet_damage(off_units as i64 * FP as i64, reach, range_units as i64 * FP as i64)
+        };
+
+        let best = at(0, 0);
+        assert_eq!(best, HIT_DAMAGE_MAX, "point blank dead center is the full figure");
+        assert!(best * 2 < MAX_HEALTH, "one round must never be half a life");
+        assert!(best * 3 >= MAX_HEALTH, "three perfect rounds should kill");
+
+        // Monotone in centeredness, at a fixed range...
+        let mut previous = i32::MAX;
+        for off in 0..=(PLAYER_R + BULLET_R) {
+            let damage = at(off, 0);
+            assert!(damage <= previous, "damage rose as the shot went wider at {off}");
+            previous = damage;
+        }
+        // ...and in range, at a fixed centeredness.
+        let mut previous = i32::MAX;
+        for range in (0..=800).step_by(20) {
+            let damage = at(0, range);
+            assert!(damage <= previous, "damage rose with range at {range}");
+            previous = damage;
+        }
+
+        // Both floors hold, and the worst hit still registers.
+        assert_eq!(at(0, 2000), at(0, DAMAGE_FAR), "range falloff must flatten out");
+        let worst = at(PLAYER_R + BULLET_R, 2000);
+        assert!(worst >= 1, "a hit is never worth nothing");
+        assert!(worst * 6 < best, "a long graze should be a fraction of a good hit");
+        // Beyond the hitbox the caller never asks, but the clamp must hold.
+        assert_eq!(at(500, 0), at(PLAYER_R + BULLET_R, 0));
     }
 
     #[test]

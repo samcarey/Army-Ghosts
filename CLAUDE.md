@@ -132,6 +132,41 @@ Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_SIGNALING` env vars.
   a rollback correction can read as a supersonic `Pos` delta for one frame and
   must not land on an empty frame. `Stance` is rollback-registered like every
   other tick-evolving component.
+- **Health, damage and respawn** (`sim/src/lib.rs`: `Health`, `Deaths`,
+  `Sweep`, `bullet_damage`, `resolve_hits`, `respawn_players`): a round takes
+  off `HIT_DAMAGE_MAX` (42 of `MAX_HEALTH` 100) scaled twice — by how centered
+  it was and by how far it flew — so three perfect rounds kill and a long graze
+  is worth about a tenth of that. Both scalings have floors (`DAMAGE_EDGE_FRAC`
+  30%, `DAMAGE_FAR_FRAC` 45% beyond `DAMAGE_FAR`), and damage is floored at 1: a
+  hit is never worth nothing. Range is free of extra state — every round flies at
+  `BULLET_SPEED`, so the ticks it has burned *are* its range.
+  The part worth understanding is the **sweep**. A bullet covers 16 units a tick
+  against a 24-unit pawn, so the old point-in-circle test on the post-move
+  position was both tunnelling and unable to answer "how centered": a dead-center
+  shot whose sampled position happened to land near the rim read as a graze.
+  Rounds are now tested against the whole tick's travel as a segment, and the
+  centeredness is the perpendicular distance from the pawn to the shot *line*,
+  not to the contact point — a round entering someone's edge at the very end of a
+  tick is still a dead-center shot, it just hasn't arrived yet.
+  Consequences that are easy to miss:
+  * Players, dummies and boulders now resolve in ONE nearest-impact pass in
+    `resolve_hits` (the rock test moved out of `move_bullets`), because cover has
+    to stop a round that would otherwise carry on into someone behind it. Ties
+    are broken by (distance along the sweep, position, handle) — query iteration
+    order is not a determinism guarantee, and two pawns can share a subunit.
+  * Death is a flag (`Health::down`), not a despawn: rollback un-killing someone
+    then only restores a component instead of resurrecting an entity the
+    renderer has forgotten. While down you can't move, fire, change stance or be
+    hit, and the client hides you via `Visibility` (NOT alpha — `fade_hidden`
+    owns pawn alpha and would overwrite it a system later; `update_health_visuals`
+    writes rgb only, and must run before it).
+  * `Deaths` is sim state, so every peer's scoreboard agrees without anyone
+    sending a score message.
+  * **The spawn→spawn lanes are NOT clear.** Only spawn→dummy is (see
+    `rock_layout`); there's a boulder at (30,-23) squarely between spawns 0 and 1.
+    Any test that needs a clear shot must pick its lane deliberately —
+    `sim/tests/combat.rs` fires spawn 2 → spawn 3 and asserts `lane_is_clear`
+    up front, so a reseeded field fails saying what actually changed.
 - **Character art** (`tools/gen_assets.py` `gen_soldier` + `client/src/render.rs`):
   the soldier is modelled ONCE in 3D — capsules in character space, x right,
   y forward, z up, origin on the ground between the feet — then rotated about z
@@ -433,7 +468,15 @@ need a TURN server eventually.
 ## Testing
 
 - `cargo test -p army-ghosts-sim` — pure-integer layout/collision checks
-  (rock + bush fields land and stay walkable, cover deflects an angled walk).
+  (rock + bush fields land and stay walkable, cover deflects an angled walk),
+  plus `tests/combat.rs`, which drives a REAL synctest session a tick at a time
+  (`TimeUpdateStrategy::ManualDuration` — bevy_ggrs steps off `Time`'s delta, so
+  a manual clock makes ticks countable) to prove rounds land, damage accumulates
+  into a death, and the pawn comes back whole. It runs at
+  `with_check_distance(2)`, so it re-simulates every frame and checksums:
+  rollback-unsafe health state fails there rather than as a desync in a match.
+  Note `PlayerInputs` can only be filled by a session, which is why the systems
+  can't just be called directly.
 - Native smoke: run without a room (synctest re-simulates every frame — it
   catches nondeterminism AND rollback-unsafe state immediately).
 - Web smoke: `tools/build-web.sh` + local http.server + headless chromium

@@ -13,11 +13,14 @@
 //!
 //! **The display is quantized.** The arena is a grid of flat-top hexes, and each
 //! one integrates that answer over its own area ([`HEX_PROBES`] points) and
-//! paints the average flat across the tile. Adjacent tiles don't share vertices,
-//! so the boundaries are hard on purpose: what's hidden reads as a *place* —
-//! this hex, not that one — rather than as a smear whose edge you can't locate.
-//! A pawn straddling two tiles is shaded by both, which is the tell that the fog
-//! belongs to the ground and not to them.
+//! paints it across the tile: flat over the middle ([`TILE_PLATEAU`]), then a rim
+//! that blends to a value shared with the neighbours meeting at each corner, so
+//! the grid reads as tiles without hard-edged polygons. What's hidden is a
+//! *place* — this hex, not that one — rather than a smear whose edge you can't
+//! locate. Tiles also ease toward their target over [`TILE_EASE`] rather than
+//! snapping, so cover sliding through your sight lines dissolves the fog instead
+//! of flickering it. A pawn straddling two tiles is shaded by both, which is the
+//! tell that the fog belongs to the ground and not to them.
 //!
 //! Sight lines start `VIEW_PULLBACK` *behind* the pawn rather than at it — a
 //! third-person camera over the shoulder, at two [`SHOULDER_OFFSET`] positions —
@@ -38,7 +41,7 @@
 //! skirts and a per-pixel feather in the shader. It was prettier and much harder
 //! to read: you could never tell where a shadow's edge actually was, and three
 //! different concealment systems each had their own falloff. `git log` this file
-//! if the soft version is wanted back.
+//! if the per-caster version is wanted back.
 
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, MeshVertexBufferLayoutRef, PrimitiveTopology};
@@ -144,6 +147,16 @@ const HEX_R: f32 = 16.0;
 /// loop of the whole system (probes x tiles x casts, every frame), so it buys
 /// that with four points rather than seven.
 const HEX_PROBES: usize = 4;
+/// How far out from a tile's centre its flat plateau reaches, as a fraction of
+/// the way to the corners; the rest is rim that blends into the neighbours. All
+/// plateau is a honeycomb of hard polygons, all rim is a smear with no tiles left
+/// in it.
+const TILE_PLATEAU: f32 = 0.55;
+/// Time constant for a tile easing toward its target darkness, seconds. Long
+/// enough to dissolve rather than flicker as cover slides in and out of the
+/// sight lines, short enough that the fog isn't lagging behind you when it
+/// matters.
+const TILE_EASE: f32 = 0.14;
 
 /// Flat vertex-color material for the fog mesh — no uniforms, no textures.
 ///
@@ -194,12 +207,23 @@ impl Plugin for VisionPlugin {
 
 /// The hex fog: static geometry (one fan per tile), colors rewritten each frame.
 ///
-/// `centres` is parallel to the tiles in the mesh, so `update_fog` can walk the
-/// two together without recomputing any geometry.
+/// `centres`, `corners`, `target` and `shown` are all parallel to the tiles in
+/// the mesh, so `update_fog` walks them together without touching geometry.
 #[derive(Resource)]
 pub struct FogMesh {
     mesh: Handle<Mesh>,
     centres: Vec<Vec2>,
+    /// For each tile, the shared-corner index of each of its six corners. A
+    /// corner belongs to up to three hexes; giving all of them the same value
+    /// there is what makes the rims blend instead of butting up against each
+    /// other.
+    corners: Vec<[u32; 6]>,
+    /// How many tiles meet at each shared corner (three inside the field, fewer
+    /// at the walls).
+    corner_share: Vec<f32>,
+    /// Where each tile's shadow is heading, and where it has actually got to.
+    target: Vec<f32>,
+    shown: Vec<f32>,
 }
 
 /// Marks the fog entity.
@@ -243,20 +267,47 @@ pub fn setup_fog(
 ) {
     let centres = hex_centres();
     let (mut positions, mut colors, mut indices) = (Vec::new(), Vec::new(), Vec::new());
+    // Shared corners, found by position: hexes that meet at a point compute the
+    // same coordinates for it, to well within this rounding.
+    let mut corner_ids: std::collections::HashMap<(i32, i32), u32> = Default::default();
+    let mut corner_share: Vec<f32> = Vec::new();
+    let mut corners: Vec<[u32; 6]> = Vec::with_capacity(centres.len());
+
     for centre in &centres {
-        // A fan: the centre plus its six corners. The tile gets ONE color, so
-        // its vertices are never shared with a neighbour — that hard edge
-        // between tiles is the whole point of the quantization.
+        // Thirteen vertices per tile: the centre and an inner ring carrying the
+        // tile's own value, then the outer corners carrying the value shared
+        // with the neighbours. So each tile is a flat plateau with a feathered
+        // rim, and along any shared edge both tiles interpolate between the same
+        // two corner values — no seam, and no visible hard boundary.
         let base = positions.len() as u32;
+        let mut ids = [0u32; 6];
         positions.push([centre.x, centre.y, 0.0]);
-        colors.push([0.0; 4]);
+        for i in 0..6 {
+            let p = centre.lerp(hex_corner(*centre, i), TILE_PLATEAU);
+            positions.push([p.x, p.y, 0.0]);
+        }
         for i in 0..6 {
             let p = hex_corner(*centre, i);
             positions.push([p.x, p.y, 0.0]);
-            colors.push([0.0; 4]);
-            indices.extend([base, base + 1 + i as u32, base + 1 + ((i as u32 + 1) % 6)]);
+            let key = ((p.x * 2.0).round() as i32, (p.y * 2.0).round() as i32);
+            let id = *corner_ids.entry(key).or_insert_with(|| {
+                corner_share.push(0.0);
+                corner_share.len() as u32 - 1
+            });
+            corner_share[id as usize] += 1.0;
+            ids[i] = id;
+        }
+        corners.push(ids);
+        colors.extend(std::iter::repeat_n([0.0f32; 4], 13));
+        for i in 0..6u32 {
+            let j = (i + 1) % 6;
+            let (in_i, in_j) = (base + 1 + i, base + 1 + j);
+            let (out_i, out_j) = (base + 7 + i, base + 7 + j);
+            indices.extend([base, in_i, in_j]);                 // plateau
+            indices.extend([in_i, out_i, out_j, in_i, out_j, in_j]); // rim
         }
     }
+
     // RenderAssetUsages::default() keeps the mesh in the main world too, which
     // is what lets `update_fog` mutate it every frame.
     let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
@@ -275,7 +326,15 @@ pub fn setup_fog(
         // first frame's, and the cost of getting it wrong is the fog blinking out.
         bevy::camera::visibility::NoFrustumCulling,
     ));
-    commands.insert_resource(FogMesh { mesh, centres });
+    let tiles = centres.len();
+    commands.insert_resource(FogMesh {
+        mesh,
+        centres,
+        corners,
+        corner_share,
+        target: vec![0.0; tiles],
+        shown: vec![0.0; tiles],
+    });
 }
 
 /// Re-shade every tile from the local player's point of view.
@@ -283,10 +342,17 @@ pub fn setup_fog(
 /// The rays are unchanged — [`Cast`] cones from the shoulder cameras, plus the
 /// grass ray test — and are still evaluated at continuous points. What's
 /// quantized is only the *display*: each tile integrates the shadow over its own
-/// area (`HEX_PROBES` points) and paints the average across the whole hex.
+/// area ([`HEX_PROBES`] points) and paints one value across its plateau.
+///
+/// Two things soften that. Between tiles, the rim blends to a value shared with
+/// the neighbours, so the grid reads as tiles without hard-edged polygons. Over
+/// time, each tile eases toward its target ([`TILE_EASE`]) rather than snapping,
+/// so walking dissolves the fog instead of flickering it — which also hides the
+/// fact that the targets themselves only recompute every third of a tile walked.
 pub fn update_fog(
-    fog: Res<FogMesh>,
+    mut fog: ResMut<FogMesh>,
     mut meshes: ResMut<Assets<Mesh>>,
+    time: Res<Time>,
     local_players: Option<Res<LocalPlayers>>,
     players: Query<(&Player, &Pos, &Stance)>,
     rocks: Query<(&Rock, &Pos)>,
@@ -306,54 +372,67 @@ pub fn update_fog(
         *visibility = Visibility::Hidden;
         return;
     };
-    let Some(mesh) = meshes.get_mut(&fog.mesh) else { return };
     *visibility = Visibility::Visible;
-    // Cover doesn't move and the grass field is fixed, so the whole picture is a
+
+    // Cover doesn't move and the grass field is fixed, so the targets are a
     // function of where the viewer stands and how tall they are — and the answer
     // is quantized to 32-unit tiles anyway, so it doesn't need recomputing for
-    // every pixel of walking. This is the cheap half of what quantizing bought:
-    // standing still costs nothing, and walking recomputes ~20 times a second
-    // instead of 60. The threshold has to stay well under a tile or shadows lag
-    // visibly behind the pawn.
-    if last.is_some_and(|(p, level)| level == eye_level && p.distance_squared(eye) < HEX_R * HEX_R / 9.0)
-    {
-        return;
-    }
-    *last = Some((eye, eye_level));
-
-    let casts = casts_from(eye, &rocks, &bushes);
-    let grey = FOG_COLOR.to_linear();
-    let mut colors: Vec<[f32; 4]> = Vec::with_capacity(fog.centres.len() * 7);
-    for centre in &fog.centres {
-        // Integrate over the tile rather than sampling its middle: a hex that
-        // straddles the edge of a shadow should come out half dark, not pick a
-        // side. The centre plus the six corner midpoints is enough for that.
-        // Grass once per tile, at the centre: the depth field is smooth over a
-        // 32-unit hex, so probing it four times costs four ray marches to say
-        // the same thing. Cover is the opposite — a shadow edge is hard, and
-        // catching it half way across a tile is the entire point of probing.
-        //
-        // What the grass term answers is "could I see someone STANDING here",
-        // which is the question the player asks of a tile — and it keeps open
-        // ground bright, instead of drowning it in the grass that hides the dirt
-        // but not a soldier.
-        let grass = grass_conceal(eye, eye_h, *centre, STANCE_HEIGHT[0] as f32);
-        let mut sum = 0.0;
-        for i in 0..HEX_PROBES {
-            let p = match i {
-                0 => *centre,
-                _ => centre.lerp(hex_corner(*centre, (i - 1) * 2), 0.62),
-            };
-            sum += 1.0 - (1.0 - coverage_at(&casts, p)) * (1.0 - grass);
+    // every pixel of walking. Standing still costs nothing; walking recomputes
+    // ~20 times a second instead of 60, and the easing below covers the steps.
+    let moved = !last
+        .is_some_and(|(p, level)| level == eye_level && p.distance_squared(eye) < HEX_R * HEX_R / 9.0);
+    if moved {
+        *last = Some((eye, eye_level));
+        let casts = casts_from(eye, &rocks, &bushes);
+        // Split the borrow: the targets are written while the centres are read.
+        let FogMesh { centres, target, .. } = &mut *fog;
+        for (tile, centre) in centres.iter().enumerate() {
+            // Grass once per tile, at the centre: the depth field is smooth over
+            // a 32-unit hex, so probing it four times costs four ray marches to
+            // say the same thing. Cover is the opposite — a shadow edge is hard,
+            // and catching it half way across a tile is the point of probing.
+            //
+            // What the grass term answers is "could I see someone STANDING
+            // here", which is the question the player asks of a tile — and it
+            // keeps open ground bright, instead of drowning it in the grass that
+            // hides the dirt but not a soldier.
+            let grass = grass_conceal(eye, eye_h, *centre, STANCE_HEIGHT[0] as f32);
+            let mut sum = 0.0;
+            for i in 0..HEX_PROBES {
+                let p = match i {
+                    0 => *centre,
+                    _ => centre.lerp(hex_corner(*centre, (i - 1) * 2), 0.62),
+                };
+                sum += 1.0 - (1.0 - coverage_at(&casts, p)) * (1.0 - grass);
+            }
+            // Tiles carry more of the shadow than the old swept mesh did: the
+            // whole point of quantizing is that the fog is what you read the map
+            // from. Still short of opaque, so a hidden hex is "no information",
+            // not a hole.
+            target[tile] = sum / HEX_PROBES as f32 * TILE_SHADOW_SCALE;
         }
-        // Tiles carry more of the shadow than the old swept mesh did: the whole
-        // point of quantizing is that the fog is the thing you read the map
-        // from, and at the soft version's `TERRAIN_SHADOW_SCALE` the tiles were
-        // too faint to tell apart over a busy grass texture. Still short of
-        // opaque, so a hidden hex is "no information", not a hole.
-        let alpha = sum / HEX_PROBES as f32 * TILE_SHADOW_SCALE;
-        for _ in 0..7 {
-            colors.push([grey.red, grey.green, grey.blue, alpha]);
+    }
+
+    let Some(mesh) = meshes.get_mut(&fog.mesh) else { return };
+    // Frame-rate independent ease, so the dissolve looks the same at 30 fps as
+    // at 120.
+    let k = 1.0 - (-time.delta_secs() / TILE_EASE).exp();
+    let FogMesh { corners, corner_share, target, shown, .. } = &mut *fog;
+    let mut corner_sum = vec![0.0f32; corner_share.len()];
+    for (tile, shown) in shown.iter_mut().enumerate() {
+        *shown += (target[tile] - *shown) * k;
+        for corner in corners[tile] {
+            corner_sum[corner as usize] += *shown;
+        }
+    }
+
+    let grey = FOG_COLOR.to_linear();
+    let mut colors: Vec<[f32; 4]> = Vec::with_capacity(shown.len() * 13);
+    for (tile, shown) in shown.iter().enumerate() {
+        let vertex = |alpha: f32| [grey.red, grey.green, grey.blue, alpha];
+        colors.extend(std::iter::repeat_n(vertex(*shown), 7)); // centre + plateau
+        for corner in corners[tile] {
+            colors.push(vertex(corner_sum[corner as usize] / corner_share[corner as usize]));
         }
     }
     mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);

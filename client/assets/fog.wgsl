@@ -1,9 +1,10 @@
 // Line-of-sight fog (see client/src/vision.rs).
 //
-// Flat per-tile shading: the whole hex carries one vertex color, and adjacent
-// tiles don't share vertices, so the boundary between two visibility levels is
-// a hard edge. That is deliberate — the fog is quantized to the tile grid so
-// what's hidden reads as a place on the map rather than as a soft smear.
+// Per-tile shading, interpolated: each hex is a flat plateau of its own value
+// with a rim blending to values shared with its neighbours, so the fog is
+// quantized to the tile grid — what's hidden reads as a place on the map — but
+// without hard-edged polygons. All of that lives in the vertex colors; this
+// shader just passes them through.
 //
 // This exists at all because bevy's stock `ColorMaterial` gates vertex colors
 // behind a `VERTEX_COLORS` shader def that is decided once, when the entity is

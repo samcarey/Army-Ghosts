@@ -253,11 +253,13 @@ Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_SIGNALING` env vars.
     standing THERE can be seen from HERE.
   * **The display is quantized to hexes.** The arena is a flat-top hex grid
     (`HEX_R` 16, ~750 tiles); each tile integrates that answer over its own area
-    (`HEX_PROBES` points) and paints the average FLAT across itself. Adjacent
-    tiles don't share vertices, so boundaries are hard on purpose — what's hidden
-    reads as a place on the map rather than a smear. The fog draws over
-    everything at z 5, so a pawn straddling two tiles is shaded by both, which is
-    the tell that the fog belongs to the ground and not to them.
+    (`HEX_PROBES` points) and paints it flat over its middle (`TILE_PLATEAU`)
+    with a rim blending to a value shared with the neighbours meeting at each
+    corner — tiles without hard-edged polygons, and no seams, because both sides
+    of an edge interpolate between the same two corner values. Tiles also ease
+    toward their target over `TILE_EASE` (0.14s) instead of snapping. The fog
+    draws over everything at z 5, so a pawn straddling two tiles is shaded by
+    both, which is the tell that the fog belongs to the ground and not to them.
   Two things this buys beyond legibility: the mesh is static (only vertex colors
   change), and because the answer is quantized anyway it only needs recomputing
   when the viewer moves ~a third of a tile — standing still is free, walking

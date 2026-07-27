@@ -72,7 +72,15 @@ def write_png(path, width, height, rows, color_type):
 
 def gen_ground(path, size=128):
     rng = random.Random(42)
-    base = (62, 74, 42)  # muted army green
+    # Dry earth, NOT green. This layer is only ever seen where the grass field
+    # says a tile is bare (`GRASS_BARE_BELOW`) — everywhere else the sward draws
+    # over it opaque — so it is the thing that makes open ground read as open.
+    # It used to be a muted army green, which under the 12% sward tint came out
+    # looking like short grass: standing on a bare tile then read as standing in
+    # grass with your boots poking out below the blades next to you.
+    # Same luminance as that green on purpose, because `PLAYER_COLORS` were
+    # picked to sit above the ground in value.
+    base = (88, 76, 54)  # dry earth
     # Low-frequency blotches for variation, wrapped so the tile is seamless.
     blotches = [
         (rng.randrange(size), rng.randrange(size), rng.randint(12, 28), rng.randint(-10, 8))
@@ -914,6 +922,21 @@ def gen_tufts(path, w=28, h=48, variants=12):
     for v in range(variants):
         rng = random.Random(4400 + v)
         parts = []
+        # A skirt of short, wide, hard-bent leaves right at the root FIRST, so
+        # the clump meets the ground instead of standing on bare stems.
+        #
+        # Without it the bottom of a frame is ~26% opaque against ~33% higher up:
+        # a pawn's boots sit exactly on that line, so whatever the sort order
+        # does you see them through the stems of every clump in front of them.
+        # That is the "foot under the grass" that survived three passes at the
+        # sprite anchor and the y-sort banding — it was never the ordering, it
+        # was that there is nothing painted down there.
+        for _ in range(rng.randint(10, 14)):
+            azim = rng.uniform(0, 2 * math.pi)
+            rad = rng.uniform(0.0, 0.15)
+            base = (math.cos(azim) * rad, math.sin(azim) * rad, 0.0)
+            _blade(parts, base, rng.uniform(0, 2 * math.pi),
+                   rng.uniform(0.08, 0.24), rng.uniform(0.15, 0.35), rng)
         for _ in range(rng.randint(4, 8)):
             azim = rng.uniform(0, 2 * math.pi)
             rad = rng.uniform(0.0, 0.07)

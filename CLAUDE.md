@@ -226,51 +226,130 @@ Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_SIGNALING` env vars.
   + `client/assets/grass.wgsl`): unlike rocks and bushes there are NO grass
   entities. The depth anywhere is a pure integer function of position — three
   octaves of value noise (lattice hash, smoothstep interpolation, cells
-  300/105/38), contrast-stretched and biased toward thin ground — so nothing is
-  spawned, stored, rolled back or checksummed, and the renderer, a test or a
-  future sim rule can all ask "how deep here?" for a few multiplies. It's
-  integer for the usual reason: float noise on two machines is exactly the sort
-  of thing that wouldn't match. Only a handful of lattice points land in the
-  800x600 arena at the coarse scale, so the *mix* of open and deep ground is as
-  much a property of `GRASS_SEED` as of the weights — the two were picked
-  together against the `grass_field_*` tests (currently ~21% ankle-deep, ~14%
-  over a crouching soldier, steepest gradient ~2 units per unit walked).
+  300/105/38) — so nothing is spawned, stored, rolled back or checksummed, and
+  the renderer, a test or a future sim rule can all ask "how deep here?" for a
+  few multiplies. It's integer for the usual reason: float noise on two machines
+  is exactly the sort of thing that wouldn't match.
+  **The depth is QUANTIZED TO HEX TILES: one depth per tile, constant across it,
+  different from tile to tile.** The noise is sampled once at the tile's centre
+  (`hex_cell` → `hex_centre`) and that answer covers the whole tile, so the map
+  is a honeycomb of even swards — a tile is a thing you can look at and judge the
+  cost of crossing. `HEX_R` therefore lives in the SIM and `vision.rs` reads it:
+  the fog paints these same tiles, and the tile you can see has to be the tile
+  you're hiding in. Variety comes at three scales, all wanted: the coarse octave
+  drifts whole regions (area to area), the 105/38-unit octaves differ across the
+  24-unit tile pitch (tile to tile), and `GRASS_TILE_JITTER` (±6) breaks up
+  neighbours where the noise happens to be level.
+  **THE MIX IS THE DESIGN**, and `grass_field_has_a_mix_of_depths` prints it as a
+  histogram rather than just asserting it: ~780 tiles, 49 distinct depths, mean
+  33, of which **9% are BARE** (depth 0 — the ground texture, no tufts at all),
+  2% short enough to leave a prone pawn showing, and **6% deep enough to bury a
+  crouching one**, with the bulk in between. Every stance needs ground that suits
+  it and ground that doesn't, or the terrain isn't saying anything.
+  Three knobs, and they are deliberately independent:
+  * **`GRASS_BARE_SPREAD`** — how much of the noise's bottom end comes out bare.
+    A separate decision from the depth mapping ON PURPOSE: folding bare ground
+    into the bottom of one 0..`GRASS_MAX_H` range drags the whole range down with
+    it, which took the crouch-burying tiles from 8% of the map to 3%. Bare ground
+    and how deep grass gets are different questions. It's applied BEFORE the
+    per-tile jitter, or single bare tiles speckle through grassy ground instead
+    of forming patches.
+  * **`GRASS_BARE_BELOW`** (14) — the shallowest a GRASSY tile can be. Nothing
+    lands between 0 and it, so a tile either has grass or it doesn't; that gap is
+    what makes bare ground read as a place rather than as the field thinning out.
+    It sits just under a prone pawn's 15, which is why bare ground does nearly
+    all the work of "lying down doesn't help here" and short grass barely any —
+    the test asserts the SUM of the two for that reason.
+  * **the two curves** — a contrast stretch opens the middle half of the noise
+    out to the whole band (without it every tile lands on the mean), then a
+    square bias is applied **to the shallow half only**. Biasing the whole range,
+    which is what the original 0..72 field did, costs the deep tiles again.
   How much of you it hides is *emergent* — it's whichever clumps happen to stand
   between you and the camera (see y-sorting below) — but the sim still states the
   rule: `grass_cover` = depth / `STANCE_HEIGHT` (64/52/15 units), i.e. grass
-  hides whatever is shorter than it. Prone qualifies over ~70% of the map,
-  standing over ~2%, which is why going flat beats any hand-tuned stance bonus.
+  hides whatever is shorter than it. A prone pawn is fully buried on ~88% of the
+  map, a crouching one on 6%, a standing one nowhere.
   The shade sprite follows that number.
+  The renderer asks `Scenario::depth` (see Testing) rather than `grass_height`
+  directly, so the measuring scenario can swap the whole field for a wall of
+  grass of a known depth without a second code path through the three layers.
   Rendering is three layers, all off that one number:
   * **The field** — one static `Mesh2d` over the arena (`GrassMaterial`, another
     vertex-color material for the `ColorMaterial` reason below), textured with
-    `grass.png` tiled in WORLD uv and tinted per vertex: dry/pale/see-through
-    over thin ground (the dirt tile shows through the vertex alpha), lush and
-    opaque in the deep. Vertex interpolation is what makes the area-to-area
-    transitions smooth for free. The shader crosses two octaves of the same
-    texture at different scales, or the 128px tile reads as a grid.
-  * **Tufts** — ~2000 small clumps on a fine jittered grid (`TUFT_STEP` 6, with
-    acceptance from `tuft_density`, so depth thickens the field as well as
-    heightening it), each drawn as tall as the grass is deep where it stands.
-    Baked into static meshes (quads with atlas UVs) rather than sprites:
-    nothing about a tuft ever changes, and on a phone the scarce resource is
-    per-frame sprite extraction, not triangles. Same material as the field with
-    the octave crossing turned off — atlas UVs would sample the neighbouring
-    frame.
+    `grass.png` tiled in WORLD uv and tinted per vertex. Its alpha saturates
+    FAST (`0.12 + 3f`): grass covers soil long before it gets tall, so anything
+    from ankle deep up is solid sward and only genuinely bare ground (bare tiles,
+    and the rig's clear lanes) shows the ground texture underneath.
+    **That texture is DRY EARTH, not green** (`gen_ground`): it is only ever
+    visible where a tile is bare, so it is the thing that makes open ground read
+    as open. It used to be a muted army green, and under the 12% sward tint that
+    came out looking like mown grass — standing on a bare tile then read as
+    standing in short grass with your boots poking out below the blades beside
+    you, which is exactly how it got reported. The tint spread is WIDE (pale dry green to dark lush
+    green) and that is what actually makes one tile read as deeper than the next
+    — from almost straight down a third more blade height barely registers, since
+    the silhouettes overlap into the same mass either way, so depth has to carry
+    in value and hue as well. The shader crosses two octaves of the same texture
+    at different scales, or the 128px tile reads as a grid.
+  * **Tufts** — ~28,000 small clumps on a fine jittered grid (`TUFT_STEP` 4),
+    each drawn as tall as the grass is deep where it stands. Baked into static
+    meshes (quads with atlas UVs) rather than sprites: nothing about a tuft ever
+    changes, and on a phone the scarce resource is per-frame sprite extraction,
+    not triangles. Same material as the field with the octave crossing turned
+    off — atlas UVs would sample the neighbouring frame.
+    **`tuft_density` is nearly FLAT on purpose (0.80..1.00): depth sets how tall
+    the grass is, not whether there is any.** Two earlier versions ramped
+    acceptance with depth and both drew the same complaint — the shallow end
+    reads as scattered clumps with ground between them, because thinning the
+    count and narrowing the sprites (a clump is `TUFT_ASPECT` as wide as it is
+    tall) compound. For the same reason the grid must stay finer than the
+    narrowest tuft: at the field's floor a clump is ~12px wide, so a 6-unit grid
+    left gaps however many were accepted. Short grass is a complete carpet, just
+    a short one. Per-clump height jitter is only ±10% for a related reason: it
+    competes directly with the tile-to-tile depth difference, and at the ±22% it
+    used to be, neighbouring tiles read as one noisy sward instead of two swards
+    of different depth.
+    **Each clump wears a skirt of short hard-bent leaves at its root**
+    (`gen_tufts`), and that is not decoration. Without it a frame is ~26% opaque
+    at the ground line against ~33% higher up — bare stems — and a pawn's boots
+    sit exactly on that line, so you see them through every clump in front of
+    them whatever the sort order does. The skirt takes the root band to ~50%.
+    This was the third and actual cause of a "foot under the grass" report that
+    also had two real but insufficient causes (see `GRASS_BAND` below and
+    `render::STANCE_ANCHOR`); if it comes back, measure the sheet's opacity by
+    row before touching the ordering again.
   * **Shade** — the only thing parented to a pawn: a `shade.png` gradient over
     its lower body, reaching as far up as `grass_cover` says the grass buries
     it (`STANCE_SHADE`, measured off `soldier.png` bboxes — prone's ground line
     hangs 17px BELOW `Pos` because that sprite is anchored mid-body).
   **Y-SORTING is what makes the grass behave, and it is not optional.** Grass is
-  baked one mesh per `GRASS_BAND` (12-unit) slice of the arena, each drawn at
-  the z of its SOUTHERN edge, and everything standing on the ground — pawns,
+  baked one mesh per `GRASS_BAND` (4-unit) slice of the arena, each drawn at
+  the z of its MIDDLE line, and everything standing on the ground — pawns,
   boulders, practice dummies — carries `render::Grounded` and takes its z from
-  `grass::y_sort(Pos.y)` in `sync_transforms`. So the clumps between you and the
-  camera are drawn after you and swallow your legs, the ones behind you are
-  drawn before you and don't, and walking north uncovers you a clump at a time.
-  A mesh has one sort key, which is the only reason bands exist; a band's worth
-  of grass north of you can still draw over you (12 units, half a pawn's width,
-  invisible in practice). Consequences: the whole band `Z_SORT_LO..Z_SORT_HI`
+  `grass::y_sort` of its GROUND LINE in `sync_transforms`. So the clumps between
+  you and the camera are drawn after you and swallow your legs, the ones behind
+  you are drawn before you and don't, and walking north uncovers you a clump at
+  a time.
+  The ground line is `Pos.y - Grounded::reach`, and the reach is not decoration:
+  a pawn's is its feet (0), but a boulder's is the southern rim of its own
+  footprint (`rock.r`). Sorted by its centre instead, every clump standing in a
+  boulder's southern half draws over it, which reads as **grass growing out of
+  solid stone** — and it did. The other half of that fix is in `tuft_bands`,
+  which skips candidates inside a rock at all (`Scenario::rocks`, so the rig,
+  which has none, still grows grass where the arena's boulders would be).
+  Bushes are exempt from all of this: their canopies sit at a fixed z 2.5, above
+  the whole sort band, because you hide *under* a bush.
+  A mesh has one sort key, which is the only reason bands exist, and the ONLY
+  place a pawn can be slotted into the grass is between two bands — so some
+  grass near your feet always sorts wrong, and the question is only how much and
+  which way. Two things bound it, and both were reported before they were fixed:
+  `GRASS_BAND` is 4 rather than 12 (150 band meshes and draw calls instead of
+  50 — raise it first if the grass ever costs too much on a phone), and the key
+  is the band's MIDDLE rather than its southern edge, which splits the error
+  instead of piling it all on the north side. At 12-and-southern a blade grew out
+  of your knee; at 4-and-southern a few still sprouted above the bottom of your
+  boot; at 4-and-middle the worst case is 2 units either way.
+  Consequences: the whole band `Z_SORT_LO..Z_SORT_HI`
   (0.1..1.8) is spoken for, so bullets (2.0), trails (1.9), the ADS aim line
   (1.85) and bush canopies (2.5) must stay above it; and boulders now sort with
   pawns, so you can walk behind one as well as in front of it.
@@ -304,15 +383,39 @@ Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_SIGNALING` env vars.
   bush haze no longer tints greener than boulder grey, only weaker.
   **Grass concealment** (`grass_conceal`): a blade of depth `g` at fraction `t`
   along the sight line, seen from an eye at height `E` (the viewer's
-  `STANCE_HEIGHT`), hides the target up to `E + (g - E) / t` — similar triangles
-  — and the share of the body under that line accumulates as Beer-Lambert
-  extinction over the BLOCKED LENGTH. The length is the whole point: taking the
-  worst step instead made every prone pawn invisible from everywhere and every
-  prone viewer blind, because on any long line some blade beats the sight line.
-  With `GRASS_EXTINCTION` at 0.010, two standing pawns 60 units apart barely dim
-  (~0.03), at 300 units they're half gone, a prone pawn at that range is ~0.8
-  hidden, and lying down costs you the far half of the field while keeping close
-  range. `grass_cover` (depth / `STANCE_HEIGHT`) is the same rule's t = 1 limit.
+  `STANCE_HEIGHT`), hides the target up to `E + (g - E) / t` — similar triangles.
+  The share of the body under that line then answers TWO questions, and keeping
+  them apart is the whole model (`Block`):
+  * **`covered`** — the WORST step on the line: how much of the target is behind
+    grass at all. Pure geometry, saturating at 1. If the tallest blade between
+    you only reaches his knees, his head is in clear air and no amount of
+    distance can hide it.
+  * **`length`** — Beer-Lambert extinction over the blocked length: how solid
+    that grass is. Blades have gaps, so a hand's width is a screen you see
+    through and a body's width is opaque. The ONLY place distance enters.
+  Concealment is their product, so `grass_cover` (depth / `STANCE_HEIGHT`) is now
+  exactly the ceiling rather than a cousin of it. `GRASS_EXTINCTION` is 0.12,
+  anchored on the case the mechanic exists for: **two pawns lying either side of
+  a body's width (~33 units) of shin-deep grass cannot see each other at all**
+  (alpha 0.017 — `tools/grass-table.sh` asserts it). In the arena the answer
+  depends on the tiles the line crosses, which is the point; down the spawn lane
+  a standing viewer sees a standing target at alpha ~0.92 at 40 units, ~0.50 at
+  80, ~0.30 at 150, and a prone one is gone past 80. A prone VIEWER is not
+  automatically blind any more — in a short tile it still sees a standing pawn at
+  ~0.57 at 40 units — but it loses everything past ~80. Going flat is mostly for
+  breaking contact; where it also lets you fight depends on the tile you picked.
+  The predecessor was extinction over the blocked length ALONE, with no
+  geometric ceiling, and it was wrong in both directions at once: enough distance
+  hid anybody behind anything (ankle-deep grass eventually erased a standing
+  man), while 30 units of shin-deep grass — which you genuinely cannot see a
+  prone man through — dimmed him by a quarter. The `covered` term is the fix.
+  Note what it means with a tiled field: a long sight line crosses many tiles and
+  `covered` takes the DEEPEST one, so range costs you visibility in steps as the
+  line picks up deeper tiles — which is why the arena numbers fall off with
+  distance even though `length` saturates within ~50 units. Widening
+  `GRASS_MIN_H..GRASS_MAX_H` therefore hides people at range faster than it
+  sounds like it should; check `tools/grass-table.sh`'s arena table after any
+  change to the band.
   Tiles ask it about a STANDING target, which is the question a player asks of a
   patch of ground — asking about the dirt itself would darken the whole map,
   since grass hides dirt long before it hides a soldier.
@@ -477,6 +580,57 @@ need a TURN server eventually.
   rollback-unsafe health state fails there rather than as a desync in a match.
   Note `PlayerInputs` can only be filled by a session, which is why the systems
   can't just be called directly.
+- **`tools/grass-table.sh [outfile]`** — the concealment measuring rig
+  (`client/src/vision/strip_table.rs`). Two pawns either side of a ONE-HEX-wide
+  strip of grass, one clear hex off it, tabulated over every grass depth x every
+  stance pairing x both directions, in the units that matter: the sprite alpha
+  `fade_hidden` would write, plus the blocked sight-line length that produced it.
+  Run it before and after touching `GRASS_EXTINCTION`, `GRASS_NEAR_T`,
+  `GRASS_SAMPLES`, `HEX_R`, `STANCE_HEIGHT` or `GRASS_MAX_H` — those constants
+  are otherwise only judgeable by eye. The scene is `Scenario::GrassStrip` (see
+  below), not the procedural field — which contains no patch of known depth
+  aligned to known hexes, so measuring it there would test `GRASS_SEED`. It's
+  also a real test — it asserts what it prints (bare ground hides nobody, deeper
+  grass never hides less, lower is never easier to see, a prone viewer never sees
+  more, each side's numbers mirror the other's, and the sim's `STRIP_HALF_W` /
+  `STRIP_STANDOFF` still match the fog's `HEX_R`), and prints before asserting so
+  a failure explains itself — including the spec the model is built around (two
+  prone pawns can't see each other through shin-deep grass) and the guards that
+  stop it being satisfied by hiding everyone always. It prints a second table
+  for the ARENA — the same stances at 40/80/150/300 units through the real field
+  — because the rig is a wall with clear ground either side and the arena is
+  grass all the way, which changes the answer completely.
+- **`Scenario` (`sim/src/lib.rs`) — the rig, playable.** `Scenario::Arena` is the
+  game; `Scenario::GrassStrip { depth, east_stance }` is the concealment scene
+  the table measures, built for real: `spawn_world` puts one pawn either side of
+  the wall and spawns NOTHING else (no boulders, bushes or dummies), and
+  `Scenario::depth` replaces the procedural field with grass `depth` deep inside
+  `STRIP_HALF_W` of x=0 and bare ground everywhere else. The renderer asks the
+  scenario rather than `grass_height` directly (`grass.rs`, `vision.rs`), so
+  field, tufts, shade, fog and player fade all agree. Reach it with
+  `?scenario=strip:<depth>:<east stance>` on the web or `AG_SCENARIO=strip:52:2`
+  natively. **Offline only** — `parse_scenario` returns `Arena` whenever a room
+  is set, because peers building different worlds is a desync by construction;
+  `players` is forced to 2, `camera_follow` leaves the camera fixed on the wall,
+  and `setup_scene` zooms it (`STRIP_ZOOM`). One thing that is easy to get wrong:
+  the east pawn has no player, so its stance can't be a spawn value alone — the
+  wire carries the level a pawn is ASKING for every tick, and `input.rs` would
+  otherwise send "stand" for it and quietly stand it back up. Hence
+  `Scenario::idle_stance`, which every non-first local handle sends.
+- **`tools/grass-shots.sh [outdir]`** — that scene, photographed. Numbers can
+  stay put while the picture rots, so this is the companion to the table above:
+  it runs `grass-table.sh` first and takes both the depths AND each frame's
+  caption from it, then drives a headless browser through
+  `?scenario=strip:...`, cropping three frames per depth (both standing, east
+  prone, west-camera prone) into `target/grass-shots/grass-strip.png`. The
+  captioned alpha is the table's number for that exact pairing, so the picture
+  and the measurement can't drift. Run it after touching `GRASS_EXTINCTION`,
+  `GRASS_NEAR_T`, `STANCE_HEIGHT`, `HEX_R`, `grass.wgsl` or `gen_assets.py`'s
+  grass tile. Notes for whoever edits it: it needs a CURRENT `_site` build
+  (`tools/build-web.sh`) — it photographs the built wasm, not the source tree;
+  playwright is not a repo dependency, so pass `AG_NODE_PATH=/path/to/node_modules`;
+  and `SHOT`'s crop is sized to clear the HUD (health bar and roster above, the
+  sights button below, stance buttons right), so a HUD move needs it re-checked.
 - Native smoke: run without a room (synctest re-simulates every frame — it
   catches nondeterminism AND rollback-unsafe state immediately).
 - Web smoke: `tools/build-web.sh` + local http.server + headless chromium

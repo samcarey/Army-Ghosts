@@ -157,6 +157,9 @@
       const room = p.get('room') || '';
       const players = p.get('players') || '';
       const ice = p.get('ice') || '';
+      // Dev measuring rig, offline only (net.rs ignores it with a room set):
+      // ?scenario=strip[:depth[:east stance]] — see sim's `Scenario`.
+      const scenario = p.get('scenario') || '';
       // Plain-http origins (localhost dev, or a LAN IP for same-wifi phones
       // that can't hairpin to the public URL): direct ws:// to matchbox.
       const isPlainWs = /^(localhost|127\.|192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)/.test(location.hostname);
@@ -173,7 +176,7 @@
          : isTailnet ? 'wss://' + location.hostname + ':9451'
          : isCaddy ? 'wss://' + location.host + '/ws'
                    : 'wss://army-ghosts.dev.whoeverwants.com:7443/ws');
-      window.__AG_NET__ = { room, players, signaling, ice };
+      window.__AG_NET__ = { room, players, signaling, ice, scenario };
       if (room) {
         document.getElementById('room').textContent =
           'multiplayer · room ' + room + (players ? ' · ' + players + ' players' : '');

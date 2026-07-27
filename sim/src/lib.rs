@@ -518,20 +518,108 @@ pub fn bush_layout() -> Vec<(i32, i32, Bush)> {
 //
 // The client draws it and hides pawns in it; the sim doesn't act on it yet.
 
-/// Deepest grass, world units — a shade over the 64-unit standing soldier of
-/// [`STANCE_HEIGHT`], so the tallest patches genuinely swallow someone standing
-/// up in them. Reached only where every octave peaks together, which is rare.
-pub const GRASS_MAX_H: i32 = 72;
+/// The band the whole field lives in, world units. Every tile is THICK — nowhere
+/// is bare, nowhere is over a standing soldier's head ([`STANCE_HEIGHT`] is
+/// 64/52/15) — so the variety between tiles is about what a CROUCHING pawn can
+/// do: the deep end buries one completely, the shallow end leaves them showing.
+///
+/// This replaced a 0..72 continuous field with real clearings in it. The old one
+/// looked more dramatic and played worse: cover you could only find in patches
+/// meant most ground was worthless, and thin ground left a prone pawn exposed
+/// with no way to read where. Keeping the whole band deep, and quantizing it to
+/// the tiles the fog already draws, is what makes the depth legible — a tile is
+/// a thing you can look at and judge.
+pub const GRASS_MIN_H: i32 = 0;
+pub const GRASS_MAX_H: i32 = 62;
+/// The shallowest a GRASSY tile can be, world units. Nothing lands between 0 and
+/// this: a tile either has grass or it doesn't, which is what makes bare ground
+/// read as a place rather than as the field thinning out.
+pub const GRASS_BARE_BELOW: i32 = 14;
+/// How much of the noise's bottom end comes out bare, as a fraction of `FP`.
+/// Tuned against the histogram in `grass_field_has_a_mix_of_depths` for about a
+/// tenth of the map.
+///
+/// This is a separate decision from the depth mapping, and it has to be: fold
+/// bare ground into the bottom of one 0..`GRASS_MAX_H` range and the whole
+/// range shifts down with it, which took the tiles deep enough to bury a
+/// crouching pawn from 8% of the map to 3%. Bare ground and how deep grass gets
+/// are different questions.
+///
+/// Applied BEFORE the per-tile jitter, so bare tiles come out in coherent
+/// patches the way the noise does; jittering first speckles single bare tiles
+/// through otherwise grassy ground.
+const GRASS_BARE_SPREAD: i32 = FP / 14;
+/// How far a single tile may sit off what the noise says, world units — the
+/// per-tile break-up that keeps neighbouring tiles distinguishable even where
+/// the underlying noise is flat. A sixth of the band: enough that adjacent tiles
+/// visibly differ (which is the whole point of quantizing), not so much that the
+/// honeycomb stops following the terrain underneath it.
+const GRASS_TILE_JITTER: u32 = 6;
 /// Octave lattice sizes, world units. The coarsest is deliberately large next
 /// to the 800x600 arena — the point of it is a handful of *regions* per map, not
-/// a lawn of dots — with two finer octaves for patchiness and break-up. Only a
-/// few lattice points fall inside the arena at that scale, so the mix of open
-/// and deep ground is as much a property of [`GRASS_SEED`] as of the weights:
-/// both were picked together against the assertions in `grass_field_*`.
+/// a lawn of dots — with two finer octaves for break-up. Their weights fall off
+/// steeply (100/34/12) so the fine detail stays a texture: the depth under your
+/// feet must never jump as you walk, which `grass_transitions_are_smooth`
+/// asserts.
 const GRASS_CELL: i32 = 300;
 const GRASS_CELL_MID: i32 = 105;
 const GRASS_CELL_FINE: i32 = 38;
 const GRASS_SEED: u32 = 0x883D_58B3;
+
+/// Hex tile circumradius, world units — corner to corner is `2 * HEX_R`, flat to
+/// flat `sqrt(3) * HEX_R`. The client's fog paints these tiles and the grass is
+/// uniform within one, so the two must be the same grid: the size lives here and
+/// `vision.rs` reads it.
+pub const HEX_R: i32 = 16;
+/// Column pitch, world units (`1.5 * HEX_R`), and row pitch in FP subunits
+/// (`sqrt(3) * HEX_R`, which is irrational and so has to live in fixed point).
+/// Odd columns drop half a row, which is what interlocks the grid.
+const HEX_COL: i32 = HEX_R * 3 / 2;
+const HEX_ROW_FP: i32 = 7094;
+
+/// Centre of the hex at odd-q offset coordinates `(col, row)`, in FP.
+fn hex_centre_fp(col: i32, row: i32) -> (i32, i32) {
+    (
+        (-ARENA_HALF_W + col * HEX_COL) * FP,
+        -ARENA_HALF_H * FP
+            + row * HEX_ROW_FP
+            + if col.rem_euclid(2) == 1 { HEX_ROW_FP / 2 } else { 0 },
+    )
+}
+
+/// Which hex tile a world point falls in, as `(col, row)`.
+///
+/// By nearest centre, which IS hex containment: the Voronoi cells of a hex
+/// lattice are its hexes. Nine candidates is enough — the true cell is always
+/// within one column and one row of the rounded guess — and it avoids the
+/// cube-rounding dance that the usual pixel-to-hex conversion needs, which is
+/// awkward to do exactly in integers.
+pub fn hex_cell(x: i32, y: i32) -> (i32, i32) {
+    let (px, py) = (x as i64 * FP as i64, y as i64 * FP as i64);
+    let col0 = (x + ARENA_HALF_W).div_euclid(HEX_COL);
+    let row0 = ((y + ARENA_HALF_H) as i64 * FP as i64).div_euclid(HEX_ROW_FP as i64) as i32;
+    let mut best = (i64::MAX, col0, row0);
+    for col in col0 - 1..=col0 + 1 {
+        for row in row0 - 1..=row0 + 1 {
+            let (cx, cy) = hex_centre_fp(col, row);
+            let (dx, dy) = (px - cx as i64, py - cy as i64);
+            let d2 = dx * dx + dy * dy;
+            // Ties broken by the lowest (col, row) so the seam between two
+            // equidistant tiles always falls the same way.
+            if d2 < best.0 {
+                best = (d2, col, row);
+            }
+        }
+    }
+    (best.1, best.2)
+}
+
+/// Centre of a hex tile in whole world units — where the grass field is sampled
+/// for the whole tile.
+fn hex_centre(col: i32, row: i32) -> (i32, i32) {
+    let (x, y) = hex_centre_fp(col, row);
+    ((x + FP / 2).div_euclid(FP), (y + FP / 2).div_euclid(FP))
+}
 
 /// Hash a lattice point to a well-mixed u32 (xorshift-multiply, same family as
 /// the rest of the layout code — no float, no RNG crate, no state).
@@ -571,28 +659,59 @@ fn value_noise(x: i32, y: i32, cell: i32, salt: u32) -> i32 {
     lerp_fp(top, bottom, v)
 }
 
-/// How deep the grass is at a world point, in world units (0..=[`GRASS_MAX_H`]).
+/// How deep the grass is at a world point, world units
+/// ([`GRASS_MIN_H`]..=[`GRASS_MAX_H`]).
 ///
-/// Three octaves of value noise — broad meadows, patchiness inside them, and a
-/// fine break-up so no edge reads as a contour line — then two corrections,
-/// both of which the field is bad without:
+/// **Constant across a hex tile, different from tile to tile.** The noise is
+/// sampled once at the tile's centre and that answer covers the whole tile, so
+/// the map is a honeycomb of even swards rather than either a continuous slope
+/// or a scatter of clumps — you can look at a tile and know what it costs you to
+/// cross it, which is the point of quantizing anything.
 ///
-/// * **Contrast.** Summed octaves pile up around the middle, so the raw sum is
-///   shin-deep almost everywhere: no cover *and* no open ground. Stretching the
-///   middle half of the range over the whole output, eased at both ends, is what
-///   turns it into meadows and clearings (the test asserts the mix).
-/// * **Bias.** Even then, splitting the map evenly between deep and thin would
-///   make deep grass the default. Averaging the stretched value with its own
-///   square tilts the whole field toward thin ground, so the deep patches stay
-///   somewhere you move *to*.
+/// Variety comes at three scales, and all three are wanted:
+///   * **Area to area** — the coarse octave (300 units) drifts whole regions
+///     shallower and deeper.
+///   * **Tile to tile** — the mid and fine octaves (105 / 38 units) differ
+///     across a 24-unit tile pitch, so neighbours in the same region still
+///     differ.
+///   * **Tile by itself** — a small per-tile hash jitter, so the honeycomb never
+///     flattens out into an obvious gradient where the noise happens to be
+///     level.
+///
+/// The band is deliberately clear of both ends: nothing is thin enough to leave
+/// a prone pawn exposed, nothing deep enough to swallow a standing one, so the
+/// tile-to-tile variety is about what a CROUCHING pawn can do — which is where
+/// the interesting decisions are.
 pub fn grass_height(x: i32, y: i32) -> i32 {
-    let n = (value_noise(x, y, GRASS_CELL, GRASS_SEED) * 100
-        + value_noise(x, y, GRASS_CELL_MID, GRASS_SEED ^ 0x9E37_79B9) * 34
-        + value_noise(x, y, GRASS_CELL_FINE, GRASS_SEED ^ 0x85EB_CA6B) * 12)
-        / 146;
-    let stretched = smoothstep_fp(((n - FP / 4) * 2).clamp(0, FP));
-    let shaped = (stretched * stretched / FP + stretched) / 2;
-    GRASS_MAX_H * shaped / FP
+    let (col, row) = hex_cell(x, y);
+    let (cx, cy) = hex_centre(col, row);
+    let n = (value_noise(cx, cy, GRASS_CELL, GRASS_SEED) * 100
+        + value_noise(cx, cy, GRASS_CELL_MID, GRASS_SEED ^ 0x9E37_79B9) * 45
+        + value_noise(cx, cy, GRASS_CELL_FINE, GRASS_SEED ^ 0x85EB_CA6B) * 30)
+        / 175;
+    // Summed octaves pile up around their middle, so without a stretch the whole
+    // map lands within a few units of the mean and the tiles stop differing.
+    // This opens the middle half of the range out to the full band. It is the
+    // same shape as the contrast curve the old field used, and it is fine HERE
+    // because the band it stretches into is deep at both ends — what made that
+    // one bad was the bias curve after it, which pushed the result toward bare
+    // ground.
+    let spread = ((n - FP / 4) * 2).clamp(0, FP);
+    // Then bias the SHALLOW HALF down and leave the deep half alone, so short
+    // ground is common without the deep end being squashed with it. Biasing the
+    // whole range (averaging it with its own square, which is what the old field
+    // did) costs the map nearly every tile that buries a crouching pawn — it
+    // took the deep tiles from 8% to 1% — and those are the tiles worth crossing
+    // the map for. The two halves meet at the midpoint, so there's no kink.
+    let spread = if spread < FP / 2 { spread * spread * 2 / FP } else { spread };
+    if spread < GRASS_BARE_SPREAD {
+        return 0;
+    }
+    let depth = GRASS_BARE_BELOW + (GRASS_MAX_H - GRASS_BARE_BELOW) * spread / FP;
+    let jitter = (grass_hash(col, row, GRASS_SEED ^ 0xC2B2_AE35) % (2 * GRASS_TILE_JITTER + 1))
+        as i32
+        - GRASS_TILE_JITTER as i32;
+    (depth + jitter).clamp(GRASS_BARE_BELOW, GRASS_MAX_H)
 }
 
 /// What fraction of a pawn standing at `(x, y)` in this stance the grass
@@ -601,14 +720,92 @@ pub fn grass_height(x: i32, y: i32) -> i32 {
 /// stance bonus would be — 15 units of prone soldier disappears in grass that
 /// barely reaches a standing one's knees.
 pub fn grass_cover(x: i32, y: i32, stance: u8) -> i32 {
-    let body = STANCE_HEIGHT[(stance as usize).min(STANCE_COUNT - 1)];
-    (grass_height(x, y) * FP / body).min(FP)
+    Scenario::Arena.cover(x, y, stance)
+}
+
+/// Which world to build.
+///
+/// [`Scenario::Arena`] is the game. [`Scenario::GrassStrip`] is the concealment
+/// measuring rig made playable: a wall of grass one fog hex wide with a pawn
+/// either side of it and NOTHING else on the map — no boulders, no bushes, no
+/// practice dummies, and no grass anywhere but the wall. It exists so that the
+/// numbers in `client/src/vision/strip_table.rs` and the pictures in
+/// `tools/grass-shots.sh` are the same scene rather than two descriptions of
+/// one, and so the wall can be set to depths the procedural field never reaches.
+///
+/// It is a dev scenario and OFFLINE ONLY — `net.rs` ignores it whenever a room
+/// is set, because two peers building different worlds is a desync by
+/// construction. Nothing in a real match ever sees anything but `Arena`.
+#[derive(Resource, Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub enum Scenario {
+    #[default]
+    Arena,
+    /// A wall of grass `depth` units deep. The east pawn holds `east_stance`
+    /// (it has no player: only the first local handle takes input, so its
+    /// stance has to be told to it — see `client/src/input.rs`).
+    GrassStrip { depth: i32, east_stance: u8 },
+}
+
+/// Half the width of the wall in [`Scenario::GrassStrip`], world units — one
+/// fog hex across, since a flat-top hex is `2 * HEX_R` corner to corner and the
+/// client's `HEX_R` is 16. `strip_table.rs` asserts the two still agree.
+pub const STRIP_HALF_W: i32 = 16;
+/// How far each pawn stands from the middle of the wall, world units: two hex
+/// columns of `1.5 * HEX_R`, which leaves exactly one clear hex between each
+/// pawn and the grass.
+pub const STRIP_STANDOFF: i32 = 48;
+
+impl Scenario {
+    /// How deep the grass is at a point in this world, world units.
+    pub fn depth(&self, x: i32, y: i32) -> i32 {
+        match *self {
+            Scenario::Arena => grass_height(x, y),
+            Scenario::GrassStrip { depth, .. } => {
+                if x.abs() <= STRIP_HALF_W {
+                    depth
+                } else {
+                    0
+                }
+            }
+        }
+    }
+
+    /// [`grass_cover`] in this world: the fraction of a pawn in `stance` that
+    /// the grass here stands taller than, 0..=[`FP`].
+    pub fn cover(&self, x: i32, y: i32, stance: u8) -> i32 {
+        let body = STANCE_HEIGHT[(stance as usize).min(STANCE_COUNT - 1)];
+        (self.depth(x, y) * FP / body).min(FP)
+    }
+
+    /// The boulders in this world. The rig has none, and the renderer needs to
+    /// know that as much as `spawn_world` does — grass must not grow out of a
+    /// rock that exists, nor be kept off one that doesn't.
+    pub fn rocks(&self) -> Vec<(i32, i32, Rock)> {
+        match *self {
+            Scenario::Arena => rock_layout(),
+            Scenario::GrassStrip { .. } => Vec::new(),
+        }
+    }
+
+    /// The stance every handle *except* the first local one asks for each tick.
+    /// In the game that's just "stand"; in the rig it's how the target pawn is
+    /// posed, since nothing else can pose it.
+    pub fn idle_stance(&self) -> u8 {
+        match *self {
+            Scenario::Arena => STANCE_STAND,
+            Scenario::GrassStrip { east_stance, .. } => east_stance.min(STANCE_PRONE),
+        }
+    }
 }
 
 /// Spawn the initial world: one pawn per player, the practice targets, and the
 /// procedural rock and bush fields. Both clients run this identically before
 /// the first tick.
-pub fn spawn_world(commands: &mut Commands, num_players: usize) {
+pub fn spawn_world(commands: &mut Commands, num_players: usize, scenario: Scenario) {
+    if let Scenario::GrassStrip { east_stance, .. } = scenario {
+        spawn_grass_strip(commands, east_stance);
+        return;
+    }
     for handle in 0..num_players {
         let (x, y) = SPAWN_POINTS[handle];
         commands
@@ -636,6 +833,31 @@ pub fn spawn_world(commands: &mut Commands, num_players: usize) {
     for (x, y, bush) in bush_layout() {
         commands
             .spawn((bush, Pos::from_units(x, y)))
+            .add_rollback();
+    }
+}
+
+/// The measuring scene ([`Scenario::GrassStrip`]): two pawns facing each other
+/// across the wall, and nothing else at all.
+///
+/// West is handle 0 — the pawn the camera follows and the keyboard drives. East
+/// is the target: it spawns already in `east_stance` so there's no getting-down
+/// animation to wait out, and `idle_stance` keeps it there.
+fn spawn_grass_strip(commands: &mut Commands, east_stance: u8) {
+    for (handle, x, toward, level) in [
+        (0, -STRIP_STANDOFF, 127, STANCE_STAND),
+        (1, STRIP_STANDOFF, -127, east_stance.min(STANCE_PRONE)),
+    ] {
+        commands
+            .spawn((
+                Player { handle },
+                Pos::from_units(x, 0),
+                Facing { x: toward, y: 0 },
+                Cooldown::default(),
+                Stance { level, change: 0 },
+                Health::default(),
+                Deaths::default(),
+            ))
             .add_rollback();
     }
 }
@@ -1079,10 +1301,6 @@ fn tick_targets(mut targets: Query<&mut Target>) {
 mod tests {
     use super::*;
 
-    /// Deepest grass a crouching soldier still stands out of. A match arm needs
-    /// a constant and `STANCE_HEIGHT[STANCE_CROUCH as usize] - 1` isn't one.
-    const CROUCH_TOPS_OUT: i32 = 51;
-
     /// Walking straight at a boulder stops you; walking at it on an angle
     /// slides you around it (the whole point of pushing out along the normal).
     #[test]
@@ -1180,64 +1398,190 @@ mod tests {
         }
     }
 
-    /// The grass has to be worth having: thin ground you can be caught on,
-    /// deep patches that hide a standing soldier, and most of the arena in
-    /// between. A curve tweak that quietly flattens the field into uniform
-    /// shin-deep grass would still *look* fine in a screenshot.
+    /// The MIX. Every stance has to have ground that suits it and ground that
+    /// doesn't, or the terrain isn't saying anything: short tiles where lying
+    /// down still leaves you showing, deep ones that bury a crouching pawn, and
+    /// the bulk in between.
+    ///
+    /// The percentages are the design, so they're printed as a histogram — if a
+    /// curve tweak moves them, the test says which way rather than just failing.
     #[test]
-    fn grass_field_has_thin_and_deep_ground() {
-        let (mut thin, mut mid, mut deep, mut total) = (0, 0, 0, 0);
-        let (mut min, mut max) = (GRASS_MAX_H, 0);
+    fn grass_field_has_a_mix_of_depths() {
+        let prone_h = STANCE_HEIGHT[STANCE_PRONE as usize];
+        let crouch_h = STANCE_HEIGHT[STANCE_CROUCH as usize];
+        let (mut min, mut max, mut sum, mut total) = (GRASS_MAX_H, 0, 0i64, 0i64);
+        let (mut bare, mut short, mut deep) = (0i64, 0i64, 0i64);
+        let mut bins = [0i64; 6];
         let mut y = -ARENA_HALF_H;
         while y <= ARENA_HALF_H {
             let mut x = -ARENA_HALF_W;
             while x <= ARENA_HALF_W {
                 let h = grass_height(x, y);
-                assert!((0..=GRASS_MAX_H).contains(&h), "grass out of range at {x},{y}: {h}");
+                assert!(
+                    (GRASS_MIN_H..=GRASS_MAX_H).contains(&h),
+                    "grass out of band at {x},{y}: {h}"
+                );
                 min = min.min(h);
                 max = max.max(h);
-                // Ankle-deep / knee-to-waist / over a crouching soldier.
-                match h {
-                    0..=9 => thin += 1,
-                    10..=CROUCH_TOPS_OUT => mid += 1,
-                    _ => deep += 1,
-                }
+                sum += h as i64;
+                // Bare = ground texture, nothing growing; short = a prone pawn
+                // is not fully buried; deep = a crouching one is.
+                bare += (h == 0) as i64;
+                short += (h > 0 && h <= prone_h) as i64;
+                deep += (h > crouch_h) as i64;
+                bins[((h - GRASS_MIN_H) * 6 / (GRASS_MAX_H - GRASS_MIN_H + 1)) as usize] += 1;
                 total += 1;
                 x += 4;
             }
             y += 4;
         }
-        println!("grass {min}..{max}: {thin} thin / {mid} mid / {deep} deep of {total}");
-        assert!(min <= 6, "nowhere in the arena is the grass thin: min {min}");
-        assert!(max >= 56, "no deep patches anywhere: max {max}");
-        // Deep cover should be a place you go to, not the default state.
-        assert!(deep * 100 / total >= 3, "too little deep grass");
-        assert!(deep * 100 / total <= 30, "too much deep grass");
-        assert!(thin * 100 / total >= 5, "nowhere is open enough to be exposed");
+        let pct = |n: i64| n * 100 / total;
+        let step = (GRASS_MAX_H - GRASS_MIN_H + 1) / 6;
+        println!("grass {min}..{max}, mean {}:", sum / total);
+        for (i, n) in bins.iter().enumerate() {
+            println!(
+                "  {:>2}..{:<2} {:>3}% {}",
+                GRASS_MIN_H + i as i32 * step,
+                GRASS_MIN_H + (i as i32 + 1) * step - 1,
+                pct(*n),
+                "#".repeat((pct(*n) * 2) as usize)
+            );
+        }
+        println!(
+            "  {}% bare + {}% short = {}% where a prone pawn shows; \
+             {}% deep enough to bury a crouching one",
+            pct(bare),
+            pct(short),
+            pct(bare + short),
+            pct(deep)
+        );
+
+        assert!(
+            max < STANCE_HEIGHT[STANCE_STAND as usize],
+            "nothing should be over a standing soldier's head: max {max}"
+        );
+        assert!(
+            max - min >= 24,
+            "the field is too flat to be worth quantizing: {min}..{max}"
+        );
+        // Open ground is terrain you read and cross carefully: real, but never
+        // the norm. Nowhere to hide at all and the map is a shooting gallery;
+        // nothing but cover and there is no reason to move. Bare tiles are
+        // asserted separately from short ones because they are what the player
+        // actually SEES as open — the ground texture with nothing on it.
+        assert!(
+            (4..=20).contains(&pct(bare)),
+            "bare ground should be patches, not the map: {}%",
+            pct(bare)
+        );
+        // Bare and short are counted together because they answer one question —
+        // where does lying down stop working — and `GRASS_BARE_BELOW` decides
+        // how the total splits between them. With the floor at 14 (just under a
+        // prone pawn's 15), grass that leaves one showing is a sliver and bare
+        // ground does nearly all of this job; drop the floor and it shifts the
+        // other way. The sum is the design; the split is a look.
+        assert!(
+            (5..=30).contains(&pct(bare + short)),
+            "ground a prone pawn shows on should be a feature, not the map: {}%",
+            pct(bare + short)
+        );
+        assert!(
+            (5..=40).contains(&pct(deep)),
+            "crouching should be a real choice, not always or never: {}%",
+            pct(deep)
+        );
     }
 
-    /// "Smooth transition between areas" is the whole spec of the field: a
-    /// player walking a straight line must never step over a wall of grass.
+    /// The spec the field is quantized for: **one depth per hex tile.** Every
+    /// point in a tile has to answer the same as the tile's centre, or the
+    /// honeycomb the fog draws and the grass the player reads are different
+    /// shapes.
     #[test]
-    fn grass_transitions_are_smooth() {
-        let mut worst = 0;
+    fn grass_is_uniform_within_a_hex_tile() {
+        let mut tiles = std::collections::BTreeMap::new();
         let mut y = -ARENA_HALF_H;
         while y <= ARENA_HALF_H {
             let mut x = -ARENA_HALF_W;
-            while x < ARENA_HALF_W {
-                let step = (grass_height(x + 2, y) - grass_height(x, y)).abs();
-                let up = (grass_height(x, y + 2) - grass_height(x, y)).abs();
-                worst = worst.max(step).max(up);
+            while x <= ARENA_HALF_W {
+                let cell = hex_cell(x, y);
+                let h = grass_height(x, y);
+                match tiles.get(&cell) {
+                    None => {
+                        tiles.insert(cell, h);
+                    }
+                    Some(&first) => assert_eq!(
+                        h, first,
+                        "grass changes inside tile {cell:?} at {x},{y}: {h} vs {first}"
+                    ),
+                }
                 x += 2;
             }
             y += 2;
         }
-        // 2 world units is a sixth of a pawn's radius. At the steepest point in
-        // the arena the grass deepens by about 2 units per unit walked — knee to
-        // waist over a pawn's width, which is the edge of a thicket rather than
-        // a seam. Anything much past that and the noise is showing its lattice.
-        println!("worst grass step over 2 units: {worst}");
-        assert!(worst <= 4, "grass steps {worst} units over 2 — visible seam");
+        // ...and the tiles differ from each other. Depths are integers in a
+        // 37-wide band, so a good field uses most of the values available.
+        let depths: std::collections::BTreeSet<_> = tiles.values().collect();
+        println!("{} tiles, {} distinct depths", tiles.len(), depths.len());
+        assert!(tiles.len() > 600, "the arena should be ~750 tiles: {}", tiles.len());
+        assert!(
+            depths.len() >= 20,
+            "tiles barely differ: only {} distinct depths",
+            depths.len()
+        );
+    }
+
+    /// The depth only ever changes at a tile boundary, and never by a wall's
+    /// worth when it does.
+    ///
+    /// This used to assert the field was CONTINUOUS (no step over 4 units
+    /// anywhere). Quantizing to tiles makes steps the intended behaviour, so
+    /// what's left to check is that they land on tile edges — a step in the
+    /// middle of a tile would mean the quantization is broken — and that
+    /// neighbours stay in the same conversation: walking from one tile to the
+    /// next is a change of stance's worth of grass at most, never ankle-deep to
+    /// over your head.
+    #[test]
+    fn grass_steps_only_at_tile_edges() {
+        let mut worst = 0;
+        let mut edges = 0;
+        let mut y = -ARENA_HALF_H;
+        while y <= ARENA_HALF_H {
+            let mut x = -ARENA_HALF_W;
+            while x < ARENA_HALF_W {
+                for (nx, ny) in [(x + 2, y), (x, y + 2)] {
+                    let (here, there) = (grass_height(x, y), grass_height(nx, ny));
+                    let step = (there - here).abs();
+                    if step > 0 {
+                        assert_ne!(
+                            hex_cell(x, y),
+                            hex_cell(nx, ny),
+                            "grass changed by {step} inside one tile at {x},{y}"
+                        );
+                    }
+                    // The edge of a bare patch is a real edge — grass simply
+                    // stops — so it isn't held to the bound below. Everything
+                    // else is grass meeting grass.
+                    if here == 0 || there == 0 {
+                        edges += (step > 0) as i32;
+                    } else {
+                        worst = worst.max(step);
+                    }
+                }
+                x += 2;
+            }
+            y += 2;
+        }
+        assert!(edges > 0, "no bare ground meets grass anywhere");
+        println!("worst step between neighbouring tiles: {worst}");
+        // Around two thirds of the band. Quantizing plus `GRASS_TILE_JITTER`
+        // makes some step inevitable and a visible one is the point — the edge
+        // of a patch of long grass is a real thing — but a tile may not go from
+        // ankle-deep to over a crouching pawn's head in one stride, which reads
+        // as a hedge rather than as terrain.
+        assert!(
+            worst <= 34,
+            "neighbouring tiles differ by {worst} units — that reads as a wall, not terrain"
+        );
     }
 
     /// Going flat is what the grass is for.

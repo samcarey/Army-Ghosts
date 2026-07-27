@@ -54,7 +54,7 @@ use bevy::sprite_render::{AlphaMode2d, Material2d, Material2dKey, Material2dPlug
 use bevy_ggrs::LocalPlayers;
 
 use army_ghosts_sim::{
-    grass_height, Bush, Player, Pos, Rock, Stance, ARENA_HALF_H, ARENA_HALF_W, PLAYER_R,
+    Bush, Player, Pos, Rock, Scenario, Stance, ARENA_HALF_H, ARENA_HALF_W, PLAYER_R,
     STANCE_HEIGHT,
 };
 
@@ -121,12 +121,19 @@ const GRASS_SAMPLES: usize = 24;
 /// `1/t` in `grass_conceal` has to be kept away from zero. Raise it to make
 /// crawling less blinding, lower it to make grass at your nose count.
 const GRASS_NEAR_T: f32 = 0.06;
-/// Extinction per world unit of blocked sight line. Tuned so grass matters at
-/// fighting range without erasing the game: at 60 units apart in ordinary grass
-/// two standing pawns barely dim (~0.03), across 300 units they're half gone,
-/// and a prone pawn at that range is ~0.8 hidden. Turning this up hides
-/// everything from everyone; turning it down makes grass decoration.
-const GRASS_EXTINCTION: f32 = 0.010;
+/// Extinction per world unit of blocked sight line — how opaque grass is, per
+/// unit of it, once the geometry has decided how much of the target is behind
+/// any (see [`grass_conceal`]).
+///
+/// Anchored on the case the mechanic exists for: two pawns lying either side of
+/// a body's width (~33 units, one fog hex) of shin-deep grass cannot see each
+/// other AT ALL. That fixes it at about 0.12 — `1 - e^(-0.12 * 33)` is 0.98 —
+/// and everything else follows: half that width is still 0.86, a hand's width of
+/// grass is a screen you see through, and the term saturates within ~50 units,
+/// past which only the geometric `covered` term matters. It was 0.010 under the
+/// old length-only model, where it had to carry the distance falloff on its own
+/// and so could never be strong enough to do this.
+const GRASS_EXTINCTION: f32 = 0.12;
 /// How dark a fully-hidden tile gets. The rest of the hiding is spent on
 /// whoever is standing there (`fade_hidden`), so cover stays total against
 /// players while the ground merely goes unreadable — you keep a sense of terrain
@@ -139,8 +146,14 @@ const Z_FOG: f32 = 5.0;
 /// `sqrt(3) * HEX_R`. Sized against the pawn (24 units across) rather than
 /// against the cover: much bigger and you can't tell which side of a boulder a
 /// tile is on; much smaller and quantizing stops simplifying anything. At 16 the
-/// arena is about 750 tiles.
-const HEX_R: f32 = 16.0;
+/// arena is about 780 tiles.
+///
+/// It comes FROM THE SIM because the grass depth is quantized to the same grid
+/// (`grass_height` is constant across a tile): the fog and the grass must draw
+/// the same honeycomb or the tile you can see is not the tile you're hiding in.
+/// The layout here — odd-q offset, columns of `1.5 R`, odd ones dropped half a
+/// row — has to match `hex_cell` there too.
+const HEX_R: f32 = army_ghosts_sim::HEX_R as f32;
 /// Points sampled inside each tile before its shadow is averaged: the centre
 /// plus one toward every other corner. A tile straddling the edge of a shadow
 /// has to come out half dark rather than picking a side — but this is the inner
@@ -358,6 +371,7 @@ pub fn update_fog(
     rocks: Query<(&Rock, &Pos)>,
     bushes: Query<(&Bush, &Pos)>,
     mut fog_view: Query<&mut Visibility, With<Fog>>,
+    scenario: Res<Scenario>,
     mut last: Local<Option<(Vec2, u8)>>,
 ) {
     let Ok(mut visibility) = fog_view.single_mut() else { return };
@@ -396,7 +410,7 @@ pub fn update_fog(
             // here", which is the question the player asks of a tile — and it
             // keeps open ground bright, instead of drowning it in the grass that
             // hides the dirt but not a soldier.
-            let grass = grass_conceal(eye, eye_h, *centre, STANCE_HEIGHT[0] as f32);
+            let grass = grass_conceal(&scenario, eye, eye_h, *centre, STANCE_HEIGHT[0] as f32);
             let mut sum = 0.0;
             for i in 0..HEX_PROBES {
                 let p = match i {
@@ -618,42 +632,104 @@ fn smoothstep(s: f32) -> f32 {
 /// (similar triangles: the line through the tip carries on to the target plane).
 /// The share of the body under that line is how much *this* step hides.
 ///
-/// Those shares then go through Beer-Lambert rather than a max, and that choice
-/// is the whole character of the mechanic. Grass is not a wall: it is blades with
-/// gaps, so a metre of it dims and fifty metres of it hides. Taking the worst
-/// step instead made every prone pawn on the map invisible from everywhere and
-/// every prone *viewer* blind, because somewhere on any long line there is always
-/// one blade taller than the sight line. Extinction over the blocked LENGTH gives
-/// the thing its distance falloff: with `GRASS_EXTINCTION`, about 150 units of
-/// fully-blocking grass hides ~80% of a pawn.
+/// Those shares combine as TWO separate questions, and keeping them apart is
+/// what makes the model behave:
 ///
-/// Two more things fall out of the geometry rather than being written into it:
+///   * **How much of the target is behind grass at all** — [`Block::covered`],
+///     the *worst* step on the line. This is geometry and nothing else: if the
+///     tallest blade between you only ever reaches his knees, his head is in
+///     clear air no matter how much of it there is, and no amount of distance
+///     can hide it. It saturates at 1 the moment any step covers him whole.
+///   * **How solid that grass is** — extinction over the blocked LENGTH,
+///     [`Block::length`]. Grass isn't a wall, it's blades with gaps: a hand's
+///     width of it is a screen you see straight through, and a body's width of
+///     it is opaque. This is where distance enters, and it is the only place it
+///     does.
+///
+/// Multiplying them says: the part of him below the grass line is hidden as
+/// completely as the depth of grass in the way allows, and the part above it is
+/// always visible. Which is the answer you'd give looking at the situation.
+///
+/// Beer-Lambert over the blocked length ALONE was the previous model, and its
+/// failure is worth remembering: with no geometric ceiling, enough distance hid
+/// anybody behind anything, so ankle-deep grass eventually erased a standing man
+/// — while 30 units of shin-deep grass, which you genuinely cannot see a prone
+/// man through, dimmed him by a quarter. Both directions were wrong at once.
+///
+/// Two things fall out of the geometry rather than being written into it:
 ///   * **Grass at the target's own feet (t = 1) hides it up to `g`** — which is
 ///     [`army_ghosts_sim::grass_cover`], the standing-in-it rule, as the limiting
-///     case of this one.
+///     case of this one. With `covered` taking the worst step, that rule is now
+///     the model's ceiling exactly, not merely its cousin.
 ///   * **Lying down costs you sight as well as buying it.** A prone eye is 15
-///     units up, so anything deeper than that near you blocks; you keep close
-///     range vision and lose the far half of the field. Crawling to the edge of a
-///     patch to see out of it is the intended move.
+///     units up, so grass deeper than that — which is all of it now — covers
+///     every target completely; what's left is the length term, so a prone pawn
+///     sees a body's width into the field and no further. Going flat is for
+///     breaking contact, not for fighting.
 ///
 /// The eye here is the pawn itself, not the pulled-back shoulder cameras the
 /// [`Cast`]s use: peeking *around* a field of grass isn't a thing.
-fn grass_conceal(eye: Vec2, eye_h: f32, target: Vec2, target_h: f32) -> f32 {
+fn grass_conceal(scenario: &Scenario, eye: Vec2, eye_h: f32, target: Vec2, target_h: f32) -> f32 {
+    grass_conceal_in(eye, eye_h, target, target_h, |x, y| scenario.depth(x, y))
+}
+
+/// [`grass_conceal`] over an arbitrary depth field, rather than whichever one
+/// the scenario supplies. `vision/strip_table.rs` is what needs it: the table
+/// sweeps depths the arena doesn't contain.
+fn grass_conceal_in(
+    eye: Vec2,
+    eye_h: f32,
+    target: Vec2,
+    target_h: f32,
+    depth_at: impl Fn(i32, i32) -> i32,
+) -> f32 {
+    grass_block(eye, eye_h, target, target_h, depth_at).conceal()
+}
+
+/// What the grass on one sight line does, split into the two questions
+/// [`grass_conceal`] describes. Kept as a pair rather than folded into one
+/// number because they are the two things worth looking at when tuning, and
+/// `strip_table.rs` tabulates both.
+#[derive(Copy, Clone, Debug, Default)]
+struct Block {
+    /// Largest share of the target that any single step's grass stands over,
+    /// 0..=1 — the geometric ceiling on how much can be hidden.
+    covered: f32,
+    /// How much of the line is blocked, world units, weighted by how much of the
+    /// target each step covers. How *solid* the cover is.
+    length: f32,
+}
+
+impl Block {
+    fn conceal(&self) -> f32 {
+        self.covered * (1.0 - (-GRASS_EXTINCTION * self.length).exp())
+    }
+}
+
+fn grass_block(
+    eye: Vec2,
+    eye_h: f32,
+    target: Vec2,
+    target_h: f32,
+    depth_at: impl Fn(i32, i32) -> i32,
+) -> Block {
     let dist = eye.distance(target);
     if target_h <= 0.0 || dist < 1.0 {
-        return 0.0;
+        return Block::default();
     }
-    let mut blocked_len = 0.0;
+    let mut block = Block::default();
     let step = dist * (1.0 - GRASS_NEAR_T) / GRASS_SAMPLES as f32;
     for i in 0..GRASS_SAMPLES {
         let t = GRASS_NEAR_T
             + (1.0 - GRASS_NEAR_T) * (i + 1) as f32 / GRASS_SAMPLES as f32;
         let p = eye.lerp(target, t);
-        let depth = grass_height(p.x.round() as i32, p.y.round() as i32) as f32;
+        let depth = depth_at(p.x.round() as i32, p.y.round() as i32) as f32;
         let reaches = eye_h + (depth - eye_h) / t;
-        blocked_len += (reaches / target_h).clamp(0.0, 1.0) * step;
+        let share = (reaches / target_h).clamp(0.0, 1.0);
+        block.covered = block.covered.max(share);
+        block.length += share * step;
     }
-    1.0 - (-GRASS_EXTINCTION * blocked_len).exp()
+    block
 }
 
 /// A pawn's eye height, world units — where it looks from, and (near enough)
@@ -677,6 +753,7 @@ pub fn fade_hidden(
     rocks: Query<(&Rock, &Pos)>,
     bushes: Query<(&Bush, &Pos)>,
     mut players: Query<(&Player, &Pos, &Stance, &mut Sprite), With<Player>>,
+    scenario: Res<Scenario>,
 ) {
     let Some(local) = local_players else { return };
     let Some(&handle) = local.0.first() else { return };
@@ -718,12 +795,16 @@ pub fn fade_hidden(
         .map(|offset| coverage_at(&casts, body + *offset))
         .sum::<f32>()
             / 5.0;
-        let grass = grass_conceal(viewer, viewer_h, body, eye_height(stance));
+        let grass = grass_conceal(&scenario, viewer, viewer_h, body, eye_height(stance));
         sprite
             .color
             .set_alpha(((1.0 - hidden) * (1.0 - grass)).clamp(0.0, 1.0));
     }
 }
+
+/// The concealment table generator (`tools/grass-table.sh`).
+#[cfg(test)]
+mod strip_table;
 
 #[cfg(test)]
 mod tests {
@@ -738,9 +819,9 @@ mod tests {
         let (west, east) = (Vec2::new(-150.0, 0.0), Vec2::new(150.0, 0.0));
         let near = Vec2::new(-90.0, 0.0); // same bearing, a fifth of the way
 
-        let standing = grass_conceal(west, h(0), east, h(0));
-        let crouching = grass_conceal(west, h(0), east, h(1));
-        let prone = grass_conceal(west, h(0), east, h(2));
+        let standing = grass_conceal(&Scenario::Arena, west, h(0), east, h(0));
+        let crouching = grass_conceal(&Scenario::Arena, west, h(0), east, h(1));
+        let prone = grass_conceal(&Scenario::Arena, west, h(0), east, h(2));
         assert!((0.0..=1.0).contains(&standing));
         assert!(
             prone > crouching && crouching > standing,
@@ -750,23 +831,39 @@ mod tests {
         // Distance has to matter, or grass stops being terrain and becomes a
         // property of standing in it.
         assert!(
-            grass_conceal(west, h(0), near, h(0)) < standing,
+            grass_conceal(&Scenario::Arena, west, h(0), near, h(0)) < standing,
             "a pawn 60 units away must be plainer than one 300 away"
         );
 
         // Lying down buys concealment and costs sight: the same target is harder
         // to make out from down in the blades.
         assert!(
-            grass_conceal(west, h(2), east, h(0)) > standing,
+            grass_conceal(&Scenario::Arena, west, h(2), east, h(0)) > standing,
             "a prone viewer must see less, not more"
         );
 
-        // Bare ground hides nobody. (0, -250) sits in the arena's thinnest
-        // corner; if the depth field is ever reseeded this may need moving.
-        let bare = Vec2::new(-40.0, -250.0);
+        // Bare ground hides nobody. There is none left in the arena — the field
+        // is a thick even sward now — so this asks the rig for it instead of
+        // hunting for the thinnest corner of the map and re-hunting whenever
+        // `GRASS_SEED` moves.
+        let bare = Scenario::GrassStrip { depth: 0, east_stance: 0 };
+        assert_eq!(
+            grass_conceal(&bare, west, h(0), east, h(0)),
+            0.0,
+            "bare ground must not conceal"
+        );
+
+        // Standing has to remain a fight. The arena's own grass is waist-deep
+        // everywhere, and if that were enough to hide an upright soldier there
+        // would be no reason to ever go prone — nor any way to find anybody.
+        //
+        // Asked at FIGHTING range, not across the whole arena: a sight line the
+        // width of the map crosses ~12 tiles and `covered` takes the deepest, so
+        // fading out at 300 units is the model working, not failing.
+        let close = grass_conceal(&Scenario::Arena, west, h(0), west + Vec2::new(80.0, 0.0), h(0));
         assert!(
-            grass_conceal(bare, h(0), bare + Vec2::new(60.0, 0.0), h(0)) < 0.2,
-            "thin ground must not conceal"
+            close < 0.7,
+            "the field must not hide a standing pawn 80 units away: {close}"
         );
     }
 }

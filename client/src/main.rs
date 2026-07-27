@@ -62,6 +62,11 @@ fn main() {
     .add_plugins(GgrsPlugin::<SessionConfig>::default())
     .add_plugins(SimPlugin::<SessionConfig>::default())
     .add_systems(ReadInputs, input::read_local_inputs)
+    // Which world this is, as its own resource: the renderer asks it how deep
+    // the grass is (`Scenario::depth`) and it decides what `spawn_world`
+    // builds, so everything downstream reads one value instead of pattern
+    // matching on the launch config.
+    .insert_resource(launch.scenario)
     .insert_resource(launch)
     .init_resource::<touch::TouchControls>()
     .init_resource::<ads::Ads>()

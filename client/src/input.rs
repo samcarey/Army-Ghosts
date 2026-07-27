@@ -8,7 +8,7 @@ use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
 use bevy_ggrs::{LocalInputs, LocalPlayers};
 
-use army_ghosts_sim::{PlayerInput, BTN_ADS, BTN_FIRE};
+use army_ghosts_sim::{PlayerInput, Scenario, BTN_ADS, BTN_FIRE};
 
 use crate::ads::Ads;
 use crate::stance::StanceControl;
@@ -22,6 +22,7 @@ pub fn read_local_inputs(
     ads: Res<Ads>,
     stance: Res<StanceControl>,
     local_players: Res<LocalPlayers>,
+    scenario: Res<Scenario>,
 ) {
     let mut local_inputs = HashMap::new();
     // Inputs drive the *first* local handle; any additional local handles
@@ -65,6 +66,12 @@ pub fn read_local_inputs(
             // re-applies it identically.
             input.set_stance(stance.wanted);
             first = false;
+        } else {
+            // Idle handles still have to ASK for their stance every tick, or
+            // the sim stands them back up — the wire carries the level wanted,
+            // not a change. Normally that's just "stand"; the grass rig uses it
+            // to pose the pawn nobody is driving.
+            input.set_stance(scenario.idle_stance());
         }
         local_inputs.insert(*handle, input);
     }

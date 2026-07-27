@@ -15,7 +15,9 @@ use bevy_ggrs::{Rollback, Session};
 use bevy_matchbox::matchbox_socket::{RtcIceServerConfig, WebRtcChannel, WebRtcSocketBuilder};
 use bevy_matchbox::prelude::*;
 
-use army_ghosts_sim::{spawn_world, MAX_PLAYERS, TICK_HZ};
+use army_ghosts_sim::{
+    spawn_world, Scenario, GRASS_MAX_H, MAX_PLAYERS, STANCE_STAND, TICK_HZ,
+};
 
 use crate::{AppState, SessionConfig};
 
@@ -33,6 +35,9 @@ pub struct LaunchConfig {
     /// drops the responses, and browsers then stall ICE gathering for ~40s
     /// per handshake leg, which reads as "p2p is broken").
     pub ice: Option<Vec<String>>,
+    /// Which world to build. Always [`Scenario::Arena`] in a real match; the
+    /// measuring rig is offline-only (see [`parse_scenario`]).
+    pub scenario: Scenario,
 }
 
 const DEFAULT_SIGNALING: &str = "ws://127.0.0.1:3536";
@@ -42,10 +47,41 @@ const DEFAULT_SIGNALING: &str = "ws://127.0.0.1:3536";
 /// auto-starts if the room actually fills). Offline defaults to 1 (a phantom
 /// second pawn in solo practice reads as "someone else is here"); an explicit
 /// `players` still forces a multi-handle local synctest for testing.
-fn resolve_players(explicit: Option<usize>, has_room: bool) -> usize {
+fn resolve_players(explicit: Option<usize>, has_room: bool, scenario: Scenario) -> usize {
+    if matches!(scenario, Scenario::GrassStrip { .. }) {
+        return 2; // the rig is a fixed two-hander; whatever `players` said is noise
+    }
     explicit
         .unwrap_or(if has_room { MAX_PLAYERS } else { 1 })
         .clamp(1, MAX_PLAYERS)
+}
+
+/// Dev scenario override — `AG_SCENARIO` natively, `?scenario=` on the web:
+///
+/// * `strip` — the concealment rig at the deepest grass the field can hold
+/// * `strip:<depth>` — that wall, `depth` units deep
+/// * `strip:<depth>:<level>` — and the east pawn crouching (1) or prone (2)
+///
+/// Ignored outright when a room is set: peers that disagree about which world
+/// they are in desync on the first tick, and nothing about this is worth that
+/// risk. Anything unrecognised is the game.
+fn parse_scenario(raw: Option<String>, has_room: bool) -> Scenario {
+    if has_room {
+        return Scenario::Arena;
+    }
+    let Some(raw) = raw else { return Scenario::Arena };
+    let mut parts = raw.split(':');
+    if parts.next() != Some("strip") {
+        return Scenario::Arena;
+    }
+    Scenario::GrassStrip {
+        depth: parts
+            .next()
+            .and_then(|d| d.parse().ok())
+            .unwrap_or(GRASS_MAX_H)
+            .clamp(0, GRASS_MAX_H),
+        east_stance: parts.next().and_then(|s| s.parse().ok()).unwrap_or(STANCE_STAND),
+    }
 }
 
 fn parse_ice(raw: Option<String>) -> Option<Vec<String>> {
@@ -60,14 +96,16 @@ fn parse_ice(raw: Option<String>) -> Option<Vec<String>> {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn launch_config() -> LaunchConfig {
     let room = std::env::var("AG_ROOM").ok().filter(|r| !r.is_empty());
+    let scenario = parse_scenario(std::env::var("AG_SCENARIO").ok(), room.is_some());
     let players = resolve_players(
         std::env::var("AG_PLAYERS").ok().and_then(|p| p.parse().ok()),
         room.is_some(),
+        scenario,
     );
     let signaling =
         std::env::var("AG_SIGNALING").unwrap_or_else(|_| DEFAULT_SIGNALING.to_string());
     let ice = parse_ice(std::env::var("AG_ICE").ok());
-    LaunchConfig { room, players, signaling, ice }
+    LaunchConfig { room, players, signaling, ice, scenario }
 }
 
 /// Web: `window.__AG_NET__ = { room, players, signaling }`, set by index.html
@@ -83,13 +121,15 @@ pub fn launch_config() -> LaunchConfig {
     let window = web_sys::window().expect("no window");
     let net = js_sys::Reflect::get(&window, &"__AG_NET__".into()).unwrap_or_default();
     let room = get(&net, "room");
+    let scenario = parse_scenario(get(&net, "scenario"), room.is_some());
     let players = resolve_players(
         get(&net, "players").and_then(|p| p.parse().ok()),
         room.is_some(),
+        scenario,
     );
     let signaling = get(&net, "signaling").unwrap_or_else(|| DEFAULT_SIGNALING.to_string());
     let ice = parse_ice(get(&net, "ice"));
-    LaunchConfig { room, players, signaling, ice }
+    LaunchConfig { room, players, signaling, ice, scenario }
 }
 
 /// Handoff between `run_lobby` (which tears the warmup world down) and
@@ -128,7 +168,7 @@ pub struct Lobby {
     pub start_requested: bool,
 }
 
-fn start_local_session(commands: &mut Commands, players: usize) {
+fn start_local_session(commands: &mut Commands, players: usize, scenario: Scenario) {
     let mut builder = SessionBuilder::<SessionConfig>::new()
         .with_num_players(players)
         .with_check_distance(2);
@@ -139,7 +179,7 @@ fn start_local_session(commands: &mut Commands, players: usize) {
     }
     let session = builder.start_synctest_session().expect("start synctest");
     commands.insert_resource(Session::SyncTest(session));
-    spawn_world(commands, players);
+    spawn_world(commands, players, scenario);
 }
 
 /// Startup: always start playing immediately. With a room, that's a 1-player
@@ -171,11 +211,16 @@ pub fn begin_session_setup(
                 builder.add_reliable_channel().add_unreliable_channel(),
             ));
             // Warmup: run around and shoot while waiting for the room to fill.
-            start_local_session(&mut commands, 1);
+            // Always the real arena — `parse_scenario` refuses the rig with a
+            // room set, but spell it out rather than rely on that here.
+            start_local_session(&mut commands, 1, Scenario::Arena);
         }
         None => {
-            info!("no room — starting local synctest session ({} players)", launch.players);
-            start_local_session(&mut commands, launch.players);
+            info!(
+                "no room — starting local synctest session ({} players, {:?})",
+                launch.players, launch.scenario
+            );
+            start_local_session(&mut commands, launch.players, launch.scenario);
             next_state.set(AppState::InGame);
         }
     }
@@ -315,7 +360,9 @@ pub fn finalize_p2p_session(
     // EARLIER moment and panic ("tried to move time backwards"). Fresh clock.
     commands.insert_resource(Time::new_with(bevy_ggrs::GgrsTime));
     commands.remove_resource::<PendingSession>();
-    spawn_world(&mut commands, num_players);
+    // A p2p match is the arena, full stop: every peer must build the same world
+    // and only one of them typed the URL.
+    spawn_world(&mut commands, num_players, Scenario::Arena);
     next_state.set(AppState::InGame);
 }
 

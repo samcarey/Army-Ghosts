@@ -8,8 +8,8 @@ use bevy::sprite::Anchor;
 use bevy_ggrs::LocalPlayers;
 
 use army_ghosts_sim::{
-    Bullet, Bush, Facing, Health, Player, Pos, Rock, Stance, Target, ARENA_HALF_H, ARENA_HALF_W,
-    STANCE_COUNT, STANCE_STAND, TARGET_R,
+    Bullet, Bush, Facing, Health, Player, Pos, Rock, Scenario, Stance, Target, ARENA_HALF_H,
+    ARENA_HALF_W, STANCE_COUNT, STANCE_STAND, TARGET_R,
 };
 
 use crate::ads::Ads;
@@ -54,14 +54,37 @@ const SOLDIER_FRAME_PX: u32 = 72;
 const STANCE_COLS: u32 = 13;
 const SOLDIER_COLS: u32 = STANCE_COLS * STANCE_COUNT as u32;
 const SOLDIER_DIRS: u32 = 16;
-/// Where the pawn's `Pos` sits in the frame, as a fraction from the top (the
-/// generator's `SOLDIER_GROUND_PY` / `SOLDIER_PRONE_PY` over the frame size),
-/// per stance. Upright figures are anchored at the ground between their feet,
-/// so they stand on their `Pos` and rise above it; a prone figure is anchored
+/// Where the pawn's `Pos` sits in the frame, as a fraction from the top, per
+/// stance. Upright figures are anchored where their boots MEET THE GROUND, so
+/// they stand on their `Pos` and rise above it; a prone figure is anchored
 /// mid-body, because that is what it pivots around when it turns.
+///
+/// These are the silhouette's bottom, measured off `soldier.png` — NOT the
+/// generator's `SOLDIER_GROUND_PY` (58.5), which is where the model's z = 0
+/// plane lands. The two differ, and it matters: a boot is a capsule with real
+/// extent, and in a 3/4 projection the part of it nearest the camera projects
+/// BELOW the origin it is standing on. Anchored on the origin, every pawn's
+/// boots hung below the line the grass at its feet is rooted on, which reads
+/// exactly as reported: "note foot is below grass".
+///
+/// Measured bottoms per stance block, over all 16 facings:
+///
+/// ```text
+///   standing   idle 61..64   walk 59..66
+///   crouching  idle 61..66   walk 60..67
+/// ```
+///
+/// Anchored on the IDLE MAXIMUM, so a pawn standing still never dips below its
+/// own ground line whichever way it faces. The facings that bottom out higher
+/// then float up to 3 frame px — invisible, since nothing draws a contact
+/// shadow. A walking pawn's trailing boot still swings ~2 px below, and that one
+/// is left alone deliberately: anchoring on the walk maximum would hover the
+/// figure at idle, and per-frame anchors would bob the whole body in place of
+/// swinging the feet. Re-measure with a bbox pass over the sheet if the model or
+/// `SOLDIER_TILT` changes.
 const STANCE_ANCHOR: [f32; STANCE_COUNT] = [
-    58.5 / 72.0,
-    58.5 / 72.0,
+    64.0 / 72.0,
+    66.0 / 72.0,
     36.0 / 72.0,
 ];
 const IDLE_FRAME: usize = 0;
@@ -76,9 +99,12 @@ const SOLDIER_SIZE: f32 = 56.25;
 /// 3/4 sprite stands with its feet on the Pos, so the rifle sits this far up
 /// the screen; shots have to be lifted to match or tracers appear to leave the
 /// soldier's boots. Derived from the rifle's height in the sheet: z units x
-/// sin(40 deg) x 38 px/unit x (SOLDIER_SIZE / frame). A crawling soldier's
-/// rifle is all but on the ground, hence the near-zero third entry.
-const STANCE_MUZZLE_LIFT: [f32; STANCE_COUNT] = [22.0, 14.0, 3.0];
+/// sin(40 deg) x 38 px/unit x (SOLDIER_SIZE / frame), plus the `STANCE_ANCHOR`
+/// correction (4.3 px standing, 5.9 crouching) — moving the anchor to the boots
+/// raised the whole figure against `Pos`, and the muzzle rode up with it. A
+/// crawling soldier's rifle is all but on the ground, hence the near-zero third
+/// entry, and prone's anchor didn't move.
+const STANCE_MUZZLE_LIFT: [f32; STANCE_COUNT] = [26.3, 19.9, 3.0];
 
 pub fn muzzle_lift(level: u8) -> f32 {
     STANCE_MUZZLE_LIFT[(level as usize).min(STANCE_COUNT - 1)]
@@ -160,16 +186,25 @@ const TRAIL_ALPHA: f32 = 0.45;
 const TRAIL_MAX_SEG: f32 = 48.0;
 
 /// Marks a sprite that stands ON the ground, so its draw order comes from where
-/// it stands rather than from a fixed layer: `grass::y_sort` of its `Pos.y`,
-/// plus this bias.
+/// it stands rather than from a fixed layer: `grass::y_sort` of its ground line,
+/// plus a bias.
 ///
 /// Everything in the field shares one z band — pawns, boulders, practice
 /// dummies and every band of grass — which is what makes the grass behave: the
 /// clumps between you and the camera are drawn after you and swallow your legs,
 /// the ones behind you are drawn before you and don't. It also means you can now
 /// walk *behind* a boulder as well as in front of one.
+///
+/// `reach` is how far SOUTH of `Pos` the thing's nearest edge sits, and it is
+/// not decoration: a pawn's ground line is its feet (0), but a boulder's is the
+/// southern rim of its own footprint. Sorting a boulder by its centre instead
+/// let every clump standing in its southern half draw over it — grass growing
+/// out of a rock, which is what it looks like.
 #[derive(Component)]
-pub struct Grounded(f32);
+pub struct Grounded {
+    reach: f32,
+    bias: f32,
+}
 
 /// Render-only per-bullet trail bookkeeping.
 #[derive(Component, Default)]
@@ -218,12 +253,36 @@ const Z_BULLET: f32 = 2.0;
 /// the boulders and the pawns — you hide *under* a bush.
 const Z_BUSH: f32 = 2.5;
 
+/// World units per pixel in `Scenario::GrassStrip`. The pawns stand
+/// `2 * STRIP_STANDOFF` (96 units) apart, so at a third of a unit per pixel the
+/// pair spans about 290 px of a phone-width window: both of them, the wall
+/// between them, and enough ground either side to see where the grass stops.
+const STRIP_ZOOM: f32 = 0.33;
+
 pub fn setup_scene(
     mut commands: Commands,
     assets: Res<AssetServer>,
     mut layouts: ResMut<Assets<TextureAtlasLayout>>,
+    scenario: Res<Scenario>,
 ) {
-    commands.spawn(Camera2d);
+    match *scenario {
+        // The game: unzoomed, one world unit per pixel, following the pawn.
+        Scenario::Arena => {
+            commands.spawn(Camera2d);
+        }
+        // The rig is a scene to be looked AT, not played: frame both pawns and
+        // the wall between them from a fixed camera (`camera_follow` leaves it
+        // alone), close enough to see what the grass is doing to the far one.
+        Scenario::GrassStrip { .. } => {
+            commands.spawn((
+                Camera2d,
+                Projection::Orthographic(OrthographicProjection {
+                    scale: STRIP_ZOOM,
+                    ..OrthographicProjection::default_2d()
+                }),
+            ));
+        }
+    }
     commands.insert_resource(SoldierSheet {
         image: assets.load("soldier.png"),
         layout: layouts.add(TextureAtlasLayout::from_grid(
@@ -298,7 +357,7 @@ pub fn attach_sprites(
             // re-anchors when the stance changes).
             Anchor(stance_anchor(STANCE_STAND)),
             WalkAnim::default(),
-            Grounded(0.0),
+            Grounded { reach: 0.0, bias: 0.0 },
             Transform::default(),
         ));
     }
@@ -330,7 +389,7 @@ pub fn attach_sprites(
     for entity in &new_targets {
         commands.entity(entity).insert((
             Sprite::from_color(Color::srgb(0.55, 0.55, 0.55), Vec2::splat((TARGET_R * 2) as f32)),
-            Grounded(0.0),
+            Grounded { reach: TARGET_R as f32, bias: 0.0 },
             Transform::default(),
         ));
     }
@@ -355,9 +414,14 @@ pub fn attach_sprites(
                 custom_size: Some(cover_size(rock.r, ROCK_FILL_PX)),
                 ..default()
             },
-            // Half a hair under the pawns: a boulder and a soldier on the same
-            // line are close enough that the tie should go to the soldier.
-            Grounded(-0.002),
+            // Sorted by the southern rim of its own footprint, so the grass
+            // inside that footprint draws BEFORE it — a boulder displaces the
+            // sward, it doesn't grow out of it. Only clumps standing in front of
+            // the rim cover it, which is what grass in front of a rock does.
+            // The hair of bias puts it just under the pawns: a boulder and a
+            // soldier on the same line are close enough that the tie should go
+            // to the soldier.
+            Grounded { reach: rock.r as f32, bias: -0.002 },
             Transform::from_rotation(Quat::from_rotation_z(angle)),
         ));
     }
@@ -540,7 +604,7 @@ pub fn sync_transforms(
         // where your feet are, so the grass in front of you covers you and the
         // grass behind you doesn't (see `grass::y_sort`).
         if let Some(grounded) = grounded {
-            transform.translation.z = crate::grass::y_sort(y) + grounded.0;
+            transform.translation.z = crate::grass::y_sort(y - grounded.reach) + grounded.bias;
         }
     }
     // Rounds fly at the weapon height they were fired from, not ankle height.
@@ -574,7 +638,13 @@ pub fn camera_follow(
     mut focus: ResMut<CameraFocus>,
     ads: Res<Ads>,
     time: Res<Time>,
+    scenario: Res<Scenario>,
 ) {
+    // The rig's camera is fixed on the wall, showing both pawns at once — see
+    // `setup_scene`.
+    if matches!(*scenario, Scenario::GrassStrip { .. }) {
+        return;
+    }
     let Some(local) = local_players else { return };
     let Some(first_local) = local.0.first() else { return };
     let Some((_, pos)) = players.iter().find(|(p, _)| p.handle == *first_local) else {

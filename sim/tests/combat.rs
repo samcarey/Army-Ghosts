@@ -76,7 +76,7 @@ fn arena() -> App {
         .init_resource::<Script>()
         .add_systems(ReadInputs, read_inputs)
         .add_systems(Startup, |mut commands: Commands| {
-            spawn_world(&mut commands, PLAYERS)
+            spawn_world(&mut commands, PLAYERS, Scenario::Arena)
         });
 
     let mut builder = SessionBuilder::<TestConfig>::new()

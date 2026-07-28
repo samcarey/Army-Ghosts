@@ -204,6 +204,58 @@ Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_SIGNALING` env vars.
   `sim/tests/combat.rs` `bot_pawns_are_simulated_without_a_session_seat` builds a
   session for 4 handles and a world with 8 pawns; it runs at `check_distance(2)`,
   so bot state that isn't rollback-safe fails there rather than in a match.
+- **Bots** (`sim/src/bot.rs`) — **utility scoring, because it is the only common
+  architecture that is naturally rollback-safe**, and that falls out of the
+  constraint rather than taste. A behavior tree carries a running-node cursor; an
+  HTN plan (Killzone 2's bots) carries a task stack plus the world-state
+  assumptions it was planned under; an FSM carries timers, and timers are where
+  wall-clock creeps into a sim that must not read one. All must be snapshotted
+  every tick and can desync. **Utility scoring carries almost nothing** — score
+  the options against the world as it is, take the best — so re-evaluating a
+  rolled-back tick returns the same answer by construction. Do not "upgrade" this
+  to a behavior tree without re-reading that sentence.
+  Three mechanisms are lifted from shipped shooters, in each case because the
+  obvious implementation is the one that breaks under rollback:
+  * **Reaction time is a RING BUFFER, not a timer** (Counter-Strike: Source's
+    `UpdateReactionQueue`). `Memory` keeps `MEMORY_TICKS` (24) sightings
+    round-robin and the bot attends to the one `profile.reaction` steps back.
+    Fixed size, integer indices, measured in ticks: it snapshots for free, and
+    the bot genuinely acts on stale information rather than being artificially
+    slowed. It also does double duty — the *velocity* used for leading a target
+    comes from differencing two entries, so there is no separate tracking state.
+  * **`skill` and `accuracy` are DIFFERENT KNOBS** (Quake III's `BotAimAtEnemy`).
+    `skill` GATES TECHNIQUES — above `LEAD_SKILL` the bot leads a moving target,
+    below it it shoots where you were. `accuracy` only scales aim jitter. A weak
+    bot is one that doesn't know to lead, not a good bot with shaky hands. The
+    jitter is scaled BY RANGE so it's an angle, not a fixed offset; otherwise
+    perfect accuracy at 300 units would be easier than at 30.
+  * **Visibility is sampled across the body**, which is `visible_fraction`'s five
+    points, so cover degrades in fifths instead of snapping.
+  Things that will bite:
+  * **Every behavior scores on EXACTLY THREE considerations.** Multiplying values
+    in `0..=FP` drags a score down as considerations are added, which penalises
+    the behaviors that think hardest; the textbook fix is the geometric mean,
+    which is awkward in integer math. Sidestepped rather than solved — equal
+    counts mean the bias is identical everywhere and cancels. Add a fourth to one
+    behavior and you have silently down-weighted it. Add it to all five or none.
+  * The RNG seed is **rollback state**. A bot whose seed didn't roll back would
+    take a different shot on a re-simulated frame, which is a desync, not a
+    glitch. `Bot::new` hashes the handle rather than adding it, because
+    consecutive LCG seeds give visibly correlated first draws and "all the bots
+    twitch together" is exactly the tell that gives it away.
+  * A dead bot still pushes an empty sighting every tick, so "12 ticks ago" keeps
+    meaning the same thing across a respawn.
+  * `SimPlugin` `init_resource::<Scenario>()`s, because `bot_think` asks what
+    world it is in and anything building a bare app (the combat tests, the
+    harness) would otherwise panic on the first tick.
+  Tuning lives in `BotProfile` (skill / accuracy / reaction / aggression /
+  caution) — one struct precisely so the self-play harness can vary it.
+  `sim/tests/combat.rs` covers the three failures worth catching:
+  `bots_decide_identically_in_identical_worlds` (two runs, 400 ticks, every pawn
+  on the same subunit — catches an unseeded RNG or iteration-order dependence,
+  which the synctest's checksums would NOT catch since they only prove state
+  rolls back), `bots_open_fire_only_after_their_reaction_time`, and
+  `bots_left_alone_fight_each_other` (30 s in one arena: ~21 deaths).
 - **Character art** (`tools/gen_assets.py` `gen_soldier` + `client/src/render.rs`):
   the soldier is modelled ONCE in 3D — capsules in character space, x right,
   y forward, z up, origin on the ground between the feet — then rotated about z

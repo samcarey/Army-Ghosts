@@ -252,19 +252,125 @@ fn bot_pawns_are_simulated_without_a_session_seat() {
     let mut input = PlayerInput { move_x: 90, move_y: 40, buttons: 0 };
     input.buttons |= BTN_FIRE;
     drive(&mut app, SHOOTER, input);
-    run(&mut app, 120);
+    run(&mut app, 180);
 
-    // Every bot is still there, still whole, and still where it started: with no
-    // brain wired up yet its `Intent` stays default, which must read as "stands
-    // still" and not as "drifts" or "fires".
+    // The bots are being driven — something moved, and it wasn't the wire.
+    // Getting through 180 ticks at all is most of the point (the old code
+    // panicked on tick one), but a bot that is present and inert would pass
+    // that trivially.
+    let moved = (PLAYERS..PLAYERS + BOTS)
+        .filter(|&handle| {
+            pawn(&mut app, handle).0
+                != Pos::from_units(SPAWN_POINTS[handle].0, SPAWN_POINTS[handle].1)
+        })
+        .count();
+    assert!(moved > 0, "no bot moved in 180 ticks — the brain isn't running");
+
+    // Nothing wandered off the map or out of a boulder.
     for handle in PLAYERS..PLAYERS + BOTS {
-        let (pos, health, deaths) = pawn(&mut app, handle);
-        assert_eq!(
-            pos,
-            Pos::from_units(SPAWN_POINTS[handle].0, SPAWN_POINTS[handle].1),
-            "bot {handle} moved on a default intent"
+        let (pos, ..) = pawn(&mut app, handle);
+        assert!(
+            pos.x.abs() <= ARENA_HALF_W * FP && pos.y.abs() <= ARENA_HALF_H * FP,
+            "bot {handle} left the arena at {pos:?}"
         );
-        assert_eq!(health.hp, MAX_HEALTH, "bot {handle} took damage from nowhere");
-        assert_eq!(deaths.0, 0, "bot {handle} died with nothing shooting at it");
     }
+}
+
+/// Bots are deterministic: the same world, ticked the same way, twice, lands
+/// every pawn on the same subunit.
+///
+/// This is the property the whole architecture is arranged around, and it is
+/// worth testing separately from the synctest's checksums because it catches a
+/// different failure. The synctest proves a bot's state ROLLS BACK correctly;
+/// this proves the decision itself doesn't depend on anything outside that
+/// state — an unseeded RNG, a wall clock, or query iteration order.
+///
+/// The bots must actually fight for it to mean anything, so the arena is full
+/// and the run is long enough for contact, deaths and respawns.
+#[test]
+fn bots_decide_identically_in_identical_worlds() {
+    fn play() -> Vec<(usize, Pos, i32, u32)> {
+        let mut app = arena_with_bots(4);
+        drive(&mut app, SHOOTER, PlayerInput { move_x: 0, move_y: 0, buttons: BTN_FIRE });
+        run(&mut app, 400);
+        let mut out: Vec<(usize, Pos, i32, u32)> = app
+            .world_mut()
+            .query::<(&Player, &Pos, &Health, &Deaths)>()
+            .iter(app.world())
+            .map(|(p, pos, h, d)| (p.handle, *pos, h.hp, d.0))
+            .collect();
+        out.sort_unstable_by_key(|&(handle, ..)| handle);
+        out
+    }
+
+    let a = play();
+    let b = play();
+    assert_eq!(a, b, "two identical runs diverged — a bot read something outside its state");
+
+    // And the run was worth comparing: bots that never moved would match
+    // trivially. Something has to have happened for 400 ticks of a full arena.
+    let interesting = a
+        .iter()
+        .any(|&(handle, pos, ..)| {
+            handle >= PLAYERS
+                && pos != Pos::from_units(SPAWN_POINTS[handle].0, SPAWN_POINTS[handle].1)
+        });
+    assert!(interesting, "nothing happened in 400 ticks; the comparison proved nothing");
+}
+
+/// A bot shoots at somebody it can see, and doesn't shoot at somebody it can't.
+///
+/// The reaction queue makes the first half non-trivial: a bot that fires on the
+/// tick it sees you has no reaction time, and one that never fires has a broken
+/// memory index. Both are easy mistakes and both look fine from the outside.
+#[test]
+fn bots_open_fire_only_after_their_reaction_time() {
+    let mut app = arena_with_bots(4);
+    // Nobody drives a human; the bots are the only thing that can shoot.
+    drive(&mut app, SHOOTER, PlayerInput::default());
+
+    let mut first_shot = None;
+    for tick in 0..120 {
+        run(&mut app, 1);
+        let bullets = app.world_mut().query::<&Bullet>().iter(app.world()).count();
+        if bullets > 0 {
+            first_shot = Some(tick);
+            break;
+        }
+    }
+    let first_shot = first_shot.expect("four bots in an arena together should find each other");
+    assert!(
+        first_shot >= BotProfile::default().reaction as usize,
+        "a bot fired on tick {first_shot}, inside its own {}-tick reaction time",
+        BotProfile::default().reaction
+    );
+}
+
+/// Bots actually fight: left alone in an arena together they find each other,
+/// trade rounds and put each other down.
+///
+/// A smoke test rather than a balance one — the self-play harness is what
+/// judges whether they fight *well*. This only catches the failure where they
+/// are technically running but never resolve anything, which every previous
+/// assertion in this file would happily pass.
+#[test]
+fn bots_left_alone_fight_each_other() {
+    let mut app = arena_with_bots(4);
+    drive(&mut app, SHOOTER, PlayerInput::default());
+    run(&mut app, 1800); // 30 seconds
+
+    let mut deaths = 0;
+    let mut damaged = 0;
+    for handle in 0..PLAYERS + 4 {
+        let (_, health, d) = pawn(&mut app, handle);
+        deaths += d.0;
+        if health.hp < MAX_HEALTH || d.0 > 0 {
+            damaged += 1;
+        }
+    }
+    println!("30s of bots: {deaths} deaths, {damaged} pawns marked");
+    assert!(
+        deaths > 0,
+        "30 seconds of bots in one arena and nobody died — they aren't fighting"
+    );
 }

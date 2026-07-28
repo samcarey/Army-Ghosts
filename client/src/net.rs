@@ -239,8 +239,8 @@ pub fn begin_session_setup(
         }
         None => {
             info!(
-                "no room — starting local synctest session ({} players, {:?})",
-                launch.players, launch.scenario
+                "no room — starting local synctest session ({} players, {} bots, {:?})",
+                launch.players, launch.bots, launch.scenario
             );
             start_local_session(&mut commands, launch.players, launch.bots, launch.scenario);
             next_state.set(AppState::InGame);

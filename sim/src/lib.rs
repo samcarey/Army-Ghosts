@@ -20,6 +20,9 @@ use bevy_ggrs::{
 };
 use serde::{Deserialize, Serialize};
 
+pub mod bot;
+pub use bot::{bot_think, Bot, BotProfile};
+
 /// Fixed-point scale: subunits per world unit (pixel).
 pub const FP: i32 = 256;
 /// Simulation tick rate (GGRS rollback schedule fps).
@@ -197,11 +200,7 @@ pub struct Player {
 #[derive(Component, Copy, Clone, Default, Debug)]
 pub struct Intent(pub PlayerInput);
 
-/// Marks a pawn the sim drives itself. The brain and its state live in
-/// [`Bot`]'s fields; this is here so the intent systems can tell the two kinds
-/// of pawn apart.
-#[derive(Component, Copy, Clone, Default, Debug)]
-pub struct Bot;
+// `Bot` — the component, its profile and its brain — lives in `bot.rs`.
 
 /// Last non-zero move direction, raw joystick range (-127..=127 per axis).
 /// Bullets fire along this. Defaults to "up".
@@ -1151,7 +1150,9 @@ pub fn spawn_world(
         let (x, y) = SPAWN_POINTS[handle];
         let pawn = spawn_pawn(commands, handle, x, y);
         if handle >= num_players {
-            commands.entity(pawn).insert(Bot);
+            commands
+                .entity(pawn)
+                .insert(Bot::new(handle, BotProfile::default()));
         }
     }
     for (x, y) in TARGET_POINTS {
@@ -1331,6 +1332,13 @@ impl<C> Default for SimPlugin<C> {
 impl<C: Config<Input = PlayerInput>> Plugin for SimPlugin<C> {
     fn build(&self, app: &mut App) {
         app.insert_resource(RollbackFrameRate(TICK_HZ))
+            // The sim owns `Scenario`, so it guarantees one exists rather than
+            // leaving every caller to remember — `init_resource` defers to a
+            // scenario the client has already chosen and only fills in `Arena`
+            // when nobody has. Without this, anything that builds a bare app
+            // (the combat tests, the harness) panics the moment a bot asks what
+            // world it is in.
+            .init_resource::<Scenario>()
             .rollback_component_with_copy::<Pos>()
             .rollback_component_with_copy::<Player>()
             .rollback_component_with_copy::<Intent>()
@@ -1366,6 +1374,7 @@ impl<C: Config<Input = PlayerInput>> Plugin for SimPlugin<C> {
                     // settled, including respawns — and everything after them
                     // wants this tick's decisions.
                     read_human_intent::<C>,
+                    bot_think,
                     move_players,
                     fire_bullets,
                     move_bullets,

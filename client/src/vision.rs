@@ -54,8 +54,8 @@ use bevy::sprite_render::{AlphaMode2d, Material2d, Material2dKey, Material2dPlug
 use bevy_ggrs::LocalPlayers;
 
 use army_ghosts_sim::{
-    Bush, Player, Pos, Rock, Scenario, Stance, ARENA_HALF_H, ARENA_HALF_W, PLAYER_R,
-    STANCE_HEIGHT,
+    Block as SimBlock, Bush, Player, Pos, Rock, Scenario, Stance, ARENA_HALF_H, ARENA_HALF_W, FP,
+    PLAYER_R, STANCE_HEIGHT,
 };
 
 /// Unlit ground: dark enough to read as "no information", light enough to tell
@@ -111,29 +111,12 @@ const EDGE_MIN_FRACTION: f32 = 0.08;
 /// as an edge; foliage shouldn't read as anything but a smudge.
 const ROCK_BLUR_SCALE: f32 = 1.0;
 const BUSH_BLUR_SCALE: f32 = 1.8;
-/// Steps along a sight line when testing it against the grass. The depth field's
-/// finest octave is 38 units across, so even a sight line the width of the arena
-/// samples it faster than it changes.
-const GRASS_SAMPLES: usize = 24;
-/// Where the grass test starts, as a fraction of the way to the target. The
-/// first stretch in front of your face is skipped on the grounds that you are
-/// looking *through* the blades you're lying in, not at them — and because the
-/// `1/t` in `grass_conceal` has to be kept away from zero. Raise it to make
-/// crawling less blinding, lower it to make grass at your nose count.
-const GRASS_NEAR_T: f32 = 0.06;
-/// Extinction per world unit of blocked sight line — how opaque grass is, per
-/// unit of it, once the geometry has decided how much of the target is behind
-/// any (see [`grass_conceal`]).
-///
-/// Anchored on the case the mechanic exists for: two pawns lying either side of
-/// a body's width (~33 units, one fog hex) of shin-deep grass cannot see each
-/// other AT ALL. That fixes it at about 0.12 — `1 - e^(-0.12 * 33)` is 0.98 —
-/// and everything else follows: half that width is still 0.86, a hand's width of
-/// grass is a screen you see through, and the term saturates within ~50 units,
-/// past which only the geometric `covered` term matters. It was 0.010 under the
-/// old length-only model, where it had to carry the distance falloff on its own
-/// and so could never be strong enough to do this.
-const GRASS_EXTINCTION: f32 = 0.12;
+// The grass model's constants — how many steps a sight line is sampled at,
+// where sampling starts, and the extinction per blocked unit — moved to the sim
+// with the model itself. `GRASS_EXTINCTION` in particular no longer exists as a
+// number anywhere: it was folded into the integer `EXP_NEG` table, which *is*
+// the constant now. Tune it there.
+
 /// How dark a fully-hidden tile gets. The rest of the hiding is spent on
 /// whoever is standing there (`fade_hidden`), so cover stays total against
 /// players while the ground merely goes unreadable — you keep a sense of terrain
@@ -622,53 +605,21 @@ fn smoothstep(s: f32) -> f32 {
 ///
 /// Grass can't cast a [`Cast`] — it isn't a set of discrete casters but a
 /// continuous depth field — so it gets the honest thing instead: a ray test in
-/// elevation. Walk the sight line, and at each step ask how high up the target a
-/// sight line grazing the blade tips there would land. A blade of depth `g` at
-/// fraction `t` along the path, seen from an eye at height `E`, hides everything
-/// on the target below
+/// elevation.
 ///
-///     E + (g - E) / t
-///
-/// (similar triangles: the line through the tip carries on to the target plane).
-/// The share of the body under that line is how much *this* step hides.
-///
-/// Those shares combine as TWO separate questions, and keeping them apart is
-/// what makes the model behave:
-///
-///   * **How much of the target is behind grass at all** — [`Block::covered`],
-///     the *worst* step on the line. This is geometry and nothing else: if the
-///     tallest blade between you only ever reaches his knees, his head is in
-///     clear air no matter how much of it there is, and no amount of distance
-///     can hide it. It saturates at 1 the moment any step covers him whole.
-///   * **How solid that grass is** — extinction over the blocked LENGTH,
-///     [`Block::length`]. Grass isn't a wall, it's blades with gaps: a hand's
-///     width of it is a screen you see straight through, and a body's width of
-///     it is opaque. This is where distance enters, and it is the only place it
-///     does.
-///
-/// Multiplying them says: the part of him below the grass line is hidden as
-/// completely as the depth of grass in the way allows, and the part above it is
-/// always visible. Which is the answer you'd give looking at the situation.
-///
-/// Beer-Lambert over the blocked length ALONE was the previous model, and its
-/// failure is worth remembering: with no geometric ceiling, enough distance hid
-/// anybody behind anything, so ankle-deep grass eventually erased a standing man
-/// — while 30 units of shin-deep grass, which you genuinely cannot see a prone
-/// man through, dimmed him by a quarter. Both directions were wrong at once.
-///
-/// Two things fall out of the geometry rather than being written into it:
-///   * **Grass at the target's own feet (t = 1) hides it up to `g`** — which is
-///     [`army_ghosts_sim::grass_cover`], the standing-in-it rule, as the limiting
-///     case of this one. With `covered` taking the worst step, that rule is now
-///     the model's ceiling exactly, not merely its cousin.
-///   * **Lying down costs you sight as well as buying it.** A prone eye is 15
-///     units up, so grass deeper than that — which is all of it now — covers
-///     every target completely; what's left is the length term, so a prone pawn
-///     sees a body's width into the field and no further. Going flat is for
-///     breaking contact, not for fighting.
+/// **The model itself lives in the sim** ([`army_ghosts_sim::grass_block`], which
+/// is where the derivation, the two terms and the history are written down).
+/// It moved there when bots arrived: a bot decides from what it can see and
+/// every peer has to reach the same decision, so the answer has to be integer
+/// and it has to be somewhere both can ask. What is left here is unit
+/// conversion — the renderer thinks in `Vec2` and f32 shares, the sim in [`Pos`]
+/// and FP — so that there is exactly ONE implementation and what hides a bot is
+/// what hides a player, by construction rather than by agreement.
 ///
 /// The eye here is the pawn itself, not the pulled-back shoulder cameras the
-/// [`Cast`]s use: peeking *around* a field of grass isn't a thing.
+/// [`Cast`]s use: peeking *around* a field of grass isn't a thing. (That is also
+/// why the [`Cast`] machinery did NOT move — it is a camera model, and it
+/// answers a different question from the one a pawn asks about itself.)
 fn grass_conceal(scenario: &Scenario, eye: Vec2, eye_h: f32, target: Vec2, target_h: f32) -> f32 {
     grass_conceal_in(eye, eye_h, target, target_h, |x, y| scenario.depth(x, y))
 }
@@ -686,23 +637,33 @@ fn grass_conceal_in(
     grass_block(eye, eye_h, target, target_h, depth_at).conceal()
 }
 
-/// What the grass on one sight line does, split into the two questions
-/// [`grass_conceal`] describes. Kept as a pair rather than folded into one
-/// number because they are the two things worth looking at when tuning, and
-/// `strip_table.rs` tabulates both.
-#[derive(Copy, Clone, Debug, Default)]
-struct Block {
-    /// Largest share of the target that any single step's grass stands over,
-    /// 0..=1 — the geometric ceiling on how much can be hidden.
-    covered: f32,
-    /// How much of the line is blocked, world units, weighted by how much of the
-    /// target each step covers. How *solid* the cover is.
-    length: f32,
+/// World units to the sim's fixed point. Rounded rather than truncated so a
+/// sight line's ends land where the renderer drew them.
+fn to_pos(v: Vec2) -> Pos {
+    Pos { x: (v.x * FP as f32).round() as i32, y: (v.y * FP as f32).round() as i32 }
 }
 
+/// The sim's [`army_ghosts_sim::Block`] in the units this side of the fence
+/// reads in: shares of a body and world units, rather than FP and subunits.
+/// A view, not a second implementation — every number in it is the sim's.
+#[derive(Copy, Clone, Debug, Default)]
+struct Block(SimBlock);
+
 impl Block {
+    /// The largest share of the target any one step's grass stands over, 0..=1.
+    /// Only the strip table reads the two terms apart; the game only ever wants
+    /// them multiplied.
+    #[cfg(test)]
+    fn covered(&self) -> f32 {
+        self.0.covered as f32 / FP as f32
+    }
+    /// How much of the line is blocked, world units.
+    #[cfg(test)]
+    fn length(&self) -> f32 {
+        self.0.length as f32 / FP as f32
+    }
     fn conceal(&self) -> f32 {
-        self.covered * (1.0 - (-GRASS_EXTINCTION * self.length).exp())
+        self.0.conceal() as f32 / FP as f32
     }
 }
 
@@ -713,23 +674,13 @@ fn grass_block(
     target_h: f32,
     depth_at: impl Fn(i32, i32) -> i32,
 ) -> Block {
-    let dist = eye.distance(target);
-    if target_h <= 0.0 || dist < 1.0 {
-        return Block::default();
-    }
-    let mut block = Block::default();
-    let step = dist * (1.0 - GRASS_NEAR_T) / GRASS_SAMPLES as f32;
-    for i in 0..GRASS_SAMPLES {
-        let t = GRASS_NEAR_T
-            + (1.0 - GRASS_NEAR_T) * (i + 1) as f32 / GRASS_SAMPLES as f32;
-        let p = eye.lerp(target, t);
-        let depth = depth_at(p.x.round() as i32, p.y.round() as i32) as f32;
-        let reaches = eye_h + (depth - eye_h) / t;
-        let share = (reaches / target_h).clamp(0.0, 1.0);
-        block.covered = block.covered.max(share);
-        block.length += share * step;
-    }
-    block
+    Block(army_ghosts_sim::grass_block(
+        to_pos(eye),
+        eye_h as i32,
+        to_pos(target),
+        target_h as i32,
+        depth_at,
+    ))
 }
 
 /// A pawn's eye height, world units — where it looks from, and (near enough)

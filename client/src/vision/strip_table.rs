@@ -158,8 +158,8 @@ fn grass_strip_table() {
          one clear hex ({gap_w} units) either side of it. No rocks or bushes, so each\n\
          number is the sprite alpha `fade_hidden` writes: 1.000 is plainly visible,\n\
          0.000 is invisible. Photograph it with tools/grass-shots.sh.\n\
-         HEX_R={HEX_R}, GRASS_EXTINCTION={GRASS_EXTINCTION}, GRASS_SAMPLES={GRASS_SAMPLES},\n\
-         STANCE_HEIGHT={STANCE_HEIGHT:?}.\n\n"
+         The model is the sim's (integer, so bots and peers agree); this measures it\n\
+         through the renderer's units. HEX_R={HEX_R}, STANCE_HEIGHT={STANCE_HEIGHT:?}.\n\n"
     ));
     out.push_str(
         "| grass depth        | west pawn | east pawn | east's alpha | west's alpha | east covered | east blocked |\n\
@@ -179,7 +179,7 @@ fn grass_strip_table() {
                 seen_west[d][w][e] = west_alpha;
                 out.push_str(&format!(
                     "| {:>2} {:<15} | {:<9} | {:<9} | {east_alpha:>12.3} | {west_alpha:>12.3} | {:>12.2} | {:>12.1} |\n",
-                    depth, label, STANCES[w], STANCES[e], block.covered, block.length,
+                    depth, label, STANCES[w], STANCES[e], block.covered(), block.length(),
                 ));
             }
         }

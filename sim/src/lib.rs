@@ -163,11 +163,45 @@ impl Pos {
     }
 }
 
-/// A player pawn, owned by the GGRS player `handle`.
+/// A pawn. `handle` is its identity everywhere in the sim — who fired a round,
+/// whose deaths these are, which spawn point it comes back at.
+///
+/// For a HUMAN pawn it is also the GGRS player handle, and `0..num_players` are
+/// exactly the human pawns. A BOT pawn carries one too, allocated above that
+/// range, because everything downstream (`Bullet::owner`, `Deaths`, the roster,
+/// `SPAWN_POINTS`) wants a small unique id and there is no reason for bots to
+/// need a second kind. What a bot does NOT have is a seat in the session: see
+/// [`Intent`] for how it is driven instead.
 #[derive(Component, Copy, Clone, Default, Debug, Hash)]
 pub struct Player {
     pub handle: usize,
 }
+
+/// What a pawn is trying to do this tick, in exactly the form a human's
+/// controller produces.
+///
+/// This is the seam that lets bots exist at all. `move_players` and
+/// `fire_bullets` used to index `PlayerInputs[player.handle]` directly, which
+/// tied "is a pawn" to "has a seat in the GGRS session" — a bot would have
+/// needed a network handle, and someone would have had to send its inputs.
+/// Now the two systems read an `Intent` and don't care where it came from:
+/// [`read_human_intent`] copies it off the wire for human pawns, and the bot
+/// brain computes it from the rolled-back world for bot pawns. Since every peer
+/// simulates every pawn from identical state, every peer computes identical bot
+/// intents — zero bandwidth, and no peer is authoritative over a bot.
+///
+/// Rollback-registered even though it is rewritten at the head of every tick
+/// and so cannot strictly go stale: a bot that ever wants hysteresis (holding a
+/// heading, committing to a rush) would evolve it, and finding out then would
+/// mean finding out as a desync.
+#[derive(Component, Copy, Clone, Default, Debug)]
+pub struct Intent(pub PlayerInput);
+
+/// Marks a pawn the sim drives itself. The brain and its state live in
+/// [`Bot`]'s fields; this is here so the intent systems can tell the two kinds
+/// of pawn apart.
+#[derive(Component, Copy, Clone, Default, Debug)]
+pub struct Bot;
 
 /// Last non-zero move direction, raw joystick range (-127..=127 per axis).
 /// Bullets fire along this. Defaults to "up".
@@ -798,27 +832,327 @@ impl Scenario {
     }
 }
 
-/// Spawn the initial world: one pawn per player, the practice targets, and the
-/// procedural rock and bush fields. Both clients run this identically before
-/// the first tick.
-pub fn spawn_world(commands: &mut Commands, num_players: usize, scenario: Scenario) {
+// ── Sight lines ─────────────────────────────────────────────────────────────
+//
+// How much of one pawn another can see. This lived in the client in f32 for as
+// long as it was only ever a rendering question — the sim can't have a view,
+// because every peer simulates every pawn. Bots changed that: a bot decides
+// from what it can see, and every peer has to reach the same decision, so the
+// answer has to be integer and it has to live here.
+//
+// What moved is the GRASS half, which is the model proper and is now shared:
+// `client/src/vision.rs` calls this rather than keeping a second copy, so what
+// hides a bot and what hides a player are the same number by construction.
+// What did NOT move is the client's `Cast` machinery. That is a *camera* model
+// — sight lines swept from two points behind either shoulder so a player can
+// peek around cover they're hugging — and it answers a different question from
+// the one a pawn asks about itself. The cover test below is pawn-centred.
+
+/// How many steps a sight line is sampled at.
+const GRASS_SAMPLES: i64 = 24;
+
+/// Sight lines are sampled at `t = (T_BASE + T_RISE * (i + 1)) / T_DEN` for `i`
+/// in `0..GRASS_SAMPLES` — the client's old `0.06 + 0.94 * (i + 1) / 24`
+/// written as an exact rational, which is what lets every division here be
+/// exact instead of nearly so. The last step lands on `t = 1` exactly.
+///
+/// Why it doesn't start at zero: `reaches` below divides by `t`, so a step at
+/// the viewer's own feet would have every blade towering over the whole target.
+/// Starting at 0.06 bounds that without pulling the near end so far in that it
+/// misses the grass a pawn is actually lying in.
+const T_DEN: i64 = 1200;
+const T_BASE: i64 = 72;
+const T_RISE: i64 = 47;
+
+/// `e^(-GRASS_EXTINCTION * n) * FP` for a blocked length of `n` whole world
+/// units, the Beer-Lambert term the f32 model called `.exp()`. A table because
+/// this is the only transcendental in the model and the argument is bounded:
+/// past ~52 units of blocked grass the answer is indistinguishable from opaque.
+///
+/// `GRASS_EXTINCTION` (0.12) does not appear anywhere else — the table *is* the
+/// constant. It is anchored on the case the mechanic exists for: two pawns
+/// lying either side of a body's width (~33 units) of shin-deep grass cannot
+/// see each other at all (`EXP_NEG[33] = 5`, i.e. alpha 0.02).
+const EXP_NEG: [i32; 65] = [
+    256, 227, 201, 179, 158, 140, 125, 111, //
+    98, 87, 77, 68, 61, 54, 48, 42, //
+    38, 33, 30, 26, 23, 21, 18, 16, //
+    14, 13, 11, 10, 9, 8, 7, 6, //
+    6, 5, 4, 4, 3, 3, 3, 2, //
+    2, 2, 2, 1, 1, 1, 1, 1, //
+    1, 1, 1, 1, 0, 0, 0, 0, //
+    0, 0, 0, 0, 0, 0, 0, 0, //
+    0,
+];
+
+/// `1 - e^(-GRASS_EXTINCTION * length)` in `0..=FP`, for a blocked `length` in
+/// subunits: how solid the grass on a line is. Linear between table entries;
+/// the curve is smooth enough that the worst interpolation error is under a
+/// fifth of a percent.
+fn extinction(length_fp: i64) -> i32 {
+    let fp = FP as i64;
+    let n = length_fp.div_euclid(fp);
+    if n >= EXP_NEG.len() as i64 - 1 {
+        return FP;
+    }
+    let (a, b) = (EXP_NEG[n as usize] as i64, EXP_NEG[n as usize + 1] as i64);
+    let decay = a + (b - a) * length_fp.rem_euclid(fp) / fp;
+    (fp - decay) as i32
+}
+
+/// What the grass on one sight line does, split into the two questions that
+/// make the model work. Kept as a pair rather than folded into one number
+/// because they are the two things worth looking at when tuning, and the strip
+/// table tabulates both.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Block {
+    /// The largest share of the target that any single step's grass stands
+    /// over, `0..=FP` — the geometric ceiling on how much can be hidden. If the
+    /// tallest blade between you only reaches his knees, his head is in clear
+    /// air and no amount of distance hides it.
+    pub covered: i32,
+    /// How much of the line is blocked, subunits, weighted by that share. How
+    /// *solid* the cover is, and the only place distance enters.
+    pub length: i64,
+}
+
+impl Block {
+    /// The two terms multiplied: the ceiling, times how opaque the grass under
+    /// it is.
+    pub fn conceal(&self) -> i32 {
+        (self.covered as i64 * extinction(self.length) as i64 / FP as i64) as i32
+    }
+}
+
+/// Subunits to world units, rounded — which sample point a step lands on.
+fn round_units(fp: i64) -> i32 {
+    (fp + FP as i64 / 2).div_euclid(FP as i64) as i32
+}
+
+/// A pawn's height in this stance, world units: where it looks from, and
+/// (near enough) how far up it can be seen.
+pub fn stance_height(stance: u8) -> i32 {
+    STANCE_HEIGHT[(stance as usize).min(STANCE_COUNT - 1)]
+}
+
+/// What the grass on one sight line does, over an arbitrary depth field rather
+/// than a scenario's. The strip table needs the closure: it sweeps depths the
+/// arena doesn't contain.
+///
+/// Grass isn't a set of casters, it's a depth field, so it gets an elevation
+/// test rather than a shadow. Walk the line, and at each step ask how high up
+/// the target a sight line grazing the blade tips there would land. A blade of
+/// depth `g` at fraction `t`, seen from an eye at height `E`, hides everything
+/// on the target below `E + (g - E) / t` (similar triangles: the line through
+/// the tip carries on to the target plane). The share of the body under that
+/// line is how much *this* step hides.
+///
+/// Those shares combine as TWO separate questions, and keeping them apart is
+/// what makes the model behave — see [`Block`]. Multiplying them says: the part
+/// of him below the grass line is hidden as completely as the depth of grass in
+/// the way allows, and the part above it is always visible. Which is the answer
+/// you'd give looking at the situation.
+///
+/// **Beer-Lambert over the blocked length ALONE was the previous model, and its
+/// failure is worth remembering**: with no geometric ceiling, enough distance
+/// hid anybody behind anything, so ankle-deep grass eventually erased a
+/// standing man — while 30 units of shin-deep grass, which you genuinely cannot
+/// see a prone man through, dimmed him by a quarter. Both directions were wrong
+/// at once. The `covered` term is the fix.
+///
+/// Two things fall out of the geometry rather than being written into it:
+///   * **Grass at the target's own feet (`t = 1`) hides it up to `g`** — which
+///     is [`grass_cover`], the standing-in-it rule, as the limiting case of this
+///     one. With `covered` taking the worst step, that rule is the model's
+///     ceiling exactly, not merely its cousin.
+///   * **Lying down costs you sight as well as buying it.** A prone eye is 15
+///     units up, so grass deeper than that covers every target completely; what
+///     is left is the length term, so a prone pawn sees a body's width into the
+///     field and no further. Going flat is for breaking contact, not fighting.
+///
+/// Note what a TILED field does to this: a long line crosses many tiles and
+/// `covered` takes the DEEPEST, so range costs visibility in steps as the line
+/// picks up deeper tiles — which is why the arena numbers keep falling with
+/// distance even though `length` saturates within ~50 units.
+pub fn grass_block(
+    eye: Pos,
+    eye_h: i32,
+    target: Pos,
+    target_h: i32,
+    depth_at: impl Fn(i32, i32) -> i32,
+) -> Block {
+    let (dx, dy) = ((target.x - eye.x) as i64, (target.y - eye.y) as i64);
+    let dist = isqrt(dx * dx + dy * dy);
+    if target_h <= 0 || dist < FP as i64 {
+        return Block::default();
+    }
+    let fp = FP as i64;
+    // One step's arc. Only `1 - t0` of the line is sampled.
+    let step = dist * (T_DEN - T_BASE) / T_DEN / GRASS_SAMPLES;
+    let mut block = Block::default();
+    for i in 0..GRASS_SAMPLES {
+        let t = T_BASE + T_RISE * (i + 1);
+        let px = eye.x as i64 + dx * t / T_DEN;
+        let py = eye.y as i64 + dy * t / T_DEN;
+        let depth = depth_at(round_units(px), round_units(py)) as i64;
+        // Similar triangles, written over a common denominator so it stays one
+        // exact division.
+        let reaches = eye_h as i64 * t + (depth - eye_h as i64) * T_DEN;
+        let share = (reaches * fp / (t * target_h as i64)).clamp(0, fp);
+        block.covered = block.covered.max(share as i32);
+        block.length += share * step / fp;
+    }
+    block
+}
+
+/// How much of a pawn at `target` the grass hides from an eye at `eye`,
+/// `0..=FP`. The eye is the pawn itself, not a camera behind it — peeking
+/// *around* a field of grass isn't a thing.
+pub fn grass_conceal(
+    scenario: &Scenario,
+    eye: Pos,
+    eye_stance: u8,
+    target: Pos,
+    target_stance: u8,
+) -> i32 {
+    grass_block(
+        eye,
+        stance_height(eye_stance),
+        target,
+        stance_height(target_stance),
+        |x, y| scenario.depth(x, y),
+    )
+    .conceal()
+}
+
+/// A circle that blocks sight: a boulder or a bush. Built once per tick and
+/// shared across every query, because a pairwise sweep over 8 pawns asks 56
+/// times and rebuilding the field each time would dominate.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Occluder {
+    pub pos: Pos,
+    pub r: i32,
+}
+
+/// Whether the segment `a`..`b` passes within `r` world units of `c`.
+///
+/// The clamped-projection form, deliberately: [`Sweep::entry`] solves the same
+/// geometry but is sized for one tick of bullet travel, and its `half_b * half_b`
+/// overflows `i64` on a segment stretched across the arena. This one never
+/// squares anything larger than a coordinate.
+fn segment_hits_circle(a: Pos, b: Pos, c: Pos, r: i32) -> bool {
+    let (dx, dy) = ((b.x - a.x) as i64, (b.y - a.y) as i64);
+    let (fx, fy) = ((c.x - a.x) as i64, (c.y - a.y) as i64);
+    let rr = radius_fp(r);
+    let dd = dx * dx + dy * dy;
+    if dd == 0 {
+        return fx * fx + fy * fy <= rr * rr;
+    }
+    let t = (fx * dx + fy * dy).clamp(0, dd);
+    let (px, py) = (fx - dx * t / dd, fy - dy * t / dd);
+    px * px + py * py <= rr * rr
+}
+
+/// Whether `p` is inside `o`.
+fn inside(o: &Occluder, p: Pos) -> bool {
+    let (dx, dy) = ((p.x - o.pos.x) as i64, (p.y - o.pos.y) as i64);
+    let rr = radius_fp(o.r);
+    dx * dx + dy * dy <= rr * rr
+}
+
+/// How far across the body the four outer sample points sit, subunits. The same
+/// spread the renderer fades on, so someone edging out of cover comes into view
+/// gradually instead of popping.
+const BODY_REACH: i32 = PLAYER_R * 7 / 10 * FP;
+
+/// How much of the pawn at `target` the pawn at `eye` can see, `0..=FP`.
+///
+/// Cover and grass answer separately and multiply, exactly as the renderer's
+/// fade does. Cover is sampled at five points across the body — centre plus
+/// four edges, which is Counter-Strike's gut/head/feet/left/right test in the
+/// shape this game's geometry takes — so it degrades in fifths rather than
+/// snapping between hidden and seen.
+///
+/// `occluders` is every boulder and bush; build it once a tick. Note what is
+/// deliberately absent: cover the EYE is already inside doesn't occlude it.
+/// Standing in a bush hides you without blinding you, and that has to be true
+/// here for the same reason it's true on screen.
+pub fn visible_fraction(
+    scenario: &Scenario,
+    eye: Pos,
+    eye_stance: u8,
+    target: Pos,
+    target_stance: u8,
+    occluders: &[Occluder],
+) -> i32 {
+    let offsets = [
+        (0, 0),
+        (BODY_REACH, 0),
+        (-BODY_REACH, 0),
+        (0, BODY_REACH),
+        (0, -BODY_REACH),
+    ];
+    let mut clear = 0;
+    for (ox, oy) in offsets {
+        let p = Pos { x: target.x + ox, y: target.y + oy };
+        let blocked = occluders
+            .iter()
+            .any(|o| !inside(o, eye) && segment_hits_circle(eye, p, o.pos, o.r));
+        if !blocked {
+            clear += 1;
+        }
+    }
+    if clear == 0 {
+        return 0;
+    }
+    let seen = clear * FP / offsets.len() as i32;
+    let grass = grass_conceal(scenario, eye, eye_stance, target, target_stance);
+    (seen as i64 * (FP - grass) as i64 / FP as i64) as i32
+}
+
+/// Everything every pawn has, human or bot. Kept in one place so the two kinds
+/// can't drift apart — a bot that was missing a component the sim's systems
+/// filter on would simply stop being simulated, silently.
+fn spawn_pawn(commands: &mut Commands, handle: usize, x: i32, y: i32) -> Entity {
+    commands
+        .spawn((
+            Player { handle },
+            Intent::default(),
+            Pos::from_units(x, y),
+            Facing::default(),
+            Cooldown::default(),
+            Stance::default(),
+            Health::default(),
+            Deaths::default(),
+        ))
+        .add_rollback()
+        .id()
+}
+
+/// Spawn the initial world: one pawn per player, `num_bots` more the sim drives
+/// itself, the practice targets, and the procedural rock and bush fields. Both
+/// clients run this identically before the first tick.
+///
+/// Bots take handles straight on from the humans, so the pawns are always
+/// `0..num_players + num_bots` with no gaps — and that total is capped at
+/// [`MAX_PLAYERS`], because [`SPAWN_POINTS`] is what there is room for.
+pub fn spawn_world(
+    commands: &mut Commands,
+    num_players: usize,
+    num_bots: usize,
+    scenario: Scenario,
+) {
     if let Scenario::GrassStrip { east_stance, .. } = scenario {
         spawn_grass_strip(commands, east_stance);
         return;
     }
-    for handle in 0..num_players {
+    let total = (num_players + num_bots).min(MAX_PLAYERS);
+    for handle in 0..total {
         let (x, y) = SPAWN_POINTS[handle];
-        commands
-            .spawn((
-                Player { handle },
-                Pos::from_units(x, y),
-                Facing::default(),
-                Cooldown::default(),
-                Stance::default(),
-                Health::default(),
-                Deaths::default(),
-            ))
-            .add_rollback();
+        let pawn = spawn_pawn(commands, handle, x, y);
+        if handle >= num_players {
+            commands.entity(pawn).insert(Bot);
+        }
     }
     for (x, y) in TARGET_POINTS {
         commands
@@ -848,17 +1182,10 @@ fn spawn_grass_strip(commands: &mut Commands, east_stance: u8) {
         (0, -STRIP_STANDOFF, 127, STANCE_STAND),
         (1, STRIP_STANDOFF, -127, east_stance.min(STANCE_PRONE)),
     ] {
+        let pawn = spawn_pawn(commands, handle, x, 0);
         commands
-            .spawn((
-                Player { handle },
-                Pos::from_units(x, 0),
-                Facing { x: toward, y: 0 },
-                Cooldown::default(),
-                Stance { level, change: 0 },
-                Health::default(),
-                Deaths::default(),
-            ))
-            .add_rollback();
+            .entity(pawn)
+            .insert((Facing { x: toward, y: 0 }, Stance { level, change: 0 }));
     }
 }
 
@@ -1006,6 +1333,8 @@ impl<C: Config<Input = PlayerInput>> Plugin for SimPlugin<C> {
         app.insert_resource(RollbackFrameRate(TICK_HZ))
             .rollback_component_with_copy::<Pos>()
             .rollback_component_with_copy::<Player>()
+            .rollback_component_with_copy::<Intent>()
+            .rollback_component_with_copy::<Bot>()
             .rollback_component_with_copy::<Facing>()
             .rollback_component_with_copy::<Cooldown>()
             .rollback_component_with_copy::<Stance>()
@@ -1032,8 +1361,13 @@ impl<C: Config<Input = PlayerInput>> Plugin for SimPlugin<C> {
             .add_systems(
                 GgrsSchedule,
                 (
-                    move_players::<C>,
-                    fire_bullets::<C>,
+                    // Intent first, and nothing before it: both intent systems
+                    // want the world as the previous tick left it — fully
+                    // settled, including respawns — and everything after them
+                    // wants this tick's decisions.
+                    read_human_intent::<C>,
+                    move_players,
+                    fire_bullets,
                     move_bullets,
                     resolve_hits,
                     tick_targets,
@@ -1046,9 +1380,27 @@ impl<C: Config<Input = PlayerInput>> Plugin for SimPlugin<C> {
 
 // ── Fixed-tick systems (run inside the GGRS rollback schedule) ──────────────
 
-fn move_players<C: Config<Input = PlayerInput>>(
+/// Copy this tick's inputs off the wire onto the human pawns.
+///
+/// Guarded with `get` rather than indexed: a pawn whose handle has no seat in
+/// the session is a bug, but it should not be a panic in the middle of a
+/// rollback. Bot pawns are excluded — their handles are deliberately outside
+/// the session's range.
+fn read_human_intent<C: Config<Input = PlayerInput>>(
     inputs: Res<PlayerInputs<C>>,
-    mut players: Query<(&Player, &mut Pos, &mut Facing, &mut Stance, &Health)>,
+    mut pawns: Query<(&Player, &mut Intent), Without<Bot>>,
+) {
+    for (player, mut intent) in &mut pawns {
+        if let Some(&(input, _status)) = inputs.get(player.handle) {
+            intent.0 = input;
+        }
+    }
+}
+
+/// `With<Player>` is load-bearing, not decoration: it is what makes this query
+/// provably disjoint from the `Without<Player>` one below, and both touch `Pos`.
+fn move_players(
+    mut players: Query<(&Intent, &mut Pos, &mut Facing, &mut Stance, &Health), With<Player>>,
     rocks: Query<(&Rock, &Pos), Without<Player>>,
 ) {
     // Sorted: resolving overlaps in a different order could land a pinched
@@ -1060,13 +1412,13 @@ fn move_players<C: Config<Input = PlayerInput>>(
         .collect();
     cover.sort_unstable();
 
-    for (player, mut pos, mut facing, mut stance, health) in &mut players {
+    for (intent, mut pos, mut facing, mut stance, health) in &mut players {
         // The dead hold still: no drifting, no turning, no getting up out of
         // prone while you wait. `respawn_players` puts them back.
         if !health.alive() {
             continue;
         }
-        let (input, _status) = inputs[player.handle];
+        let input = intent.0;
         // Stance first: the requested level rides in the input bits, so every
         // peer starts (and finishes) the same transition on the same tick.
         stance.advance(input.stance());
@@ -1125,16 +1477,15 @@ fn push_out_of_cover(pos: &mut Pos, cover: &[(i32, i32, i32)]) {
     }
 }
 
-fn fire_bullets<C: Config<Input = PlayerInput>>(
+fn fire_bullets(
     mut commands: Commands,
-    inputs: Res<PlayerInputs<C>>,
-    mut players: Query<(&Player, &Pos, &Facing, &mut Cooldown, &Health)>,
+    mut players: Query<(&Player, &Intent, &Pos, &Facing, &mut Cooldown, &Health)>,
 ) {
-    for (player, pos, facing, mut cooldown, health) in &mut players {
+    for (player, intent, pos, facing, mut cooldown, health) in &mut players {
         if cooldown.0 > 0 {
             cooldown.0 -= 1;
         }
-        let (input, _status) = inputs[player.handle];
+        let input = intent.0;
         if !input.fire() || cooldown.0 > 0 || !health.alive() {
             continue;
         }
@@ -1707,5 +2058,341 @@ mod tests {
                 assert!(!within(x, y, ox, oy, r.r + o.r + 2 * PLAYER_R), "rocks {i}/{j} pinch");
             }
         }
+    }
+
+    // ── Sight lines ─────────────────────────────────────────────────────────
+
+    /// The f32 model this was ported from, verbatim, so the port can be checked
+    /// against the thing it replaced instead of against its own assertions.
+    /// If this ever has to change to keep the test passing, the port drifted.
+    pub(super) fn f32_conceal(
+        eye: (f32, f32),
+        eye_h: f32,
+        target: (f32, f32),
+        target_h: f32,
+        depth: &dyn Fn(i32, i32) -> i32,
+    ) -> f32 {
+        const SAMPLES: i32 = 24;
+        const NEAR_T: f32 = 0.06;
+        const EXTINCTION: f32 = 0.12;
+        let dist = ((target.0 - eye.0).powi(2) + (target.1 - eye.1).powi(2)).sqrt();
+        if target_h <= 0.0 || dist < 1.0 {
+            return 0.0;
+        }
+        let (mut covered, mut length) = (0.0f32, 0.0f32);
+        let step = dist * (1.0 - NEAR_T) / SAMPLES as f32;
+        for i in 0..SAMPLES {
+            let t = NEAR_T + (1.0 - NEAR_T) * (i + 1) as f32 / SAMPLES as f32;
+            let px = eye.0 + (target.0 - eye.0) * t;
+            let py = eye.1 + (target.1 - eye.1) * t;
+            let d = depth(px.round() as i32, py.round() as i32) as f32;
+            let reaches = eye_h + (d - eye_h) / t;
+            let share = (reaches / target_h).clamp(0.0, 1.0);
+            covered = covered.max(share);
+            length += share * step;
+        }
+        covered * (1.0 - (-EXTINCTION * length).exp())
+    }
+
+    /// The port is faithful: over every stance pairing, every grass depth and a
+    /// spread of ranges, the integer answer tracks the f32 one it replaced.
+    ///
+    /// This sweeps a UNIFORM field on purpose — it isolates the arithmetic from
+    /// the tile quantization, which `integer_and_f32_agree_on_the_tiled_arena`
+    /// covers separately and which is where the two genuinely can diverge.
+    #[test]
+    fn integer_concealment_matches_the_f32_model_it_replaced() {
+        let mut worst = 0.0f32;
+        let mut worst_case = String::new();
+        for depth in [0, 8, GRASS_BARE_BELOW, 15, 24, 33, 44, GRASS_MAX_H, 64] {
+            let field = move |_x: i32, _y: i32| depth;
+            for eye_stance in 0..STANCE_COUNT as u8 {
+                for target_stance in 0..STANCE_COUNT as u8 {
+                    for range in [20, 40, 80, 150, 300] {
+                        let got = grass_block(
+                            Pos::from_units(0, 0),
+                            stance_height(eye_stance),
+                            Pos::from_units(range, 0),
+                            stance_height(target_stance),
+                            field,
+                        )
+                        .conceal() as f32
+                            / FP as f32;
+                        let want = f32_conceal(
+                            (0.0, 0.0),
+                            stance_height(eye_stance) as f32,
+                            (range as f32, 0.0),
+                            stance_height(target_stance) as f32,
+                            &field,
+                        );
+                        let err = (got - want).abs();
+                        if err > worst {
+                            worst = err;
+                            worst_case = format!(
+                                "depth {depth}, eye {eye_stance} -> target {target_stance} \
+                                 at {range}u: integer {got:.4} vs f32 {want:.4}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(worst < 0.02, "port drifted from the f32 model: {worst_case}");
+    }
+
+    /// The same comparison over the REAL tiled field, which is the hard case and
+    /// the one worth stating a number for.
+    ///
+    /// Integer sample points can round to the far side of a hex edge from where
+    /// the f32 ones landed, and since `covered` takes the WORST step, one
+    /// reassigned sample near a boundary moves the answer by a whole tile's
+    /// depth. So the tolerance here is much looser than the uniform-field one
+    /// above, and deliberately so — this test exists to bound that effect and
+    /// notice if it ever stops being an edge case. It prints the worst offender
+    /// either way, so a failure explains itself.
+    #[test]
+    fn integer_and_f32_agree_on_the_tiled_arena() {
+        let field = |x: i32, y: i32| Scenario::Arena.depth(x, y);
+        let (mut worst, mut worst_case) = (0.0f32, String::new());
+        let (mut n, mut sum) = (0, 0.0f32);
+        for eye_stance in 0..STANCE_COUNT as u8 {
+            for target_stance in 0..STANCE_COUNT as u8 {
+                for range in [40, 80, 150, 300] {
+                    for &(sx, sy) in SPAWN_POINTS.iter() {
+                        let got = grass_block(
+                            Pos::from_units(sx, sy),
+                            stance_height(eye_stance),
+                            Pos::from_units(sx + range, sy),
+                            stance_height(target_stance),
+                            field,
+                        )
+                        .conceal() as f32
+                            / FP as f32;
+                        let want = f32_conceal(
+                            (sx as f32, sy as f32),
+                            stance_height(eye_stance) as f32,
+                            ((sx + range) as f32, sy as f32),
+                            stance_height(target_stance) as f32,
+                            &field,
+                        );
+                        let err = (got - want).abs();
+                        sum += err;
+                        n += 1;
+                        if err > worst {
+                            worst = err;
+                            worst_case = format!(
+                                "from ({sx},{sy}) +{range}u, eye {eye_stance} -> \
+                                 target {target_stance}: integer {got:.4} vs f32 {want:.4}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let mean = sum / n as f32;
+        println!("tiled-field port error over {n} lines: mean {mean:.4}, worst {worst:.4}");
+        println!("  worst: {worst_case}");
+
+        // The lane CLAUDE.md quotes numbers for, both ways, so the prose can be
+        // checked against the code rather than trusted.
+        println!("  the documented lane, from (-150,0) east:");
+        for (eye_stance, target_stance, range) in
+            [(0u8, 0u8, 40), (0, 0, 80), (0, 0, 150), (2, 0, 40), (2, 0, 80)]
+        {
+            let got = FP
+                - grass_block(
+                    Pos::from_units(-150, 0),
+                    stance_height(eye_stance),
+                    Pos::from_units(-150 + range, 0),
+                    stance_height(target_stance),
+                    field,
+                )
+                .conceal();
+            let want = 1.0
+                - f32_conceal(
+                    (-150.0, 0.0),
+                    stance_height(eye_stance) as f32,
+                    ((-150 + range) as f32, 0.0),
+                    stance_height(target_stance) as f32,
+                    &field,
+                );
+            println!(
+                "    eye {eye_stance} -> target {target_stance} at {range:>3}u: \
+                 integer {:.3}, f32 {want:.3}",
+                got as f32 / FP as f32
+            );
+        }
+        assert!(mean < 0.02, "port drifts on the tiled field on average: mean {mean:.4}");
+        assert!(worst < 0.25, "port drifts badly somewhere on the tiled field: {worst_case}");
+    }
+
+    /// The spec the whole concealment model is anchored on: two pawns lying
+    /// either side of a body's width of shin-deep grass cannot see each other.
+    /// `GRASS_EXTINCTION` was chosen to make this true and the extinction table
+    /// carries it, so this is what would catch the table being regenerated
+    /// wrong.
+    #[test]
+    fn prone_pawns_cannot_see_through_shin_deep_grass() {
+        let shin = 33;
+        let field = |_x: i32, _y: i32| shin;
+        let seen = FP
+            - grass_block(
+                Pos::from_units(0, 0),
+                stance_height(STANCE_PRONE),
+                Pos::from_units(33, 0),
+                stance_height(STANCE_PRONE),
+                field,
+            )
+            .conceal();
+        assert!(
+            seen * 100 / FP <= 5,
+            "prone through {shin}u of shin-deep grass: {seen}/{FP} visible, want <= 5%"
+        );
+    }
+
+    /// The guards that stop the above being satisfied by hiding everyone always:
+    /// bare ground hides nobody, and deeper grass never hides less.
+    #[test]
+    fn grass_conceals_monotonically_and_bare_ground_conceals_nothing() {
+        let bare = |_x: i32, _y: i32| 0;
+        for stance in 0..STANCE_COUNT as u8 {
+            let c = grass_block(
+                Pos::from_units(0, 0),
+                stance_height(stance),
+                Pos::from_units(60, 0),
+                stance_height(stance),
+                bare,
+            )
+            .conceal();
+            assert_eq!(c, 0, "bare ground hid a stance-{stance} pawn");
+        }
+        let mut last = -1;
+        for depth in 0..=GRASS_MAX_H {
+            let field = move |_x: i32, _y: i32| depth;
+            let c = grass_block(
+                Pos::from_units(0, 0),
+                stance_height(STANCE_STAND),
+                Pos::from_units(60, 0),
+                stance_height(STANCE_STAND),
+                field,
+            )
+            .conceal();
+            assert!(c >= last, "depth {depth} concealed less than {}", depth - 1);
+            last = c;
+        }
+    }
+
+    /// `covered` is a ceiling, not an accumulator: grass that only reaches a
+    /// standing pawn's knees leaves his head in clear air however far the line
+    /// runs through it. This is the property the predecessor model lacked — it
+    /// let enough distance hide anybody behind anything.
+    #[test]
+    fn short_grass_never_hides_a_standing_pawn_however_far_it_runs() {
+        let knee = |_x: i32, _y: i32| 20;
+        let far = grass_block(
+            Pos::from_units(0, 0),
+            stance_height(STANCE_STAND),
+            Pos::from_units(600, 0),
+            stance_height(STANCE_STAND),
+            knee,
+        );
+        let visible = FP - far.conceal();
+        assert!(
+            visible * 100 / FP >= 30,
+            "knee-deep grass erased a standing pawn at 600u: only {visible}/{FP} visible"
+        );
+    }
+
+    /// Cover blocks sight, and — the part that is easy to get backwards — cover
+    /// you are standing INSIDE does not blind you. A pawn in a bush is hidden
+    /// by it, not blinkered by it.
+    #[test]
+    fn cover_blocks_sight_without_blinding_whoever_is_inside_it() {
+        let bare = Scenario::GrassStrip { depth: 0, east_stance: STANCE_STAND };
+        let (eye, target) = (Pos::from_units(-60, 0), Pos::from_units(60, 0));
+
+        let clear = visible_fraction(&bare, eye, STANCE_STAND, target, STANCE_STAND, &[]);
+        assert_eq!(clear, FP, "nothing in the way, yet not fully visible");
+
+        let between = [Occluder { pos: Pos::from_units(0, 0), r: 30 }];
+        let blocked = visible_fraction(&bare, eye, STANCE_STAND, target, STANCE_STAND, &between);
+        assert_eq!(blocked, 0, "a 30u boulder dead between them did not block");
+
+        // The same boulder, with the viewer inside it.
+        let inside_it = visible_fraction(
+            &bare,
+            Pos::from_units(0, 0),
+            STANCE_STAND,
+            target,
+            STANCE_STAND,
+            &between,
+        );
+        assert_eq!(inside_it, FP, "cover the eye is inside blinded it");
+    }
+
+    /// Cover degrades in fifths rather than snapping: someone edging out from
+    /// behind a boulder is partly visible before they are wholly visible.
+    #[test]
+    fn cover_degrades_across_the_body() {
+        let bare = Scenario::GrassStrip { depth: 0, east_stance: STANCE_STAND };
+        let eye = Pos::from_units(-60, 0);
+        let rock = [Occluder { pos: Pos::from_units(0, 0), r: 12 }];
+        // Far enough at the top of the sweep that the body's NEAR edge is clear
+        // too, not just its centre — at half this offset the lower sample point
+        // is still behind the rock and the answer is 4/5.
+        let seen: Vec<i32> = (0..=5)
+            .map(|step| {
+                visible_fraction(
+                    &bare,
+                    eye,
+                    STANCE_STAND,
+                    Pos::from_units(60, step * 12),
+                    STANCE_STAND,
+                    &rock,
+                )
+            })
+            .collect();
+        assert_eq!(seen[0], 0, "dead behind the rock, yet visible");
+        assert_eq!(*seen.last().unwrap(), FP, "well clear of the rock, yet hidden");
+        assert!(
+            seen.windows(2).all(|w| w[1] >= w[0]),
+            "edging out of cover did not reveal monotonically: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|&v| v > 0 && v < FP),
+            "cover snapped from hidden to seen with no partial step: {seen:?}"
+        );
+    }
+
+    /// Prone-to-prone is hidden everywhere in the arena — the field is deep
+    /// enough that going flat genuinely breaks contact, which is the mechanic
+    /// the depth band was tuned for.
+    #[test]
+    fn prone_pawns_are_hidden_across_the_whole_arena() {
+        let arena = Scenario::Arena;
+        let (mut buried, mut total) = (0, 0);
+        for &(sx, sy) in SPAWN_POINTS.iter() {
+            for &(tx, ty) in SPAWN_POINTS.iter() {
+                if (sx, sy) == (tx, ty) {
+                    continue;
+                }
+                total += 1;
+                let prone = visible_fraction(
+                    &arena,
+                    Pos::from_units(sx, sy),
+                    STANCE_PRONE,
+                    Pos::from_units(tx, ty),
+                    STANCE_PRONE,
+                    &[],
+                );
+                if prone * 100 / FP < 5 {
+                    buried += 1;
+                }
+            }
+        }
+        assert_eq!(
+            buried, total,
+            "prone-to-prone across the arena should be hidden everywhere, {buried}/{total} were"
+        );
     }
 }

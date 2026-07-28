@@ -167,6 +167,43 @@ Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_SIGNALING` env vars.
     Any test that needs a clear shot must pick its lane deliberately —
     `sim/tests/combat.rs` fires spawn 2 → spawn 3 and asserts `lane_is_clear`
     up front, so a reseeded field fails saying what actually changed.
+- **Pawns are not seats** (`sim/src/lib.rs`: `Intent`, `Bot`, `read_human_intent`).
+  `move_players`/`fire_bullets` used to index `PlayerInputs[player.handle]`
+  directly, which made "is a pawn" and "has a seat in the GGRS session" the same
+  thing — a bot would have needed a network handle and someone to send its
+  inputs. They now read an **`Intent`** (a `PlayerInput` in component form) and
+  don't care where it came from: `read_human_intent` copies it off the wire for
+  human pawns, and the bot brain computes it from the rolled-back world for bot
+  pawns. Since every peer simulates every pawn from identical state, every peer
+  computes identical bot intents — **zero bandwidth, and no peer is
+  authoritative over a bot.**
+  `Player.handle` stays the pawn's identity everywhere (`Bullet::owner`,
+  `Deaths`, the roster, `SPAWN_POINTS`); bots take handles straight on from the
+  humans, so pawns are always `0..players+bots` with no gaps, capped at
+  `MAX_PLAYERS` because that's how many spawn points there are.
+  Things that are easy to get wrong here:
+  * `read_human_intent` uses `inputs.get(handle)`, NOT `inputs[handle]` — a bot's
+    handle is deliberately outside the session's range, and a stray one should
+    not panic in the middle of a rollback.
+  * `move_players` keeps `With<Player>` even though it no longer reads `Player`.
+    It is load-bearing: it's what makes the query provably disjoint from the
+    `Without<Player>` rock query, and both touch `Pos`. Drop it and bevy panics
+    with B0001 on the first tick.
+  * Intent runs FIRST in `GgrsSchedule` and nothing precedes it, because both
+    intent systems want the world exactly as the previous tick left it —
+    respawns included.
+  * `Intent` is rollback-registered even though it's rewritten every tick and so
+    can't strictly go stale. A bot that ever wants hysteresis (holding a heading,
+    committing to a rush) would evolve it, and finding out then means finding out
+    as a desync.
+  * **Bot count in a room must be AGREED, not configured.** `?bots=N`/`AG_BOTS`
+    is offline only; `finalize_p2p_session` passes 0 deliberately, because two
+    peers joining with different `?bots=` build different worlds, which is a
+    desync before the first tick. In a room it has to ride in the host's start
+    roster.
+  `sim/tests/combat.rs` `bot_pawns_are_simulated_without_a_session_seat` builds a
+  session for 4 handles and a world with 8 pawns; it runs at `check_distance(2)`,
+  so bot state that isn't rollback-safe fails there rather than in a match.
 - **Character art** (`tools/gen_assets.py` `gen_soldier` + `client/src/render.rs`):
   the soldier is modelled ONCE in 3D — capsules in character space, x right,
   y forward, z up, origin on the ground between the feet — then rotated about z
@@ -381,7 +418,27 @@ Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_SIGNALING` env vars.
   (that was `RIM_FEATHER`, the blur skirts and a per-pixel feather in
   `fog.wgsl` — `git log` if it's wanted back), and a tile carries ONE color, so
   bush haze no longer tints greener than boulder grey, only weaker.
-  **Grass concealment** (`grass_conceal`): a blade of depth `g` at fraction `t`
+  **Grass concealment** — **the model lives in the SIM** (`sim/src/lib.rs`
+  `grass_block`/`Block`/`visible_fraction`), in integer math, and the client
+  calls it. It moved there when bots arrived: a bot decides from what it can
+  see and every peer must reach the same decision, so the answer has to be
+  integer and it has to be somewhere both the sim and the renderer can ask.
+  `client/src/vision.rs` keeps only unit conversion (`Vec2`/f32 shares ⟷ `Pos`/FP),
+  so there is exactly ONE implementation and what hides a bot is what hides a
+  player by construction rather than by agreement.
+  The port is checked, not asserted: `integer_concealment_matches_the_f32_model_it_replaced`
+  reimplements the old f32 model verbatim and requires agreement within 2% over
+  every stance pairing × 9 depths × 5 ranges, and
+  `integer_and_f32_agree_on_the_tiled_arena` bounds the harder case — integer
+  sample points can round to the far side of a hex edge from where the f32 ones
+  landed, and since `covered` takes the WORST step, one reassigned sample moves
+  the answer by a whole tile's depth. Measured: mean 0.0019, worst 0.0099.
+  What did NOT move is `Cast`. That is a *camera* model — sight lines swept from
+  behind either shoulder so you can peek around cover you're hugging — and it
+  answers a different question from the one a pawn asks about itself, so the
+  cover term is deliberately split: shoulder cameras for the player's view,
+  a pawn-centred segment test (`visible_fraction`) for bots.
+  The geometry: a blade of depth `g` at fraction `t`
   along the sight line, seen from an eye at height `E` (the viewer's
   `STANCE_HEIGHT`), hides the target up to `E + (g - E) / t` — similar triangles.
   The share of the body under that line then answers TWO questions, and keeping
@@ -394,16 +451,26 @@ Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_SIGNALING` env vars.
     that grass is. Blades have gaps, so a hand's width is a screen you see
     through and a body's width is opaque. The ONLY place distance enters.
   Concealment is their product, so `grass_cover` (depth / `STANCE_HEIGHT`) is now
-  exactly the ceiling rather than a cousin of it. `GRASS_EXTINCTION` is 0.12,
-  anchored on the case the mechanic exists for: **two pawns lying either side of
-  a body's width (~33 units) of shin-deep grass cannot see each other at all**
-  (alpha 0.017 — `tools/grass-table.sh` asserts it). In the arena the answer
-  depends on the tiles the line crosses, which is the point; down the spawn lane
-  a standing viewer sees a standing target at alpha ~0.92 at 40 units, ~0.50 at
-  80, ~0.30 at 150, and a prone one is gone past 80. A prone VIEWER is not
-  automatically blind any more — in a short tile it still sees a standing pawn at
-  ~0.57 at 40 units — but it loses everything past ~80. Going flat is mostly for
-  breaking contact; where it also lets you fight depends on the tile you picked.
+  exactly the ceiling rather than a cousin of it. The extinction constant is
+  **0.12 and no longer appears as a number anywhere** — it was folded into the
+  integer `EXP_NEG` table, which *is* the constant now; tune it there and
+  regenerate. It is anchored on the case the mechanic exists for: **two pawns
+  lying either side of a body's width (~33 units) of shin-deep grass cannot see
+  each other at all** (alpha 0.020, asserted by both `tools/grass-table.sh` and
+  the sim's `prone_pawns_cannot_see_through_shin_deep_grass`).
+  In the arena the answer depends on the tiles the line crosses, which is the
+  point. Down the documented lane (viewer at (-150, 0), looking east) a standing
+  viewer sees a standing target at alpha **0.875 at 40 units, 0.449 at 80, 0.266
+  at 150**, and a prone one is gone past 80. A prone VIEWER is not automatically
+  blind, but it is close: it sees a standing pawn at **0.121 at 40 units** and
+  0.004 at 80. Going flat is for breaking contact; whether it also lets you
+  fight depends entirely on the tile you picked.
+  NOTE these figures are measured, and the previous set written here (0.92 /
+  0.50 / 0.30, and 0.57 for the prone viewer) was stale — it came from an
+  intermediate run before the final field constants landed, and was wrong at the
+  commit that introduced it. The sim test `integer_and_f32_agree_on_the_tiled_arena`
+  now prints this exact lane every run, so the prose can be checked against the
+  code instead of trusted.
   The predecessor was extinction over the blocked length ALONE, with no
   geometric ceiling, and it was wrong in both directions at once: enough distance
   hid anybody behind anything (ankle-deep grass eventually erased a standing

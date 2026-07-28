@@ -38,6 +38,10 @@ pub struct LaunchConfig {
     /// Which world to build. Always [`Scenario::Arena`] in a real match; the
     /// measuring rig is offline-only (see [`parse_scenario`]).
     pub scenario: Scenario,
+    /// How many bot pawns to spawn alongside the humans. The menu is the usual
+    /// way in; this is the starting value, so a test can ask for a full arena
+    /// without touching the UI (`?bots=5`, `AG_BOTS=5`).
+    pub bots: usize,
 }
 
 const DEFAULT_SIGNALING: &str = "ws://127.0.0.1:3536";
@@ -54,6 +58,16 @@ fn resolve_players(explicit: Option<usize>, has_room: bool, scenario: Scenario) 
     explicit
         .unwrap_or(if has_room { MAX_PLAYERS } else { 1 })
         .clamp(1, MAX_PLAYERS)
+}
+
+/// Bots fill the seats the humans aren't using, so the two together can never
+/// exceed [`MAX_PLAYERS`] — there are only that many spawn points. The rig is a
+/// fixed two-hander and takes none.
+fn resolve_bots(explicit: Option<usize>, players: usize, scenario: Scenario) -> usize {
+    if matches!(scenario, Scenario::GrassStrip { .. }) {
+        return 0;
+    }
+    explicit.unwrap_or(0).min(MAX_PLAYERS.saturating_sub(players))
 }
 
 /// Dev scenario override — `AG_SCENARIO` natively, `?scenario=` on the web:
@@ -102,10 +116,15 @@ pub fn launch_config() -> LaunchConfig {
         room.is_some(),
         scenario,
     );
+    let bots = resolve_bots(
+        std::env::var("AG_BOTS").ok().and_then(|b| b.parse().ok()),
+        players,
+        scenario,
+    );
     let signaling =
         std::env::var("AG_SIGNALING").unwrap_or_else(|_| DEFAULT_SIGNALING.to_string());
     let ice = parse_ice(std::env::var("AG_ICE").ok());
-    LaunchConfig { room, players, signaling, ice, scenario }
+    LaunchConfig { room, players, signaling, ice, scenario, bots }
 }
 
 /// Web: `window.__AG_NET__ = { room, players, signaling }`, set by index.html
@@ -127,9 +146,10 @@ pub fn launch_config() -> LaunchConfig {
         room.is_some(),
         scenario,
     );
+    let bots = resolve_bots(get(&net, "bots").and_then(|b| b.parse().ok()), players, scenario);
     let signaling = get(&net, "signaling").unwrap_or_else(|| DEFAULT_SIGNALING.to_string());
     let ice = parse_ice(get(&net, "ice"));
-    LaunchConfig { room, players, signaling, ice, scenario }
+    LaunchConfig { room, players, signaling, ice, scenario, bots }
 }
 
 /// Handoff between `run_lobby` (which tears the warmup world down) and
@@ -168,7 +188,7 @@ pub struct Lobby {
     pub start_requested: bool,
 }
 
-fn start_local_session(commands: &mut Commands, players: usize, scenario: Scenario) {
+fn start_local_session(commands: &mut Commands, players: usize, bots: usize, scenario: Scenario) {
     let mut builder = SessionBuilder::<SessionConfig>::new()
         .with_num_players(players)
         .with_check_distance(2);
@@ -179,7 +199,7 @@ fn start_local_session(commands: &mut Commands, players: usize, scenario: Scenar
     }
     let session = builder.start_synctest_session().expect("start synctest");
     commands.insert_resource(Session::SyncTest(session));
-    spawn_world(commands, players, scenario);
+    spawn_world(commands, players, bots, scenario);
 }
 
 /// Startup: always start playing immediately. With a room, that's a 1-player
@@ -213,14 +233,16 @@ pub fn begin_session_setup(
             // Warmup: run around and shoot while waiting for the room to fill.
             // Always the real arena — `parse_scenario` refuses the rig with a
             // room set, but spell it out rather than rely on that here.
-            start_local_session(&mut commands, 1, Scenario::Arena);
+            // No bots in warmup: the world is torn down and rebuilt when the
+            // match starts, and bots that vanish on START read as a bug.
+            start_local_session(&mut commands, 1, 0, Scenario::Arena);
         }
         None => {
             info!(
                 "no room — starting local synctest session ({} players, {:?})",
                 launch.players, launch.scenario
             );
-            start_local_session(&mut commands, launch.players, launch.scenario);
+            start_local_session(&mut commands, launch.players, launch.bots, launch.scenario);
             next_state.set(AppState::InGame);
         }
     }
@@ -362,7 +384,13 @@ pub fn finalize_p2p_session(
     commands.remove_resource::<PendingSession>();
     // A p2p match is the arena, full stop: every peer must build the same world
     // and only one of them typed the URL.
-    spawn_world(&mut commands, num_players, Scenario::Arena);
+    //
+    // Bot count is 0 here for exactly that reason and NOT `launch.bots`: two
+    // peers joining with different `?bots=` would build different worlds, which
+    // is a desync before the first tick. In a room the count has to be *agreed*,
+    // so it rides in the host's start roster — until that lands, rooms are
+    // humans only and bots are an offline feature.
+    spawn_world(&mut commands, num_players, 0, Scenario::Arena);
     next_state.set(AppState::InGame);
 }
 

@@ -64,6 +64,14 @@ fn lane_is_clear(from: (i32, i32), to: (i32, i32)) -> bool {
 
 /// A session with all four spawns filled, plus the usual dummies and cover.
 fn arena() -> App {
+    arena_with_bots(0)
+}
+
+/// The same, plus `bots` pawns the session has no seat for. The session is
+/// still built for `PLAYERS` handles — that is the whole point: bot pawns carry
+/// handles beyond the session's range, so anything still reaching into
+/// `PlayerInputs` by handle panics here rather than in a match.
+fn arena_with_bots(bots: usize) -> App {
     let mut app = App::new();
     // Manual clock: one update is one tick's worth of time, so tests count
     // ticks instead of hoping a wall clock cooperates. A hair over the tick
@@ -75,8 +83,8 @@ fn arena() -> App {
         .add_plugins(SimPlugin::<TestConfig>::default())
         .init_resource::<Script>()
         .add_systems(ReadInputs, read_inputs)
-        .add_systems(Startup, |mut commands: Commands| {
-            spawn_world(&mut commands, PLAYERS, Scenario::Arena)
+        .add_systems(Startup, move |mut commands: Commands| {
+            spawn_world(&mut commands, PLAYERS, bots, Scenario::Arena)
         });
 
     let mut builder = SessionBuilder::<TestConfig>::new()
@@ -208,4 +216,55 @@ fn dummies_still_take_rounds() {
         .map(|target| target.hits)
         .sum();
     assert!(hits > 0, "rounds fired at a practice dummy 150 units away must register");
+}
+
+/// Bot pawns are simulated without a seat in the session.
+///
+/// This is the property the `Intent` split exists for. `move_players` and
+/// `fire_bullets` used to index `PlayerInputs[player.handle]`, so a pawn whose
+/// handle was outside the session's range panicked on the first tick — which
+/// meant "is a pawn" and "has a network seat" were the same thing, and a bot
+/// would have needed someone to send its inputs. The session here is built for
+/// `PLAYERS` handles and the world has four more pawns than that.
+///
+/// It runs under `with_check_distance(2)`, so GGRS re-simulates and checksums
+/// every frame: bot state that isn't rollback-safe fails here rather than as a
+/// desync in a real match.
+#[test]
+fn bot_pawns_are_simulated_without_a_session_seat() {
+    const BOTS: usize = 4;
+    let mut app = arena_with_bots(BOTS);
+
+    let pawns = app
+        .world_mut()
+        .query::<&Player>()
+        .iter(app.world())
+        .map(|p| p.handle)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        pawns,
+        (0..PLAYERS + BOTS).collect::<std::collections::BTreeSet<_>>(),
+        "bots should take the handles straight on from the humans, with no gaps"
+    );
+
+    // A human walks around and shoots while the bots are present, so the tick
+    // does real work rather than just not crashing.
+    let mut input = PlayerInput { move_x: 90, move_y: 40, buttons: 0 };
+    input.buttons |= BTN_FIRE;
+    drive(&mut app, SHOOTER, input);
+    run(&mut app, 120);
+
+    // Every bot is still there, still whole, and still where it started: with no
+    // brain wired up yet its `Intent` stays default, which must read as "stands
+    // still" and not as "drifts" or "fires".
+    for handle in PLAYERS..PLAYERS + BOTS {
+        let (pos, health, deaths) = pawn(&mut app, handle);
+        assert_eq!(
+            pos,
+            Pos::from_units(SPAWN_POINTS[handle].0, SPAWN_POINTS[handle].1),
+            "bot {handle} moved on a default intent"
+        );
+        assert_eq!(health.hp, MAX_HEALTH, "bot {handle} took damage from nowhere");
+        assert_eq!(deaths.0, 0, "bot {handle} died with nothing shooting at it");
+    }
 }

@@ -236,7 +236,7 @@ fn grass_look(h: f32) -> (Color, f32) {
         // straight down, a third more blade height barely registers — the
         // silhouettes overlap into the same mass either way — so depth has to
         // carry in value and hue as well, the way it does on any top-down map.
-        // Kept out of the bright end regardless: `PLAYER_COLORS` were picked to
+        // Kept out of the bright end regardless: `TEAM_COLORS` were picked to
         // sit above the ground in value, and a vivid sward puts a camouflaged
         // soldier back into the background it was tuned against.
         Color::srgb(lerp(0.90, 0.46), lerp(0.85, 0.68), lerp(0.60, 0.42)),

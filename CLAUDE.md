@@ -5,8 +5,9 @@ Guidance for Claude Code when working in this repository.
 ## What this is
 
 **Army Ghosts** — a web-based, mobile-first, top-down 2D shooter (old-PC *Army
-Men* feel) that will grow Ghost Recon Wildlands *Ghost War* mechanics (stealth,
-hiding in bushes, squad modes). Built on **Bevy 0.18** with fully deterministic
+Men* feel) built on Ghost Recon Wildlands *Ghost War* mechanics: two teams,
+opposite ends of the field, **two-minute rounds with no respawning**, stealth and
+hiding in grass and bushes. Built on **Bevy 0.18** with fully deterministic
 **peer-to-peer rollback multiplayer**: GGRS over matchbox WebRTC. The only
 server anywhere is a matchbox *signaling* server (runs on the dev Mac); game
 traffic is p2p and the sim is replayed identically on every peer.
@@ -93,8 +94,9 @@ synctest mode. Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_BOTS`,
 ### Netcode model
 
 - **bevy_ggrs rollback**: peers exchange only `PlayerInput` (4 bytes:
-  quantized i8 move x/y, a `buttons` bitflag byte, and a `dials` byte for match
-  settings), each peer simulates everything. Everything in both flag bytes is an
+  quantized i8 move x/y, a `buttons` bitflag byte, and a `dials` byte carrying
+  bot aggression in bits 0-3 and this player's team request in bits 4-5, with 6-7
+  spare), each peer simulates everything. Everything in both flag bytes is an
   ABSOLUTE value re-sent every tick, never an edge — see the stance and bot
   notes below for why rollback makes that the only workable choice.
 - **Lobby (open rooms)**: matchbox room string from `?room=`; socket URL is
@@ -140,8 +142,8 @@ synctest mode. Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_BOTS`,
   a rollback correction can read as a supersonic `Pos` delta for one frame and
   must not land on an empty frame. `Stance` is rollback-registered like every
   other tick-evolving component.
-- **Health, damage and respawn** (`sim/src/lib.rs`: `Health`, `Deaths`,
-  `Sweep`, `bullet_damage`, `resolve_hits`, `respawn_players`): a round takes
+- **Health and damage** (`sim/src/lib.rs`: `Health`, `Deaths`,
+  `Sweep`, `bullet_damage`, `resolve_hits`, `tick_health`): a round takes
   off `HIT_DAMAGE_MAX` (42 of `MAX_HEALTH` 100) scaled twice — by how centered
   it was and by how far it flew — so three perfect rounds kill and a long graze
   is worth about a tenth of that. Both scalings have floors (`DAMAGE_EDGE_FRAC`
@@ -157,12 +159,18 @@ synctest mode. Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_BOTS`,
   not to the contact point — a round entering someone's edge at the very end of a
   tick is still a dead-center shot, it just hasn't arrived yet.
   Consequences that are easy to miss:
-  * Players, dummies and boulders now resolve in ONE nearest-impact pass in
+  * Players and boulders resolve in ONE nearest-impact pass in
     `resolve_hits` (the rock test moved out of `move_bullets`), because cover has
     to stop a round that would otherwise carry on into someone behind it. Ties
     are broken by (distance along the sweep, position, handle) — query iteration
     order is not a determinism guarantee, and two pawns can share a subunit.
-  * Death is a flag (`Health::down`), not a despawn: rollback un-killing someone
+  * **There is no respawn.** `Health::down` used to be a countdown to one and is
+    now a count of how long you have been OUT — it only ever clears at the top of
+    the next round (`round::run_round`), and nothing else in the sim writes it
+    back to zero. That is the single rule the rest of the design hangs off: a
+    death costs the round rather than a walk, which is what makes grass, stance
+    and patience worth anything.
+    Death is still a flag rather than a despawn: rollback un-killing someone
     then only restores a component instead of resurrecting an entity the
     renderer has forgotten. While down you can't move, fire, change stance or be
     hit, and the client hides you via `Visibility` (NOT alpha — `fade_hidden`
@@ -173,9 +181,9 @@ synctest mode. Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_BOTS`,
     second pass over the same query (the victim's borrow is exclusive), and it
     credits team kills too — the harness's "teams" are bookkeeping the sim knows
     nothing about, and a kill it declined to count would quietly reward friendly
-    fire. **Scoring on deaths alone is why it exists**: the best bot by that
-    measure is the one that lies in the deepest grass it can find and never
-    fires, so the harness scores kills MINUS deaths.
+    fire. It exists for the self-play harness, which used to score on it; the
+    harness now scores ROUNDS WON instead (see Testing), and kills survive as a
+    scoreboard line and a diagnostic.
   * **PAWNS ARE SOLID** (`separate_players`), and the reason is worth keeping.
     Nothing used to stop two pawns occupying the same subunit, and that turned
     out to be a *stable trap*: `Act::Fight` roots a bot with the same bit the
@@ -199,11 +207,60 @@ synctest mode. Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_BOTS`,
     being unable to leave one is not. Note `bot.rs`'s `PUSH_STANDOFF` alone does
     NOT fix this (measured: 1413 ticks still locked with separation off); it
     only stops them nosing together in the first place.
-  * **The spawn→spawn lanes are NOT clear.** Only spawn→dummy is (see
-    `rock_layout`); there's a boulder at (30,-23) squarely between spawns 0 and 1.
-    Any test that needs a clear shot must pick its lane deliberately —
-    `sim/tests/combat.rs` fires spawn 2 → spawn 3 and asserts `lane_is_clear`
-    up front, so a reseeded field fails saying what actually changed.
+  * **Only ONE lane between the muster lines is clear**, and that is the rock
+    layout doing its job — four clear corridors from one spawn line straight into
+    the other would be four sniping alleys. It is slot 2: (-330, 65) to (330, 65),
+    which is handles 4 and 5. Any test that needs a shot to arrive has to use that
+    one and say so; `sim/tests/combat.rs` asserts `lane_is_clear` up front, so a
+    reseeded field fails saying what actually changed. Everything else in that
+    file closes to point-blank instead, which works from anywhere.
+- **Teams and rounds** (`sim/src/round.rs` + `Team`/`spawn_post` in `lib.rs`) —
+  the Ghost War shape, and the thing every other rule now hangs off. Two sides
+  muster on opposite ends of the field, fight for `ROUND_SECONDS` (120), and
+  **nobody respawns**. A round ends the moment one side has nobody standing, or
+  on the clock — and then the side with more people left takes it, level pegging
+  being a draw. `INTERMISSION_TICKS` (6 s) later the next one starts, everyone up,
+  everyone back on their post. `Deaths` and `Kills` carry across the series; only
+  health, position, stance and the trigger reset.
+  * **`Round` is a rollback REGISTERED RESOURCE**, which is a path nothing else
+    in this repo uses. There is one clock and one scoreboard so a resource is the
+    honest shape, but a clock that carried on through a rollback would read
+    differently on the re-run — that is a desync, so it is snapshotted and
+    checksummed like `Health`. `sim/tests/combat.rs` is what would catch it going
+    wrong, because it runs at `check_distance(2)`.
+  * **`TEAM_SPAWNS` are exact mirrors in x**, and that is load-bearing rather than
+    tidy: the rock and bush fields are NOT mirror-symmetric, so which end a side
+    draws is worth something, and the self-play harness cancels it by playing
+    every trial from both ends. That only works if the ends differ in the terrain
+    and in nothing else.
+  * **Which side you are on is a REQUEST, in the input stream** (`dials` bits
+    4-5, `DIAL_TEAM_MASK`), not a lobby message — same idempotence argument as
+    the stance level and the bot count. Unlike the two bot dials, EVERY player's
+    own copy is read, because it is a statement about the sender. `round::balance`
+    grants it at the top of the next round if that side has room and overrules it
+    if not, so no amount of tapping can stack one end of the map.
+  * **Requests are honoured between rounds, never during one.** A pawn does not
+    move when its side changes, so a mid-round swap would change its colours where
+    it stands — and colour is now how you tell friend from foe, so everyone around
+    it would silently change what it is with nothing happening on screen.
+  * `balance` is a single pass with a cap and the simplicity is the point: two
+    peers have to reach the same answer, and anything that ITERATED to a balance
+    could reach it by a different route. The cap comes from how many pawns there
+    are rather than from `TEAM_SIZE`, so three pawns split 2-1 rather than 3-0.
+  * `default_side(handle)` — alternating — is a pure function of the handle, so
+    team membership is knowable without looking at the world. That is what lets
+    the harness put one profile on each side by parity and what lets
+    `reconcile_bots` place a bot without consulting anything that could differ
+    between peers.
+  * A side with NO pawns has not been wiped out, it has not turned up. Without
+    that guard a warmup with no bots ends a round on its first tick and every
+    tick after it, forever.
+  * Between rounds `move_players`/`separate_players`/`fire_bullets` are gated off
+    (`round_is_live`), so nobody walks or shoots while the banner is up. Rounds
+    already in the air are deliberately NOT frozen — a shot fired in time still
+    arrives.
+  * `run_round` returns immediately on any scenario but `Arena`, which is what
+    keeps the grass rig's two carefully placed pawns where they were put.
 - **Pawns are not seats** (`sim/src/lib.rs`: `Intent`, `Bot`, `read_human_intent`).
   `move_players`/`fire_bullets` used to index `PlayerInputs[player.handle]`
   directly, which made "is a pawn" and "has a seat in the GGRS session" the same
@@ -228,7 +285,7 @@ synctest mode. Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_BOTS`,
     with B0001 on the first tick.
   * Intent runs FIRST in `GgrsSchedule` and nothing precedes it, because both
     intent systems want the world exactly as the previous tick left it —
-    respawns included.
+    the round's own reset included, which is why `run_round` runs LAST.
   * `Intent` is rollback-registered even though it's rewritten every tick and so
     can't strictly go stale. A bot that ever wants hysteresis (holding a heading,
     committing to a rush) would evolve it, and finding out then means finding out
@@ -268,6 +325,40 @@ synctest mode. Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_BOTS`,
     perfect accuracy at 300 units would be easier than at 30.
   * **Visibility is sampled across the body**, which is `visible_fraction`'s five
     points, so cover degrades in fifths instead of snapping.
+  **What teams changed about the brain**, all of it measured rather than argued:
+  * **Friend and foe are told apart in ONE place** — `look` skips same-team
+    pawns, so a teammate never enters the memory buffer and therefore can never
+    be aimed at, led, hunted or broken away from. Everything downstream reads
+    the buffer, so there is no second place to get it wrong.
+  * **A bot holds fire when a teammate is on the shot line**
+    (`blocked_by_a_friend`, against the JITTERED aim point, and only for friends
+    NEARER than the target). Friendly fire is on and now costs a round rather
+    than a walk, so this is arithmetic rather than politeness.
+  * **`Act::Hunt` has an OBJECTIVE**, because a round opens with 660 units of
+    grass between the two sides and nobody has a last known position to walk to.
+    Without one the whole field crouches where it stands and every round is a
+    draw. Which point took three tries and the harness settled it — see
+    `objective`'s table; the two intuitive answers (the post facing you, the
+    middle of your own lane) both leave the sides swapping ends without meeting.
+  * **`ADVANCE` is a fixed weight, NOT `aggression`.** See the artefact note
+    below: crossing the field when you have seen nobody is not aggression, it is
+    playing the game, and conflating them made the best-measured aggression
+    setting one that stops the match.
+  * **`ARRIVED * 6` is the scale of "how far is it still".** Measured against the
+    arena's own size (800 units) instead, the consideration falls under
+    `Act::Settle` while a bot is still 165 units out, so both sides sit down 330
+    apart — outside `ENGAGE_RANGE` — and a full arena fires NOT ONE ROUND in a
+    minute.
+  * **`Act::Settle`'s `FP / 8` is the pace of the whole game.** In grass this
+    deep `visible` is a fraction almost everywhere, so `sharp(visible)` leaves
+    Settle competitive far more often than "only when nothing else scores" makes
+    it sound. Halving it to `FP / 16` takes the mean round from 66 s of fighting
+    to 5.5 — eight bots wiping each other out before a human could cross the
+    field. It is not a spare knob.
+  * The visible consequence of all that: bots creep to point-blank range through
+    the grass and kill in three shots, so a minute of eight of them is about
+    FIFTEEN rounds fired and five deaths. Quiet, close and decisive is what this
+    concealment model implies; it is not a sign they have stopped working.
   Things that will bite:
   * **Every behavior scores on EXACTLY THREE considerations.** Multiplying values
     in `0..=FP` drags a score down as considerations are added, which penalises
@@ -281,7 +372,7 @@ synctest mode. Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_BOTS`,
     consecutive LCG seeds give visibly correlated first draws and "all the bots
     twitch together" is exactly the tell that gives it away.
   * A dead bot still pushes an empty sighting every tick, so "12 ticks ago" keeps
-    meaning the same thing across a respawn.
+    meaning the same thing across a round boundary.
   * `SimPlugin` `init_resource::<Scenario>()`s, because `bot_think` asks what
     world it is in and anything building a bare app (the combat tests, the
     harness) would otherwise panic on the first tick.
@@ -328,9 +419,10 @@ synctest mode. Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_BOTS`,
   `?aggro=PCT` / `AG_AGGRO=PCT` seeds it, same as `?bots=`. UI-side, the two
   rows are one widget (`menu.rs` `Dial` + `dial_row`) rather than two that have
   to be kept looking alike — a third setting is one line in `Dial::ALL`.
-  Aggression is the dial that got a button because it is the one the harness
-  says is worth turning (0.9 loses every decisive pair, 0.1 is about +432 elo);
-  the other four stay in `tools/selfplay.sh` where a number is measurable.
+  Aggression is the dial that got a button because it is the one whose ends the
+  harness separates most legibly (0.9 is about -251 elo against the default);
+  the other four stay in `tools/selfplay.sh` where a number is measurable. NOTE
+  the row now sits UNDER a `TEAM` row — three dials, still one widget.
   Tuning lives in `BotProfile` (skill / accuracy / reaction / aggression /
   caution) — one struct precisely so the self-play harness can vary it, which is
   `BotRoster`'s whole reason to exist: a per-handle profile table plus an RNG
@@ -340,42 +432,49 @@ synctest mode. Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_BOTS`,
   the rollback schedule; mutate it mid-match and it is the same desync that
   keeps the bot COUNT in the input stream instead.
   **The five dials are measured rather than picked** (`tools/selfplay.sh`, each
-  against the shipping default, up to 210 pairs, elo from the pair win rate).
-  **These figures are the post-`separate_players` ones and the earlier set was
-  WRONG** — they were taken while bots could lock together permanently (see
-  Health/damage below), and a locked pair contributes nothing to either side, so
-  every difference was diluted and the ones that *caused* locking were
-  understated worst of all. Anything quoting aggression as neutral or 1.0
-  accuracy as worse than 0.9 predates the fix:
-  * **`reaction` dominates everything.** 5 ticks is +566, 10 is +552, 20 is
-    -257. Nothing else moves the result that far, and 10 being level with 5 says
-    the default 15 is the slow side of a plateau rather than a middle.
-  * **`accuracy` matters and then saturates.** 0.4 is -350; 0.9 is +98 and 1.0
-    is +91, whose intervals overlap almost exactly — past about 0.9 more
-    precision buys nothing measurable.
-  * **`skill` barely registers**: 0.2 is -28 and 1.0 is -9, both intervals
-    straddling even. Whether a bot leads its target is worth far less here than
-    how fast it reacts, which is not what the Quake III lineage would predict
-    and is probably about engagement ranges: most of the shooting in this arena
-    happens close enough that lead is a rounding error.
-  * **Aggression is the big trap.** 0.9 loses every decisive pair; **0.1 is
-    +432**. Pushing gets you shot. This is the dial that was most distorted
-    before the fix (it read as neutral), because charging is exactly what put
-    two bots on the same square.
-  * **Caution is a trap in the other direction**: 0.9 also loses every decisive
-    pair, 0.1 is +132. Note caution enters the scoring THREE times — as
-    `Act::Break`'s weight, inside `cowardice` which is `Break`'s own
-    consideration, and again as `not(cowardice)` suppressing `Act::Fight` — so
-    its effect is roughly cubic while aggression's is linear. The dials are not
-    on comparable scales and this is where that shows.
+  against the shipping default, up to 150 pairs, elo from the pair win rate).
+  **These are the post-ROUNDS figures and every earlier set in this file was
+  measured on a different game** — respawning deathmatch, scattered spawns,
+  scored on kills minus deaths. Where they disagree, these win; where a finding
+  reversed, that is said below, because a reversal is more informative than
+  either number on its own:
+  * **`reaction` still dominates.** 5 ticks takes every decisive pair, 23 loses
+    every one. Nothing else moves the result that far, which is unchanged from
+    the old paradigm and is the reason it stays the difficulty knob.
+  * **`caution` REVERSED, and it is the headline.** 0.1 is about **-482 elo** —
+    the worst reading any dial has produced here — where under respawn it was
+    +132. Both ends now lose (0.9 loses every decisive pair too), so the default
+    0.5 sits near an optimum rather than on a slope. That is the whole paradigm
+    change in one number: when a death costs a walk, recklessness is cheap; when
+    it costs the round, it is the most expensive mistake available.
+  * **`skill` now registers**, where it used to be indistinguishable from noise
+    (0.2 was -28, 1.0 was -9). 1.0 is about **+162** and 0.2 about **-74**, both
+    still short of a verdict at 150 pairs but both leaning the way the Quake III
+    lineage would predict. Engagements happen at longer ranges across a field
+    this size, so leading a target is worth something at last.
+  * **`accuracy` matters and saturates.** 0.4 is about -155. 1.0 won 16 of 16
+    decisive pairs and STILL came out undecided — sixteen wins is an LLR of
+    +2.92 against a bound of +2.944, so it missed by one pair. Read that as
+    "better, unproven", not as "no difference".
+  * **Aggression is now only bad at the top.** 0.9 is about -251; 0.1 against
+    0.5 is **150 pairs and not one of them decisive**. Under respawn 0.1 read as
+    +432, and chasing that number is what turned up the bug in the next
+    paragraph.
+  **The aggression finding was an artefact, and the fix is worth knowing about.**
+  `Act::Hunt` used to be weighted by `aggression`, so one dial secretly did two
+  jobs: how hard to push someone you can SEE, and whether to cross the field at
+  all. With the sides a field apart those come violently apart — a low setting
+  is not "fight patiently", it is "let them do the walking" — so 0.2 beat the
+  0.5 default in every decisive pair. Adopted as the default it played itself to
+  a standstill: **330 of 450 rounds drawn**, mean round 101 s of a 120 s clock.
+  Hunt now has its own fixed weight (`ADVANCE`), after which 0.2 and 0.5 are
+  indistinguishable and the default was left alone. A dial whose best setting
+  makes the game stop is a dial wired to the wrong thing.
   Read all of that as "which bot beats which bot", which is NOT the same
-  question as "which bot is a good opponent for a person". Stacking the wins
-  (`reaction=8,caution=0.25,aggression=0.35,accuracy=0.8`) takes every decisive
-  pair; the shipping default is deliberately still the documented "competent but
-  beatable" one, because difficulty is a design choice and the harness only
-  knows how to measure lethality. The one finding that is arguably not about
-  difficulty is aggression: charging is what the deadlock bug looked like from
-  the outside, and it is also simply bad play.
+  question as "which bot is a good opponent for a person". The shipping default
+  is deliberately still the documented "competent but beatable" one, because
+  difficulty is a design choice and the harness only knows how to measure who
+  wins rounds.
   `sim/tests/combat.rs` covers the three failures worth catching:
   `bots_decide_identically_in_identical_worlds` (two runs, 400 ticks, every pawn
   on the same subunit — catches an unseeded RNG or iteration-order dependence,
@@ -407,9 +506,16 @@ synctest mode. Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_BOTS`,
     prone) or tracers and the ADS aim line appear to leave the soldier's boots.
     Bullets carry the lift they were FIRED at in a render-only `MuzzleLift`
     (the shooter may stand up mid-flight); trails and the aim line apply it too.
-  * `PLAYER_COLORS` are muted but kept well ABOVE the ground tile in value.
-    Muted is not invisible — tinting a camouflaged soldier down into the grass
-    range makes them genuinely impossible to see on it.
+  * **`TEAM_COLORS` are what tell friend from foe**, so they are a gameplay
+    reading rather than decoration, and they have to satisfy two things at once.
+    Both must sit well ABOVE the ground tile in value — the grass is a dark olive
+    (62,74,42) and a soldier tinted into that range vanishes into it, which is
+    worse now that the green side is one of two rather than one of eight. And
+    they must differ in HUE AND VALUE, not hue alone, because under the fog they
+    are drawn at reduced alpha over a green field and two colours separated only
+    by hue converge as they fade. Hence a pale sage green against a distinctly
+    brighter tan, with a small per-slot shade so four figures in the same colours
+    are still four figures.
 - **Cover** (`sim/src/lib.rs`: `rock_layout` / `bush_layout`): two procedural
   fields, both pure integer rejection sampling from fixed seeds (`ROCK_SEED`,
   `BUSH_SEED`) — no floats, no RNG crate, so every peer builds the identical
@@ -419,9 +525,12 @@ synctest mode. Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_BOTS`,
   (so an angled approach deflects around instead of stopping dead), and bullets
   despawn on contact. **Bushes** stop nothing — they're concealment only, and
   come in overlapping clusters. Layout constants keep every gap walkable
-  (`ROCK_GAP`/`ROCK_WALL_GAP` > the 24-unit player diameter) and keep the
-  spawn→practice-dummy lane clear so `TARGET_POINTS` stays "dead ahead".
-  `cargo test -p army-ghosts-sim` asserts both.
+  (`ROCK_GAP`/`ROCK_WALL_GAP` > the 24-unit player diameter) and keep the muster
+  posts clear so a side can never be walled into its own line. **Nothing is
+  excluded from the middle of the map any more** — the band that used to be kept
+  clear ran from a spawn point to a practice dummy, and both ends of it are gone,
+  so the centre now gets cover like everywhere else. `cargo test -p
+  army-ghosts-sim` asserts the field stays walkable.
   Art-wise the two are opposites. Boulders are grayscale top-down blobs, tinted
   and *spun* by their seed. Bushes (`gen_bushes`) are modelled in 3D exactly
   like the soldier — a small L-system of tapering branch capsules, each
@@ -540,7 +649,7 @@ synctest mode. Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_BOTS`,
   **Y-SORTING is what makes the grass behave, and it is not optional.** Grass is
   baked one mesh per `GRASS_BAND` (4-unit) slice of the arena, each drawn at
   the z of its MIDDLE line, and everything standing on the ground — pawns,
-  boulders, practice dummies — carries `render::Grounded` and takes its z from
+  boulders — carries `render::Grounded` and takes its z from
   `grass::y_sort` of its GROUND LINE in `sync_transforms`. So the clumps between
   you and the camera are drawn after you and swallow your legs, the ones behind
   you are drawn before you and don't, and walking north uncovers you a clump at
@@ -820,11 +929,16 @@ need a TURN server eventually.
   plus `tests/combat.rs`, which drives a REAL synctest session a tick at a time
   (`TimeUpdateStrategy::ManualDuration` — bevy_ggrs steps off `Time`'s delta, so
   a manual clock makes ticks countable) to prove rounds land, damage accumulates
-  into a death, and the pawn comes back whole. It runs at
+  into a death, the death STICKS for the rest of the round, wiping out a side
+  ends it, and the next round picks everyone back up on their post. It runs at
   `with_check_distance(2)`, so it re-simulates every frame and checksums:
-  rollback-unsafe health state fails there rather than as a desync in a match.
+  rollback-unsafe health, team or round state fails there rather than as a desync
+  in a match — and the round is a rollback-registered RESOURCE, a path nothing
+  else in the repo exercises, so this is the only thing that would catch it.
   Note `PlayerInputs` can only be filled by a session, which is why the systems
-  can't just be called directly.
+  can't just be called directly. `arena_with(humans, bots)` takes 0 humans and
+  still builds a one-seat session, which is the shape the harness runs: a human
+  pawn standing inert on a post is a free kill that quietly decides a match.
 - **`tools/grass-table.sh [outfile]`** — the concealment measuring rig
   (`client/src/vision/strip_table.rs`). Two pawns either side of a ONE-HEX-wide
   strip of grass, one clear hex off it, tabulated over every grass depth x every
@@ -848,7 +962,7 @@ need a TURN server eventually.
 - **`Scenario` (`sim/src/lib.rs`) — the rig, playable.** `Scenario::Arena` is the
   game; `Scenario::GrassStrip { depth, east_stance }` is the concealment scene
   the table measures, built for real: `spawn_world` puts one pawn either side of
-  the wall and spawns NOTHING else (no boulders, bushes or dummies), and
+  the wall and spawns NOTHING else (no boulders or bushes), and
   `Scenario::depth` replaces the procedural field with grass `depth` deep inside
   `STRIP_HALF_W` of x=0 and bare ground everywhere else. The renderer asks the
   scenario rather than `grass_height` directly (`grass.rs`, `vision.rs`), so
@@ -877,46 +991,62 @@ need a TURN server eventually.
   and `SHOT`'s crop is sized to clear the HUD (health bar and roster above, the
   sights button below, stance buttons right), so a HUD move needs it re-checked.
 - **`tools/selfplay.sh [options]`** — the bot measuring rig: does profile A
-  actually beat profile B? Eight bots in the real arena, four a side, a minute
-  of game time a match, scored on **kills minus deaths**. `-c`/`-b` take
-  `skill=0.8,reaction=6` style specs that fill in from the shipping profile, so
-  a spec says exactly what is being varied. A match is ~30 ms, so a verdict is
-  usually a few seconds — run it before committing any change to `bot.rs` or
-  `BotProfile`.
+  actually beat profile B? Eight bots in the real arena, four a side, playing
+  **Ghost War rounds** — muster at opposite ends, two minutes or until one side
+  is wiped out, nobody respawning — and scored on **rounds won minus rounds
+  lost**. `-c`/`-b` take `skill=0.8,reaction=6` style specs that fill in from the
+  shipping profile, so a spec says exactly what is being varied. A match is
+  ~70 ms, so a verdict is usually a few seconds — run it before committing any
+  change to `bot.rs` or `BotProfile`.
   It lives in its own crate (`harness/`, bin `selfplay`) for one reason: sim's
   rule is NO FLOATS and a likelihood ratio is made of logarithms. Keeping the
   statistics behind a crate boundary means that rule stays absolute rather than
   acquiring an exception. Nothing in `client/` or `sim/` depends on it.
-  Three things make it work, and each is the answer to a way it would otherwise
-  lie:
-  * **Trials are PAIRS, not matches.** The arena isn't symmetric — spawn points
-    sit in different cover — so an unpaired run mostly measures which four seats
-    a profile drew. A pair is one split of the eight spawns played from BOTH
-    sides with the same dice, and the two scores added. There are exactly
-    C(8,4) = 70 splits; past that, `BotRoster::salt` varies the RNG. The
-    cancellation is exact: two IDENTICAL profiles score 0 every single pair,
-    because the mirrored match is the same match with the labels swapped
-    (`identical_profiles_tie_every_time` asserts it). A bot that never misses
-    never touches its dice, so `accuracy=1.0` on BOTH sides makes the salt inert
-    and only those 70 pairs exist — the run says so and caps itself.
+  * **Rounds won, not kills minus deaths**, and that is not taste. Under respawn
+    a death cost a walk and the trade WAS the objective. Under rounds a bot that
+    trades one-for-one breaks even on kills and loses every round it is
+    outnumbered at the end of, and one that kills three and dies has won nothing
+    if its side still loses 4-1. Kills are still reported, as a diagnostic —
+    "won every round killing nobody" and "won every round 4-0" are both possible
+    and are not the same bot.
+  * **Trials are PAIRS, not matches.** The two muster lines are exact mirrors but
+    the rock and bush fields are NOT, so an unpaired run is partly measuring which
+    END a profile drew. A pair is the same dice played with the candidate on each
+    end in turn, and the two round differentials added. The cancellation is exact:
+    two IDENTICAL profiles score 0 every single pair, because with the same
+    profile on both sides the mirrored match is literally the same simulation
+    (`identical_profiles_tie_every_time` asserts it).
+    **The old 70 spawn splits are gone** — with two fixed lines there is exactly
+    one split — so the salt is now the ONLY thing that varies a pair. That is a
+    real loss of an independent source of variation, and it is why the run says so
+    when the salt is inert: a bot that never misses never touches its dice, so
+    `accuracy=1.0` on both sides leaves exactly one distinct pair and the run
+    caps itself there rather than printing the same margin a hundred times.
   * **A sequential test (Wald's SPRT), so it stops when the answer is in.** H0
     is "wins half the decisive pairs", H1 is `--p1` (default 0.60, ~+70 elo),
-    alpha = beta = 0.05, bounds ±ln(19). An obvious difference resolves in ~20
-    pairs and a marginal one runs to `--pairs` (200) and reports a confidence
-    interval instead of a verdict. Ties are dropped and counted rather than
-    modelled, which is Wald's binomial test unmodified — no draw model to get
-    wrong, at the cost of a candidate that turns wins into ties looking like one
-    that changed nothing.
-  * **Kills minus deaths**, per the `Kills` note above. Both sides'
-    differentials are exact negatives, so the sign alone decides.
+    alpha = beta = 0.05, bounds ±ln(19). Ties are dropped and counted rather than
+    modelled, which is Wald's binomial test unmodified.
+  * **THE TIE RATE IS THE THING TO UNDERSTAND about this harness**, and it is new.
+    A pair's score is a small integer, so unlike a kills differential it lands on
+    exactly zero a great deal of the time — typically only about a fifth of pairs
+    come out decisive. That is what sets `--rounds` (default 9): measured against
+    a caution=0.1 candidate, 3 rounds a match left 3 of 60 pairs decisive, 9 left
+    12, 15 left 13. Worth knowing that the 3-round run did not merely say less,
+    it pointed the OTHER WAY (66% on three decisive pairs against 25% on twelve).
+    When a run reports mostly ties, **raise `--rounds` before `--pairs`** — the
+    output says so.
   Two properties worth knowing before trusting a number: the whole thing is
   deterministic, so re-running a command gives the identical verdict — repeating
   it is not extra evidence, only more `--pairs` is. And **`NOT BETTER` means
   "not ahead by the margin", which covers both "worse" and "the same"** — read
   the rate line, which is why the output prints which one it was.
   `the_harness_separates_a_quick_bot_from_a_slow_one` is the test that the
-  instrument works at all: reaction 3 vs reaction 23 on short matches must come
-  out BETTER, or every number it ever printed was noise dressed as evidence.
+  instrument works at all: reaction 3 vs reaction 23 on one-round matches must
+  come out BETTER, or every number it ever printed was noise dressed as evidence.
+  The run also prints the mean round length net of intermissions and how many
+  rounds were DRAWN, which is the tell for the failure mode this scoring has and
+  the old one didn't: two cautious profiles can spend the whole clock not finding
+  each other, and a run full of drawn rounds measured almost nothing.
 - Native smoke: run without a room (synctest re-simulates every frame — it
   catches nondeterminism AND rollback-unsafe state immediately).
 - Web smoke: `tools/build-web.sh` + local http.server + headless chromium

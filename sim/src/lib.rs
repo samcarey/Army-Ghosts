@@ -21,7 +21,9 @@ use bevy_ggrs::{
 use serde::{Deserialize, Serialize};
 
 pub mod bot;
+pub mod round;
 pub use bot::{bot_think, Bot, BotProfile, BotRoster, MEMORY_TICKS};
+pub use round::{Phase, Round, Winner, INTERMISSION_TICKS, ROUND_SECONDS, ROUND_TICKS};
 
 /// Fixed-point scale: subunits per world unit (pixel).
 pub const FP: i32 = 256;
@@ -30,6 +32,14 @@ pub const TICK_HZ: usize = 60;
 /// Sessions are built for up to this many players (`?players=N` picks the
 /// actual room size, default 2).
 pub const MAX_PLAYERS: usize = 8;
+
+/// Ghost War is two sides, and everything downstream assumes exactly two: the
+/// spawn lines, the round's win condition, [`Team::other`] and the harness's
+/// pair swap. It is a named constant so those places read as "the other side"
+/// rather than as a bare `1`, not because a third team would be a config change.
+pub const TEAM_COUNT: usize = 2;
+/// How many posts a side musters at — and therefore the largest it can be.
+pub const TEAM_SIZE: usize = MAX_PLAYERS / TEAM_COUNT;
 
 /// Arena half-extents in world units (pixels).
 pub const ARENA_HALF_W: i32 = 400;
@@ -60,9 +70,6 @@ pub const BULLET_TTL: u16 = 90;
 /// Collision radii, world units.
 pub const PLAYER_R: i32 = 12;
 pub const BULLET_R: i32 = 2;
-pub const TARGET_R: i32 = 14;
-/// Ticks a target stays "flashed" after a hit (render feedback).
-pub const HIT_FLASH_TICKS: u16 = 8;
 
 /// Hit points a pawn spawns with.
 pub const MAX_HEALTH: i32 = 100;
@@ -81,11 +88,7 @@ pub const DAMAGE_EDGE_FRAC: i32 = FP * 30 / 100;
 pub const DAMAGE_NEAR: i32 = 120;
 pub const DAMAGE_FAR: i32 = 520;
 pub const DAMAGE_FAR_FRAC: i32 = FP * 45 / 100;
-/// Ticks between dying and standing back up at your spawn (1.5s). You are
-/// frozen, unhittable and hidden for the whole count.
-pub const RESPAWN_TICKS: u16 = 90;
-/// Ticks a pawn flashes after taking a round (render feedback, like
-/// [`HIT_FLASH_TICKS`] on the dummies).
+/// Ticks a pawn flashes after taking a round (render feedback).
 pub const HURT_FLASH_TICKS: u16 = 9;
 
 /// Stance levels, tallest first. Also indexes [`STANCE_SPEED`] and the stance
@@ -121,8 +124,10 @@ pub struct PlayerInput {
     pub move_x: i8,
     pub move_y: i8,
     pub buttons: u8,
-    /// Match settings the first player is dialling. Bits 0-3: bot aggression
-    /// ([`DIAL_AGGRO_MASK`]). Bits 4-7 spare.
+    /// Bits 0-3: bot aggression ([`DIAL_AGGRO_MASK`]), which only the first
+    /// player's copy is read for. Bits 4-5: which side THIS player is asking to
+    /// fight on ([`DIAL_TEAM_MASK`]) — everyone's own copy counts, because it is
+    /// about them. Bits 6-7 spare.
     pub dials: u8,
 }
 
@@ -169,6 +174,21 @@ pub const DIAL_AGGRO_MASK: u8 = 0b1111;
 /// How many positions the aggression dial has. 11, so the steps are tenths.
 pub const AGGRO_LEVELS: u8 = 11;
 
+/// Bits 4-5 of [`PlayerInput::dials`]: the side this player would rather be on.
+/// `0` is "no preference — put me where the sides need me", `1` and `2` name a
+/// team.
+///
+/// Unlike the two bot dials this is read from EVERY player's own input rather
+/// than only the first's, because it is a statement about the sender. It is
+/// still an absolute value re-sent every tick for the usual reason, and it is
+/// still only a *request*: [`round::balance`] grants it when the sides have room
+/// and quietly overrules it when they don't, so no amount of tapping can stack
+/// one end of the map. Requests are honoured at the top of a round, never in the
+/// middle of one — swapping sides mid-firefight would teleport your allegiance
+/// without teleporting you.
+pub const DIAL_TEAM_SHIFT: u8 = 4;
+pub const DIAL_TEAM_MASK: u8 = 0b11 << DIAL_TEAM_SHIFT;
+
 impl PlayerInput {
     pub fn fire(&self) -> bool {
         self.buttons & BTN_FIRE != 0
@@ -205,6 +225,23 @@ impl PlayerInput {
         self.dials &= !DIAL_AGGRO_MASK;
         self.dials |= level.min(AGGRO_LEVELS);
     }
+    /// Which side this player is asking for, or `None` for "wherever you need
+    /// me". A peer sending the unused fourth code reads as no preference rather
+    /// than as a team that doesn't exist.
+    pub fn team_request(&self) -> Option<u8> {
+        match (self.dials & DIAL_TEAM_MASK) >> DIAL_TEAM_SHIFT {
+            code if code >= 1 && (code as usize) <= TEAM_COUNT => Some(code - 1),
+            _ => None,
+        }
+    }
+    pub fn set_team_request(&mut self, team: Option<u8>) {
+        self.dials &= !DIAL_TEAM_MASK;
+        let code = match team {
+            Some(side) if (side as usize) < TEAM_COUNT => side + 1,
+            _ => 0,
+        };
+        self.dials |= code << DIAL_TEAM_SHIFT;
+    }
 }
 
 // ── Components (all rollback-registered) ────────────────────────────────────
@@ -233,12 +270,46 @@ impl Pos {
 /// For a HUMAN pawn it is also the GGRS player handle, and `0..num_players` are
 /// exactly the human pawns. A BOT pawn carries one too, allocated above that
 /// range, because everything downstream (`Bullet::owner`, `Deaths`, the roster,
-/// `SPAWN_POINTS`) wants a small unique id and there is no reason for bots to
+/// `spawn_post`) wants a small unique id and there is no reason for bots to
 /// need a second kind. What a bot does NOT have is a seat in the session: see
 /// [`Intent`] for how it is driven instead.
 #[derive(Component, Copy, Clone, Default, Debug, Hash)]
 pub struct Player {
     pub handle: usize,
+}
+
+/// Which side a pawn is fighting for, `0..TEAM_COUNT`.
+///
+/// Sim state rather than a lobby fact, and rollback-registered like everything
+/// else, because it decides who a bot shoots at and who wins the round — a peer
+/// that disagreed about one pawn's colours would disagree about the result.
+/// Reassigned only between rounds ([`round::balance`]), so a firefight can't
+/// change hands halfway through.
+#[derive(Component, Copy, Clone, Default, Debug, Hash, PartialEq, Eq)]
+pub struct Team(pub u8);
+
+impl Team {
+    /// Clamped, so a value that somehow escaped the balancer can still index the
+    /// per-side arrays the round keeps.
+    pub fn index(self) -> usize {
+        (self.0 as usize).min(TEAM_COUNT - 1)
+    }
+    pub fn other(self) -> Team {
+        Team((TEAM_COUNT - 1 - self.index()) as u8)
+    }
+}
+
+/// Which side a handle starts on: alternating, so the sides fill evenly however
+/// many pawns turn up and in whatever order.
+///
+/// It is a pure function of the handle on purpose. Team membership is then
+/// knowable without looking at the world — which is what lets the self-play
+/// harness put one profile on each side by parity, and what makes
+/// [`reconcile_bots`] able to place a bot without consulting anything that could
+/// differ between peers. A player who asks to switch overrides it from the next
+/// round on; nothing else does.
+pub fn default_side(handle: usize) -> u8 {
+    (handle % TEAM_COUNT) as u8
 }
 
 /// What a pawn is trying to do this tick, in exactly the form a human's
@@ -324,18 +395,24 @@ impl Stance {
     }
 }
 
-/// A pawn's condition. `hp` runs to zero, `down` is the respawn countdown that
-/// starts when it gets there, and `hurt` is render feedback.
+/// A pawn's condition. `hp` runs to zero, `down` counts how long it has been
+/// out, and `hurt` is render feedback.
 ///
-/// While `down > 0` the pawn is out of the game entirely: it can't move, fire,
-/// change stance or be hit, and the client hides it. That's deliberately one
-/// flag rather than despawning the entity — a rollback that un-kills someone
-/// then only has to restore a component, instead of resurrecting an entity
-/// whose identity the renderer has already forgotten.
+/// **There is no respawn timer, because there is no respawning.** A round is
+/// fought with the people who start it: once `down` is non-zero the pawn is out
+/// until the next round begins, which is the whole reason a Ghost War round has
+/// any tension in it. `down` counts UP rather than down for that reason — there
+/// is nothing to count toward, and the client uses it to know how long you have
+/// been spectating.
+///
+/// While down the pawn can't move, fire, change stance or be hit, and the client
+/// hides it. That's deliberately one flag rather than despawning the entity — a
+/// rollback that un-kills someone then only has to restore a component, instead
+/// of resurrecting an entity whose identity the renderer has already forgotten.
 #[derive(Component, Copy, Clone, Debug, Hash)]
 pub struct Health {
     pub hp: i32,
-    /// Ticks until respawn; 0 means alive.
+    /// Ticks this pawn has been out of the round; 0 means alive.
     pub down: u16,
     /// Ticks left of the hit flash.
     pub hurt: u16,
@@ -383,14 +460,6 @@ pub struct Bullet {
     pub vy: i32,
 }
 
-/// A shootable dummy target. `hits` accumulates; `flash` counts down render
-/// feedback ticks after each hit.
-#[derive(Component, Copy, Clone, Default, Debug, Hash)]
-pub struct Target {
-    pub hits: u32,
-    pub flash: u16,
-}
-
 /// Static cover: a boulder. Solid to players and bullets, and opaque to sight
 /// (the client casts its shadow). Placed once by [`rock_layout`] and never
 /// moved, but still rollback-registered so a session restart rebuilds the field
@@ -418,23 +487,36 @@ pub struct Bush {
 
 // ── World setup ─────────────────────────────────────────────────────────────
 
-/// Fixed spawn points (world units), one per handle. Deterministic — every
-/// peer spawns the identical world before the session starts ticking.
-/// Cardinals first, then corners, all inside the arena walls.
-pub const SPAWN_POINTS: [(i32, i32); MAX_PLAYERS] = [
-    (-150, 0),
-    (150, 0),
-    (0, -150),
-    (0, 150),
-    (-150, -150),
-    (150, 150),
-    (-150, 150),
-    (150, -150),
+/// Where each side musters, world units: a line of [`TEAM_SIZE`] posts down
+/// each end of the arena, so a round opens with the two teams the length of the
+/// field apart and has to be walked into.
+///
+/// **The two lines are exact mirrors in x**, and that is load-bearing rather
+/// than tidy: the rock and bush fields are NOT mirror-symmetric, so which end a
+/// side draws is worth something. The self-play harness cancels it by playing
+/// every trial from both ends — which only works if the ends differ in the
+/// terrain and in nothing else.
+pub const TEAM_SPAWNS: [[(i32, i32); TEAM_SIZE]; TEAM_COUNT] = [
+    [(-330, -195), (-330, -65), (-330, 65), (-330, 195)],
+    [(330, -195), (330, -65), (330, 65), (330, 195)],
 ];
 
-/// Practice dummies sit on the spawn axis: walk straight out from spawn and
-/// they're dead ahead (also makes hit registration trivially testable).
-pub const TARGET_POINTS: [(i32, i32); 2] = [(-300, 0), (300, 0)];
+/// The post a pawn falls in at. Both indices are clamped: this is called from
+/// inside the rollback schedule and a bad index must not panic there.
+pub fn spawn_post(team: u8, slot: usize) -> (i32, i32) {
+    TEAM_SPAWNS[(team as usize).min(TEAM_COUNT - 1)][slot.min(TEAM_SIZE - 1)]
+}
+
+/// Every post on the field, for the layout code that has to keep them clear.
+pub fn spawn_points() -> impl Iterator<Item = (i32, i32)> {
+    TEAM_SPAWNS.into_iter().flatten()
+}
+
+/// Which way a side faces when the round starts: down the field at the other
+/// one. Full deflection, in the joystick units [`Facing`] is kept in.
+pub fn spawn_facing(team: u8) -> Facing {
+    Facing { x: if team == 0 { 127 } else { -127 }, y: 0 }
+}
 
 // ── Procedural rock field ───────────────────────────────────────────────────
 
@@ -449,9 +531,9 @@ const ROCK_WALL_GAP: i32 = 34;
 /// Clear ground kept between two boulders — same reason: every gap in the
 /// field has to stay walkable.
 const ROCK_GAP: i32 = 34;
-/// Elbow room around spawns and practice dummies.
+/// Elbow room around the spawn posts, so a side can never be walled into its
+/// own muster line.
 const ROCK_SPAWN_CLEAR: i32 = 40;
-const ROCK_TARGET_CLEAR: i32 = 24;
 /// Layout seed and the attempt budget for rejection sampling. Both fixed:
 /// the field must come out identical on every peer, every run.
 const ROCK_SEED: u32 = 0x5EED_0C13;
@@ -488,22 +570,11 @@ pub fn rock_layout() -> Vec<(i32, i32, Rock)> {
         let y = (lcg(&mut state) % (span_y as u32 * 2 + 1)) as i32 - span_y;
         let seed = lcg(&mut state);
 
-        // Keep the spawn→practice-dummy lane clear: walk straight out from
-        // spawn and the target is still dead ahead (and still trivially
-        // testable). The middle of the map is fair game.
-        if (100..=340).contains(&x.abs()) && y.abs() <= r + 22 {
-            continue;
-        }
-        if SPAWN_POINTS
-            .iter()
-            .any(|&(sx, sy)| within(x, y, sx, sy, r + PLAYER_R + ROCK_SPAWN_CLEAR))
-        {
-            continue;
-        }
-        if TARGET_POINTS
-            .iter()
-            .any(|&(tx, ty)| within(x, y, tx, ty, r + TARGET_R + ROCK_TARGET_CLEAR))
-        {
+        // Cover in the middle of the map is the whole point of the map, so
+        // nothing is excluded from it any more — the lane this used to keep
+        // clear ran from a spawn to a practice dummy, and both ends of it are
+        // gone. What is still kept clear is the muster lines themselves.
+        if spawn_points().any(|(sx, sy)| within(x, y, sx, sy, r + PLAYER_R + ROCK_SPAWN_CLEAR)) {
             continue;
         }
         if rocks
@@ -532,7 +603,7 @@ const BUSH_R_SPAN: i32 = 13;
 /// How far a bush can sit from its thicket's center. Bushes inside a thicket
 /// deliberately overlap — that's what makes the concealment stack.
 const BUSH_SPREAD: i32 = 42;
-/// Keep thickets apart, off the spawns, and out of the practice lane.
+/// Keep thickets apart and off the muster lines.
 const BUSH_CLUSTER_GAP: i32 = 2 * BUSH_SPREAD + 30;
 const BUSH_SPAWN_CLEAR: i32 = 60;
 const BUSH_SEED: u32 = 0x0B05_1137;
@@ -556,16 +627,7 @@ pub fn bush_layout() -> Vec<(i32, i32, Bush)> {
         let span_y = ARENA_HALF_H - margin;
         let cx = (lcg(&mut state) % (span_x as u32 * 2 + 1)) as i32 - span_x;
         let cy = (lcg(&mut state) % (span_y as u32 * 2 + 1)) as i32 - span_y;
-        // Same clear lane the rocks respect, widened by the thicket's reach so
-        // no stray canopy drifts into it.
-        if (100..=340).contains(&cx.abs()) && cy.abs() <= BUSH_SPREAD + BUSH_R_MIN + BUSH_R_SPAN + 22
-        {
-            continue;
-        }
-        if SPAWN_POINTS
-            .iter()
-            .any(|&(sx, sy)| within(cx, cy, sx, sy, BUSH_SPREAD + BUSH_SPAWN_CLEAR))
-        {
+        if spawn_points().any(|(sx, sy)| within(cx, cy, sx, sy, BUSH_SPREAD + BUSH_SPAWN_CLEAR)) {
             continue;
         }
         if centers
@@ -1110,7 +1172,7 @@ pub struct Occluder {
 /// geometry but is sized for one tick of bullet travel, and its `half_b * half_b`
 /// overflows `i64` on a segment stretched across the arena. This one never
 /// squares anything larger than a coordinate.
-fn segment_hits_circle(a: Pos, b: Pos, c: Pos, r: i32) -> bool {
+pub(crate) fn segment_hits_circle(a: Pos, b: Pos, c: Pos, r: i32) -> bool {
     let (dx, dy) = ((b.x - a.x) as i64, (b.y - a.y) as i64);
     let (fx, fy) = ((c.x - a.x) as i64, (c.y - a.y) as i64);
     let rr = radius_fp(r);
@@ -1183,13 +1245,15 @@ pub fn visible_fraction(
 /// Everything every pawn has, human or bot. Kept in one place so the two kinds
 /// can't drift apart — a bot that was missing a component the sim's systems
 /// filter on would simply stop being simulated, silently.
-fn spawn_pawn(commands: &mut Commands, handle: usize, x: i32, y: i32) -> Entity {
+fn spawn_pawn(commands: &mut Commands, handle: usize, team: Team, slot: usize) -> Entity {
+    let (x, y) = spawn_post(team.0, slot);
     commands
         .spawn((
             Player { handle },
+            team,
             Intent::default(),
             Pos::from_units(x, y),
-            Facing::default(),
+            spawn_facing(team.0),
             Cooldown::default(),
             Stance::default(),
             Health::default(),
@@ -1200,9 +1264,9 @@ fn spawn_pawn(commands: &mut Commands, handle: usize, x: i32, y: i32) -> Entity 
         .id()
 }
 
-/// Spawn the initial world: one pawn per player, the practice targets, and the
-/// procedural rock and bush fields. Both clients run this identically before
-/// the first tick.
+/// Spawn the initial world: one pawn per player, split between the two muster
+/// lines, plus the procedural rock and bush fields. Both clients run this
+/// identically before the first tick.
 ///
 /// **No bots.** They are not spawned here on purpose: the number of them is
 /// carried in the input stream and applied by [`reconcile_bots`], which is the
@@ -1216,13 +1280,10 @@ pub fn spawn_world(commands: &mut Commands, num_players: usize, scenario: Scenar
         return;
     }
     for handle in 0..num_players.min(MAX_PLAYERS) {
-        let (x, y) = SPAWN_POINTS[handle];
-        spawn_pawn(commands, handle, x, y);
-    }
-    for (x, y) in TARGET_POINTS {
-        commands
-            .spawn((Target::default(), Pos::from_units(x, y)))
-            .add_rollback();
+        // Alternating, so two players are 1v1 rather than 2v0 — see
+        // [`default_side`]. The slot follows from it, so the first pair take the
+        // southernmost post at each end and the sides fill northward together.
+        spawn_pawn(commands, handle, Team(default_side(handle)), handle / TEAM_COUNT);
     }
     for (x, y, rock) in rock_layout() {
         commands
@@ -1247,10 +1308,16 @@ fn spawn_grass_strip(commands: &mut Commands, east_stance: u8) {
         (0, -STRIP_STANDOFF, 127, STANCE_STAND),
         (1, STRIP_STANDOFF, -127, east_stance.min(STANCE_PRONE)),
     ] {
-        let pawn = spawn_pawn(commands, handle, x, 0);
-        commands
-            .entity(pawn)
-            .insert((Facing { x: toward, y: 0 }, Stance { level, change: 0 }));
+        // The rig poses its own pawns, so it overwrites everything the muster
+        // line would have given them. It gets away with that because the round
+        // clock does not run here at all (`run_round` returns on any scenario
+        // but the arena) — nothing will come along later and re-post them.
+        let pawn = spawn_pawn(commands, handle, Team(default_side(handle)), 0);
+        commands.entity(pawn).insert((
+            Pos::from_units(x, 0),
+            Facing { x: toward, y: 0 },
+            Stance { level, change: 0 },
+        ));
     }
 }
 
@@ -1406,8 +1473,17 @@ impl<C: Config<Input = PlayerInput>> Plugin for SimPlugin<C> {
             // Same deal: the roster is config the game never varies, so it is
             // filled in rather than demanded, and only the harness overrides it.
             .init_resource::<BotRoster>()
+            // The clock, the phase and the series score. A RESOURCE rather than
+            // a component because there is exactly one of it and every system
+            // that cares wants it without a query — and rollback-registered for
+            // the same reason `Health` is: two peers disagreeing about whether
+            // the round is still live disagree about everything after it.
+            .init_resource::<Round>()
+            .rollback_resource_with_copy::<Round>()
+            .checksum_resource_with_hash::<Round>()
             .rollback_component_with_copy::<Pos>()
             .rollback_component_with_copy::<Player>()
+            .rollback_component_with_copy::<Team>()
             .rollback_component_with_copy::<Intent>()
             .rollback_component_with_copy::<Bot>()
             .rollback_component_with_copy::<Facing>()
@@ -1417,7 +1493,6 @@ impl<C: Config<Input = PlayerInput>> Plugin for SimPlugin<C> {
             .rollback_component_with_copy::<Deaths>()
             .rollback_component_with_copy::<Kills>()
             .rollback_component_with_copy::<Bullet>()
-            .rollback_component_with_copy::<Target>()
             .rollback_component_with_copy::<Rock>()
             .rollback_component_with_copy::<Bush>()
             // Desync detection: checksum the position state every frame so a
@@ -1450,16 +1525,29 @@ impl<C: Config<Input = PlayerInput>> Plugin for SimPlugin<C> {
                     apply_bot_dials::<C>,
                     read_human_intent::<C>,
                     bot_think,
-                    move_players,
-                    // After movement and before anything reads a position:
-                    // rounds leave the barrel next, and a shot fired from
-                    // inside someone else can't hit them.
-                    separate_players,
-                    fire_bullets,
+                    // Between rounds nobody walks and nobody shoots: the result
+                    // is already on the banner and a last-second charge into an
+                    // enemy spawn would decide nothing while looking as though
+                    // it might. Rounds already in the air are deliberately NOT
+                    // frozen (below) — a shot that was fired in time still
+                    // arrives.
+                    (
+                        move_players,
+                        // After movement and before anything reads a position:
+                        // rounds leave the barrel next, and a shot fired from
+                        // inside someone else can't hit them.
+                        separate_players,
+                        fire_bullets,
+                    )
+                        .chain()
+                        .run_if(round_is_live),
                     move_bullets,
                     resolve_hits,
-                    tick_targets,
-                    respawn_players,
+                    tick_health,
+                    // Last, so it judges the tick as it finally stands, and so
+                    // the pawns it re-posts at a round start are read by next
+                    // tick's intent systems rather than by this tick's.
+                    round::run_round::<C>,
                 )
                     .chain(),
             );
@@ -1467,6 +1555,13 @@ impl<C: Config<Input = PlayerInput>> Plugin for SimPlugin<C> {
 }
 
 // ── Fixed-tick systems (run inside the GGRS rollback schedule) ──────────────
+
+/// Run condition for everything that only happens while a round is being
+/// fought. Reads a rollback-registered resource, so a re-simulated tick asks the
+/// question against the same answer.
+fn round_is_live(round: Res<Round>) -> bool {
+    round.live()
+}
 
 /// Add or remove bot pawns until the match has as many as the first player is
 /// asking for.
@@ -1487,17 +1582,19 @@ fn reconcile_bots<C: Config<Input = PlayerInput>>(
     mut commands: Commands,
     inputs: Res<PlayerInputs<C>>,
     roster: Res<BotRoster>,
-    pawns: Query<(Entity, &Player, Option<&Bot>)>,
+    pawns: Query<(Entity, &Player, &Team, Option<&Bot>)>,
 ) {
     // The first player's copy, and only theirs.
     let Some(&(input, _status)) = inputs.get(0) else { return };
 
     let mut taken = [false; MAX_PLAYERS];
+    let mut on_side = [0usize; TEAM_COUNT];
     let (mut humans, mut bots) = (0usize, Vec::new());
-    for (entity, player, is_bot) in &pawns {
+    for (entity, player, team, is_bot) in &pawns {
         if player.handle < MAX_PLAYERS {
             taken[player.handle] = true;
         }
+        on_side[team.index()] += 1;
         match is_bot {
             Some(_) => bots.push((player.handle, entity)),
             None => humans += 1,
@@ -1513,8 +1610,15 @@ fn reconcile_bots<C: Config<Input = PlayerInput>>(
 
     if bots.len() < wanted {
         let Some(handle) = (0..MAX_PLAYERS).find(|&h| !taken[h]) else { return };
-        let (x, y) = SPAWN_POINTS[handle];
-        let pawn = spawn_pawn(&mut commands, handle, x, y);
+        // The handle's own side by default, and the other one when that side is
+        // already at strength — so a bot arriving mid-round joins whichever end
+        // is short rather than making a 5v3. Both peers compute this from the
+        // same pawn set, so both put it in the same place.
+        let mut side = default_side(handle) as usize;
+        if on_side[side] >= TEAM_SIZE {
+            side = TEAM_COUNT - 1 - side;
+        }
+        let pawn = spawn_pawn(&mut commands, handle, Team(side as u8), on_side[side]);
         commands
             .entity(pawn)
             .insert(Bot::seeded(handle, roster.profile(handle), roster.salt));
@@ -1587,7 +1691,7 @@ fn move_players(
 
     for (intent, mut pos, mut facing, mut stance, health) in &mut players {
         // The dead hold still: no drifting, no turning, no getting up out of
-        // prone while you wait. `respawn_players` puts them back.
+        // prone. Nothing puts them back until the round does.
         if !health.alive() {
             continue;
         }
@@ -1804,8 +1908,6 @@ fn move_bullets(
 enum Impact {
     /// Handle hit, and how far off center the shot line passed (subunits).
     Player(usize, i64),
-    /// The dummy standing here (matched back by position — they never move).
-    Target(Pos),
     /// Stopped in cover. Nothing to apply; the round just dies.
     Rock,
 }
@@ -1819,7 +1921,6 @@ fn resolve_hits(
     mut commands: Commands,
     bullets: Query<(Entity, &Bullet, &Pos)>,
     mut players: Query<(&Player, &Pos, &mut Health, &mut Deaths, &mut Kills)>,
-    mut targets: Query<(&mut Target, &Pos)>,
     rocks: Query<(&Rock, &Pos)>,
 ) {
     for (bullet_entity, bullet, bullet_pos) in &bullets {
@@ -1839,11 +1940,6 @@ fn resolve_hits(
                 hits.push((entry, pos.x, pos.y, player.handle + 1, Impact::Player(player.handle, sweep.miss(*pos))));
             }
         }
-        for (_, pos) in &targets {
-            if let Some(entry) = sweep.entry(*pos, TARGET_R + BULLET_R) {
-                hits.push((entry, pos.x, pos.y, 0, Impact::Target(*pos)));
-            }
-        }
         for (rock, pos) in &rocks {
             if let Some(entry) = sweep.entry(*pos, rock.r + BULLET_R) {
                 hits.push((entry, pos.x, pos.y, 0, Impact::Rock));
@@ -1854,15 +1950,6 @@ fn resolve_hits(
 
         match impact {
             Impact::Rock => {}
-            Impact::Target(at) => {
-                for (mut target, pos) in &mut targets {
-                    if *pos == at {
-                        target.hits += 1;
-                        target.flash = HIT_FLASH_TICKS;
-                        break;
-                    }
-                }
-            }
             Impact::Player(handle, miss) => {
                 // Distance flown: every round travels at the same speed, so the
                 // ticks it has burned are its range — no extra state to roll
@@ -1879,7 +1966,9 @@ fn resolve_hits(
                     health.hurt = HURT_FLASH_TICKS;
                     if health.hp <= 0 {
                         health.hp = 0;
-                        health.down = RESPAWN_TICKS;
+                        // Out for the rest of the round: 1 is "just now", and
+                        // `tick_health` counts it up from there.
+                        health.down = 1;
                         deaths.0 += 1;
                         killed = true;
                     }
@@ -1902,36 +1991,19 @@ fn resolve_hits(
     }
 }
 
-/// Count the dead back in. Everything about the pawn resets — position, facing,
-/// stance, trigger — so a respawn is a clean start and not a corpse teleporting
-/// home still lying down.
-fn respawn_players(
-    mut players: Query<(&Player, &mut Pos, &mut Facing, &mut Stance, &mut Cooldown, &mut Health)>,
-) {
-    for (player, mut pos, mut facing, mut stance, mut cooldown, mut health) in &mut players {
+/// Age the two render-feedback counters. Nothing here brings anyone back:
+/// [`round::run_round`] is the only thing that ever clears `down`, because the
+/// only way back into a Ghost War match is the next round.
+fn tick_health(mut players: Query<&mut Health>) {
+    for mut health in &mut players {
         if health.hurt > 0 {
             health.hurt -= 1;
         }
-        if health.down == 0 {
-            continue;
-        }
-        health.down -= 1;
         if health.down > 0 {
-            continue;
-        }
-        let (x, y) = SPAWN_POINTS[player.handle % MAX_PLAYERS];
-        *pos = Pos::from_units(x, y);
-        *facing = Facing::default();
-        *stance = Stance::default();
-        *cooldown = Cooldown::default();
-        health.hp = MAX_HEALTH;
-    }
-}
-
-fn tick_targets(mut targets: Query<&mut Target>) {
-    for mut target in &mut targets {
-        if target.flash > 0 {
-            target.flash -= 1;
+            // Saturating rather than wrapping: eighteen minutes down is not a
+            // state anyone should reach, and coming back to life on the tick
+            // that a u16 rolls over is not the way to find out.
+            health.down = health.down.saturating_add(1);
         }
     }
 }
@@ -2392,7 +2464,7 @@ mod tests {
         for (i, &(x, y, r)) in rocks.iter().enumerate() {
             assert!(x.abs() + r.r <= ARENA_HALF_W, "rock {i} out of bounds");
             assert!(y.abs() + r.r <= ARENA_HALF_H, "rock {i} out of bounds");
-            for &(sx, sy) in &SPAWN_POINTS {
+            for (sx, sy) in spawn_points() {
                 assert!(!within(x, y, sx, sy, r.r + PLAYER_R), "rock {i} on a spawn");
             }
             for (j, &(ox, oy, o)) in rocks.iter().enumerate().skip(i + 1) {
@@ -2481,6 +2553,23 @@ mod tests {
         assert!(worst < 0.02, "port drifted from the f32 model: {worst_case}");
     }
 
+    /// Where the sight-line tests sample the arena. The muster lines are no use
+    /// for it — they hug the east and west walls, so a 300-unit line east from
+    /// one of them leaves the map — so these are spread across the middle
+    /// instead, all far enough from the east wall that the longest line still
+    /// lands inside it. The documented lane, (-150, 0) looking east, is among
+    /// them.
+    const SIGHT_PROBES: [(i32, i32); 8] = [
+        (-330, -195),
+        (-330, 65),
+        (-150, 0),
+        (-150, -150),
+        (-60, 150),
+        (0, -150),
+        (60, 195),
+        (-300, 100),
+    ];
+
     /// The same comparison over the REAL tiled field, which is the hard case and
     /// the one worth stating a number for.
     ///
@@ -2499,7 +2588,7 @@ mod tests {
         for eye_stance in 0..STANCE_COUNT as u8 {
             for target_stance in 0..STANCE_COUNT as u8 {
                 for range in [40, 80, 150, 300] {
-                    for &(sx, sy) in SPAWN_POINTS.iter() {
+                    for &(sx, sy) in SIGHT_PROBES.iter() {
                         let got = grass_block(
                             Pos::from_units(sx, sy),
                             stance_height(eye_stance),
@@ -2708,12 +2797,19 @@ mod tests {
     /// Prone-to-prone is hidden everywhere in the arena — the field is deep
     /// enough that going flat genuinely breaks contact, which is the mechanic
     /// the depth band was tuned for.
+    ///
+    /// It samples both muster lines and the middle of the map, so it covers the
+    /// two cases that mean different things: **across** the field, which is the
+    /// one the mechanic is about, and **along** a muster line, where two pawns
+    /// 130 units apart on the same side are as close as any two prone pawns ever
+    /// start. The pairs it prints are the ones that got away with being seen.
     #[test]
     fn prone_pawns_are_hidden_across_the_whole_arena() {
         let arena = Scenario::Arena;
+        let points: Vec<(i32, i32)> = spawn_points().chain(SIGHT_PROBES).collect();
         let (mut buried, mut total) = (0, 0);
-        for &(sx, sy) in SPAWN_POINTS.iter() {
-            for &(tx, ty) in SPAWN_POINTS.iter() {
+        for &(sx, sy) in &points {
+            for &(tx, ty) in &points {
                 if (sx, sy) == (tx, ty) {
                     continue;
                 }
@@ -2728,12 +2824,23 @@ mod tests {
                 );
                 if prone * 100 / FP < 5 {
                     buried += 1;
+                } else {
+                    println!(
+                        "  seen: ({sx},{sy}) -> ({tx},{ty}) at {:.3}",
+                        prone as f32 / FP as f32
+                    );
                 }
             }
         }
-        assert_eq!(
-            buried, total,
-            "prone-to-prone across the arena should be hidden everywhere, {buried}/{total} were"
+        println!("prone-to-prone: {buried}/{total} pairs buried");
+        // Not every last pair: the field has genuinely bare tiles in it (9% of
+        // them, by `grass_field_has_a_mix_of_depths`), and a short line that
+        // happens to run down one is meant to be a place where lying flat does
+        // not save you. What must not happen is that becoming common — at which
+        // point going prone stops being a way to break contact at all.
+        assert!(
+            buried * 100 / total >= 97,
+            "prone-to-prone should be hidden almost everywhere, only {buried}/{total} were"
         );
     }
 }

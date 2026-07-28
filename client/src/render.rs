@@ -8,8 +8,8 @@ use bevy::sprite::Anchor;
 use bevy_ggrs::LocalPlayers;
 
 use army_ghosts_sim::{
-    Bullet, Bush, Facing, Health, Player, Pos, Rock, Scenario, Stance, Target, ARENA_HALF_H,
-    ARENA_HALF_W, STANCE_COUNT, STANCE_STAND, TARGET_R,
+    Bullet, Bush, Facing, Health, Player, Pos, Rock, Scenario, Stance, Team, ARENA_HALF_H,
+    ARENA_HALF_W, STANCE_COUNT, STANCE_STAND, TEAM_COUNT,
 };
 
 use crate::ads::Ads;
@@ -218,21 +218,46 @@ pub struct TrailSegment {
     ttl: f32,
 }
 
-/// Per-handle tints, multiplied over the grayscale sheet. Desaturated — these
-/// are uniforms, not team jerseys — but kept well ABOVE the ground tile in
-/// value. Muted is not the same as invisible: the grass is a dark olive
-/// (62,74,42) and a soldier tinted down into that range vanishes into it, so
-/// the separation here is value, not saturation.
-const PLAYER_COLORS: [Color; 8] = [
-    Color::srgb(0.66, 0.74, 0.50), // olive drab
-    Color::srgb(0.82, 0.74, 0.54), // khaki
-    Color::srgb(0.62, 0.70, 0.76), // field grey
-    Color::srgb(0.78, 0.58, 0.48), // brick
-    Color::srgb(0.84, 0.78, 0.62), // sand
-    Color::srgb(0.62, 0.58, 0.70), // slate
-    Color::srgb(0.52, 0.72, 0.68), // teal drab
-    Color::srgb(0.84, 0.66, 0.44), // ochre
+/// Team tints, multiplied over the grayscale sheet: the classic army-men GREEN
+/// and TAN, which is the whole reason this game looks the way it does.
+///
+/// Colour is now what tells friend from foe, which makes it a gameplay reading
+/// rather than decoration and changes what it has to satisfy. Two constraints,
+/// and they pull against each other:
+/// * **Both must sit well ABOVE the ground tile in value.** The grass is a dark
+///   olive (62,74,42) and a soldier tinted down into that range vanishes into
+///   it. That was true when these were per-player uniforms and it is worse now —
+///   the green side is the one at risk, so its green is a pale sage rather than
+///   anything field-coloured.
+/// * **They must differ in HUE AND VALUE, not hue alone.** Under the fog these
+///   are drawn at reduced alpha over a green field, and two colours separated
+///   only by hue converge as they fade. Tan is the brighter of the two by a
+///   clear margin, so a half-faded figure is still identifiable.
+const TEAM_COLORS: [Color; TEAM_COUNT] = [
+    Color::srgb(0.60, 0.78, 0.52), // green — pale sage, deliberately not field green
+    Color::srgb(0.88, 0.79, 0.58), // tan
 ];
+
+/// Human-facing names for the two sides. Used by the menu's team dial, the round
+/// banner and the roster, so all three agree.
+pub const TEAM_NAMES: [&str; TEAM_COUNT] = ["GREEN", "TAN"];
+
+/// How far a pawn's tint is nudged per slot within its side, so four figures in
+/// the same colours are still four figures. Small on purpose: this must never
+/// grow far enough to make one side's darkest read as the other side's
+/// lightest.
+const TEAM_SHADE_STEP: f32 = 0.05;
+
+/// The tint a pawn wears: its side's colour, shaded a little by its handle.
+pub fn team_color(team: Team, handle: usize) -> Color {
+    let base = TEAM_COLORS[team.index()];
+    // Handles alternate between the sides, so `handle / TEAM_COUNT` is the
+    // pawn's place within its own — 0, 1, 2, 3 rather than 0, 2, 4, 6.
+    let step = (handle / TEAM_COUNT) as f32 * TEAM_SHADE_STEP;
+    let shade = 1.0 - step;
+    let rgb = base.to_srgba();
+    Color::srgb(rgb.red * shade, rgb.green * shade, rgb.blue * shade)
+}
 
 /// The colour a pawn flashes toward when a round lands on it, and how far. Not
 /// all the way to red: the tint has to read as "that one just got hit" at a
@@ -330,24 +355,24 @@ pub fn attach_sprites(
     tracer: Res<TracerImage>,
     rock_sheet: Res<RockSheet>,
     bush_sheet: Res<BushSheet>,
-    new_players: Query<(Entity, &Player), Added<Player>>,
+    new_players: Query<(Entity, &Player, &Team), Added<Player>>,
     new_bullets: Query<(Entity, &Bullet), Added<Bullet>>,
     stances: Query<(&Player, &Stance)>,
-    new_targets: Query<Entity, Added<Target>>,
     new_rocks: Query<(Entity, &Rock), Added<Rock>>,
     new_bushes: Query<(Entity, &Bush), Added<Bush>>,
 ) {
-    for (entity, player) in &new_players {
-        // Grayscale soldier sheet x per-player tint = one-color plastic
-        // figure. Rifle direction comes from `orient_players` rotation;
-        // walk/run frames from `animate_players`.
+    for (entity, player, team) in &new_players {
+        // Grayscale soldier sheet x team tint = one-color plastic figure. The
+        // facing comes from picking a sheet row; walk/run frames from
+        // `animate_players`. `update_health_visuals` rewrites the colour every
+        // frame — this is only what it looks like before the first one.
         let sprite = Sprite {
             image: soldier.image.clone(),
             texture_atlas: Some(TextureAtlas {
                 layout: soldier.layout.clone(),
                 index: IDLE_FRAME,
             }),
-            color: PLAYER_COLORS[player.handle % PLAYER_COLORS.len()],
+            color: team_color(*team, player.handle),
             custom_size: Some(Vec2::splat(SOLDIER_SIZE)),
             ..default()
         };
@@ -384,13 +409,6 @@ pub fn attach_sprites(
             TrailState::default(),
             Transform::from_xyz(0.0, 0.0, Z_BULLET)
                 .with_rotation(Quat::from_rotation_z(angle)),
-        ));
-    }
-    for entity in &new_targets {
-        commands.entity(entity).insert((
-            Sprite::from_color(Color::srgb(0.55, 0.55, 0.55), Vec2::splat((TARGET_R * 2) as f32)),
-            Grounded { reach: TARGET_R as f32, bias: 0.0 },
-            Transform::default(),
         ));
     }
     for (entity, rock) in &new_rocks {
@@ -525,14 +543,14 @@ pub fn animate_players(
 /// goes through `Visibility` for the same reason: an alpha of zero here would
 /// be overwritten a system later.
 pub fn update_health_visuals(
-    mut players: Query<(&Player, &Health, &mut Sprite, &mut Visibility), With<Player>>,
+    mut players: Query<(&Player, &Team, &Health, &mut Sprite, &mut Visibility), With<Player>>,
 ) {
-    for (player, health, mut sprite, mut visibility) in &mut players {
+    for (player, team, health, mut sprite, mut visibility) in &mut players {
         let wanted = if health.alive() { Visibility::Inherited } else { Visibility::Hidden };
         if *visibility != wanted {
             *visibility = wanted;
         }
-        let base = PLAYER_COLORS[player.handle % PLAYER_COLORS.len()];
+        let base = team_color(*team, player.handle);
         let tint = if health.hurt > 0 {
             base.mix(&HURT_COLOR, HURT_MIX)
         } else {
@@ -589,12 +607,10 @@ pub fn bullet_trails(
     }
 }
 
-/// Mirror integer sim positions into render transforms, and flash targets that
-/// were just hit.
+/// Mirror integer sim positions into render transforms.
 pub fn sync_transforms(
     mut movers: Query<(&Pos, Option<&Grounded>, &mut Transform), Without<Bullet>>,
     mut bullets: Query<(&Pos, &MuzzleLift, &mut Transform), With<Bullet>>,
-    mut targets: Query<(&Target, &mut Sprite)>,
 ) {
     for (pos, grounded, mut transform) in &mut movers {
         let (x, y) = pos.to_f32();
@@ -613,13 +629,6 @@ pub fn sync_transforms(
         transform.translation.x = x;
         transform.translation.y = y + lift.0;
     }
-    for (target, mut sprite) in &mut targets {
-        sprite.color = if target.flash > 0 {
-            Color::srgb(0.95, 0.25, 0.2)
-        } else {
-            Color::srgb(0.55, 0.55, 0.55)
-        };
-    }
 }
 
 /// Where the camera is easing to, before the aim shift. Tracked separately
@@ -631,10 +640,12 @@ pub struct CameraFocus(Vec2);
 /// Keep the local player centered-ish: the camera eases toward them, offset by
 /// however far sights are raised. (Uses floats freely — camera position is
 /// render-only state.)
+#[allow(clippy::too_many_arguments)]
 pub fn camera_follow(
     local_players: Option<Res<LocalPlayers>>,
+    spectating: Res<crate::spectate::Spectating>,
     players: Query<(&Player, &Pos)>,
-    mut cameras: Query<&mut Transform, (With<Camera2d>, Without<Player>)>,
+    mut cameras: Query<(&mut Transform, &Projection), (With<Camera2d>, Without<Player>)>,
     mut focus: ResMut<CameraFocus>,
     ads: Res<Ads>,
     time: Res<Time>,
@@ -647,14 +658,40 @@ pub fn camera_follow(
     }
     let Some(local) = local_players else { return };
     let Some(first_local) = local.0.first() else { return };
-    let Some((_, pos)) = players.iter().find(|(p, _)| p.handle == *first_local) else {
+    // Whoever you are watching if you are out, otherwise your own pawn. The
+    // camera eases to them rather than cutting, which also does the work of
+    // making the change of subject legible — you see the ground go past.
+    let watched = spectating.watching.unwrap_or(*first_local);
+    let Some((_, pos)) = players.iter().find(|(p, _)| p.handle == watched) else {
         return;
     };
-    let Ok(mut camera) = cameras.single_mut() else { return };
+    let Ok((mut camera, projection)) = cameras.single_mut() else { return };
     let (x, y) = pos.to_f32();
     let t = (time.delta_secs() * 5.0).min(1.0);
     focus.0 = focus.0.lerp(Vec2::new(x, y), t);
-    let aim = focus.0 + ads.camera_offset();
+    let aim = clamp_to_arena(focus.0 + ads.camera_offset(), projection);
     camera.translation.x = aim.x;
     camera.translation.y = aim.y;
+}
+
+/// Keep the view on the map.
+///
+/// This became necessary when the two sides moved to opposite ENDS of the arena:
+/// the muster posts sit 70 units from the wall and 105 from the corner, so a
+/// pawn standing on one used to put roughly a third of the screen outside the
+/// world — black on three sides, with the fight happening in the corner you were
+/// not looking at. The old scattered spawns were all 150 units from the middle
+/// and never came close to an edge, which is why nothing needed this before.
+///
+/// Along an axis where the arena is SMALLER than the view there is nothing to
+/// clamp to and the whole map is on screen anyway, so it centres instead —
+/// otherwise the two bounds cross and the camera snaps to a corner.
+fn clamp_to_arena(aim: Vec2, projection: &Projection) -> Vec2 {
+    let Projection::Orthographic(ortho) = projection else { return aim };
+    let half = ortho.area.size() / 2.0;
+    let arena = Vec2::new(ARENA_HALF_W as f32, ARENA_HALF_H as f32);
+    Vec2::new(
+        if half.x >= arena.x { 0.0 } else { aim.x.clamp(-(arena.x - half.x), arena.x - half.x) },
+        if half.y >= arena.y { 0.0 } else { aim.y.clamp(-(arena.y - half.y), arena.y - half.y) },
+    )
 }

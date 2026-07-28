@@ -161,7 +161,9 @@ pub fn update_stance_buttons(
         if down {
             control.wanted >= STANCE_PRONE
         } else {
-            control.wanted <= STANCE_STAND
+            // `==`, not `<=`: standing is level 0, so there is nothing below it
+            // and clippy rightly calls the comparison absurd.
+            control.wanted == STANCE_STAND
         }
     };
     for (mut background, button) in &mut buttons {

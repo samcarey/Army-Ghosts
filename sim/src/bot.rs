@@ -55,8 +55,9 @@
 use bevy::prelude::*;
 
 use crate::{
-    isqrt, visible_fraction, Health, Intent, Occluder, Player, PlayerInput, Pos, Scenario,
-    Stance, BTN_FIRE, FP, MAX_PLAYERS, STANCE_CROUCH, STANCE_PRONE, STANCE_STAND,
+    isqrt, segment_hits_circle, spawn_post, visible_fraction, Health, Intent, Occluder, Player,
+    PlayerInput, Pos, Scenario, Stance, Team, BTN_FIRE, BULLET_R, FP, MAX_PLAYERS,
+    PLAYER_R, STANCE_CROUCH, STANCE_PRONE, STANCE_STAND, TEAM_SIZE,
 };
 
 /// How many ticks of sightings a bot keeps. Caps [`BotProfile::reaction`]: at
@@ -92,6 +93,94 @@ const HURT_FRACTION: i32 = FP * 2 / 5;
 /// body widths: inside the range where damage barely falls off, outside arm's
 /// reach.
 const PUSH_STANDOFF: i32 = 72;
+
+/// How much clearance a teammate needs either side of the shot line before the
+/// bot will pull the trigger, world units on top of the round's own hitbox.
+///
+/// Friendly fire is on, and it costs a round now that nobody respawns: a
+/// teammate you shoot is a gun your side fights the rest of the round without.
+/// So this is not politeness, it is arithmetic. Generous — half a body again —
+/// because the bot is aiming at where it *thinks* the enemy is and the round has
+/// jitter on it, so a line that only just clears a friend is a line that
+/// sometimes doesn't.
+const FRIENDLY_CLEARANCE: i32 = 12;
+
+/// Where a bot heads when nothing has been seen yet, world units: **the middle
+/// of the enemy's muster line**.
+///
+/// Something like this became necessary the moment the sides started at opposite
+/// ends of the field. Under the old scattered spawns every bot could see someone
+/// within a second, so "no contact" was a state that barely existed and
+/// [`Act::Hunt`] only ever needed a last known position to walk to. Now a round
+/// opens with 660 units of grass between the two sides and NOBODY has a last
+/// known position — so without an objective the whole field would crouch down
+/// where it stood and wait out the clock, and every round would be a draw.
+///
+/// **Which point, exactly, turned out to matter far more than it sounds like it
+/// should**, so all three candidates were run through the self-play harness
+/// rather than argued about. Twenty pairs each, identical profiles both sides,
+/// counting how many of the 360 rounds ended level — a drawn round being the
+/// signature of two sides that never found each other:
+///
+/// | objective                       | drawn | mean round |
+/// |---------------------------------|-------|------------|
+/// | middle of the enemy line (this) |  **4**|      72 s  |
+/// | the post opposite its own       |    56 |      80 s  |
+/// | the middle of its OWN lane      |   132 |      88 s  |
+///
+/// The two rejected ones are the intuitive ones, which is why they are worth
+/// recording. Sending each bot to the post facing it fans the line out nicely
+/// and then walks the two sides PAST each other down parallel corridors with
+/// grass in between, after which both sit down on the ground they have just
+/// swapped. Sending each to the middle of its own lane is the same failure
+/// earlier: they stop at the halfway line, four abreast, and a side that has
+/// arrived has nothing left to advance toward.
+///
+/// Converging on one point looks like it should bunch them into a column — and
+/// it does, at the end — but the 540 units they cover getting there is where the
+/// fighting happens, and arriving late and bunched beats arriving early and
+/// apart. The concern is real enough to have its own mitigation:
+/// [`blocked_by_a_friend`] is what stops a column shooting through itself.
+fn objective(team: Team) -> Pos {
+    let line = team.other().0;
+    // The posts are symmetric about y = 0, so the middle of the line is the
+    // average of its two ends whatever `TEAM_SIZE` is.
+    let (x, top) = spawn_post(line, TEAM_SIZE - 1);
+    let (_, bottom) = spawn_post(line, 0);
+    Pos::from_units(x, (top + bottom) / 2)
+}
+
+/// How close counts as arriving at the objective, world units.
+///
+/// `Act::Hunt`'s third consideration is how much ground there is left to make,
+/// and it fades to nothing over the last `ARRIVED * 6` units of the walk. The
+/// SCALE of that ramp is load-bearing in a way that is easy to get wrong, and
+/// both ends of the range have been measured:
+///
+/// * `ARENA_HALF_W * 2` (800), on the reasoning that distance should be measured
+///   against the biggest distance in the arena, leaves the consideration under
+///   `Act::Settle`'s flat weight while the bot is still 165 units short. Against
+///   an objective in the middle of the field that meant both sides sitting down
+///   330 units apart — outside [`ENGAGE_RANGE`] — and a full arena of bots firing
+///   NOT ONE ROUND in a minute.
+/// * `ARRIVED` alone (80) is the other extreme: the bot walks all the way in.
+///   With the objective on the enemy line that is a charge into their spawn, and
+///   it tripled the drawn-round rate (12 of 360 against 4).
+///
+/// `ARRIVED * 6` stops a bot about 120 units short of the enemy line, which is
+/// roughly where the two advances meet. The constant itself is a few body widths
+/// because that is the unit "have I arrived" is naturally measured in; the
+/// multiplier is what the harness picked.
+const ARRIVED: i32 = 80;
+
+/// How much a bot wants to walk to its objective when it has seen nobody.
+///
+/// Fixed rather than a [`BotProfile`] dial, because it is not a personality: a
+/// side that will not leave its own half is not playing a cautious game, it is
+/// not playing. Comfortably above [`Act::Settle`]'s `FP / 8` so the walk always
+/// wins while there is ground to make, and comfortably below `FP` so a hurt bot
+/// still prefers `Act::Break` — the `hp` consideration on both is what arbitrates.
+const ADVANCE: i32 = FP / 2;
 
 /// What a bot knows about the biggest threat at one past tick.
 ///
@@ -197,6 +286,22 @@ impl Default for BotProfile {
     /// A competent but beatable opponent: a quarter-second to react, aim good
     /// enough to punish standing in the open, and no strong lean either way
     /// between pushing and holding.
+    ///
+    /// **These are unchanged by the move to rounds, and one of them nearly
+    /// wasn't.** With the sides mustering a field apart, `aggression=0.2` came
+    /// out ahead of this `0.5` in every decisive pair, which reads as a clear
+    /// instruction to lower it — and lowering it was wrong. The dial was
+    /// weighting `Act::Hunt` as well as `Act::Push` at the time, so a low setting
+    /// was not "fight more patiently", it was "don't cross the field"; the
+    /// winning bot was winning by making its opponent do all the walking. Adopted
+    /// as the default it played itself to a standstill — 330 of 450 rounds drawn.
+    /// The fix was to give the advance its own weight ([`ADVANCE`]), after which
+    /// 0.2 against 0.5 is **150 pairs, none of them decisive**: no difference at
+    /// all.
+    ///
+    /// What survives that is the ends of the range, which still say what they
+    /// said: `0.9` loses (about -251 elo). So the shape of the finding is "don't
+    /// charge", not "hang back", and the middle is where it already was.
     fn default() -> Self {
         Self {
             skill: FP * 3 / 5,
@@ -385,10 +490,10 @@ enum Act {
 /// Both read `Pos`, which is fine, and neither writes what the other reads.
 pub fn bot_think(
     scenario: Res<Scenario>,
-    pawns: Query<(&Player, &Pos, &Stance, &Health)>,
+    pawns: Query<(&Player, &Team, &Pos, &Stance, &Health)>,
     rocks: Query<(&crate::Rock, &Pos)>,
     bushes: Query<(&crate::Bush, &Pos)>,
-    mut bots: Query<(&Player, &Pos, &Stance, &Health, &mut Bot, &mut Intent)>,
+    mut bots: Query<(&Player, &Team, &Pos, &Stance, &Health, &mut Bot, &mut Intent)>,
 ) {
     // Built once and shared: a pairwise sweep asks this many times over.
     // Order-independent — every use is an `any()` — so no sort is needed.
@@ -400,28 +505,58 @@ pub fn bot_think(
 
     // Sorted by handle: target selection breaks ties on it, and query order is
     // not a determinism guarantee.
-    let mut others: Vec<(usize, Pos, u8, bool)> = pawns
+    let mut others: Vec<Contact> = pawns
         .iter()
-        .map(|(player, pos, stance, health)| {
-            (player.handle, *pos, stance.level, health.alive())
+        .map(|(player, team, pos, stance, health)| Contact {
+            handle: player.handle,
+            team: *team,
+            pos: *pos,
+            stance: stance.level,
+            alive: health.alive(),
         })
         .collect();
-    others.sort_unstable_by_key(|&(handle, ..)| handle);
+    others.sort_unstable_by_key(|c| c.handle);
 
-    for (player, pos, stance, health, mut bot, mut intent) in &mut bots {
+    for (player, team, pos, stance, health, mut bot, mut intent) in &mut bots {
         // The dead do nothing. Still push an empty sighting so the memory keeps
         // advancing in step with the tick count — otherwise "12 ticks ago"
-        // would mean something different after every respawn.
+        // would mean something different after every round.
         if !health.alive() {
             bot.memory.push(Sighting::default());
             *intent = Intent::default();
             continue;
         }
 
-        let seen = look(&scenario, &occluders, player.handle, *pos, stance.level, &others);
+        let seen = look(
+            &scenario,
+            &occluders,
+            player.handle,
+            *team,
+            *pos,
+            stance.level,
+            &others,
+        );
         bot.memory.push(seen);
-        *intent = decide(&mut bot, *pos, stance.level, health);
+        // Only the friends worth not shooting: living, and not this bot.
+        let friends: Vec<Pos> = others
+            .iter()
+            .filter(|c| c.alive && c.team == *team && c.handle != player.handle)
+            .map(|c| c.pos)
+            .collect();
+        *intent = decide(&mut bot, *pos, *team, stance.level, health, &friends);
     }
+}
+
+/// One pawn as the brain sees it. A struct rather than a tuple because it grew a
+/// `team` and "which of these five fields was the bool again" is exactly the
+/// sort of thing that silently makes a bot shoot its own side.
+#[derive(Copy, Clone, Debug)]
+struct Contact {
+    handle: usize,
+    team: Team,
+    pos: Pos,
+    stance: u8,
+    alive: bool,
 }
 
 /// The most dangerous enemy this bot can see right now, from its own eyes.
@@ -433,30 +568,36 @@ fn look(
     scenario: &Scenario,
     occluders: &[Occluder],
     me: usize,
+    my_team: Team,
     pos: Pos,
     stance: u8,
-    others: &[(usize, Pos, u8, bool)],
+    others: &[Contact],
 ) -> Sighting {
     let mut best = Sighting::default();
     let mut best_key = (0i32, i64::MAX, usize::MAX);
-    for &(handle, their_pos, their_stance, alive) in others {
-        if handle == me || !alive {
+    for other in others {
+        // Teammates are not threats and are never shot at. This is the only
+        // place friend and foe are told apart, deliberately: everything
+        // downstream reads the memory buffer, so a teammate that never gets into
+        // it can never be aimed at, led, hunted or broken away from.
+        if other.handle == me || !other.alive || other.team == my_team {
             continue;
         }
-        let exposure = visible_fraction(scenario, pos, stance, their_pos, their_stance, occluders);
+        let exposure =
+            visible_fraction(scenario, pos, stance, other.pos, other.stance, occluders);
         if exposure == 0 {
             continue;
         }
-        let d2 = dist2(pos, their_pos);
+        let d2 = dist2(pos, other.pos);
         // More exposed wins; nearer breaks that tie; handle breaks that one, so
         // two identically-placed pawns can't flip the answer between peers.
-        let key = (exposure, -d2, usize::MAX - handle);
+        let key = (exposure, -d2, usize::MAX - other.handle);
         if key > best_key {
             best_key = key;
             best = Sighting {
-                who: handle as u8,
-                pos: their_pos,
-                stance: their_stance,
+                who: other.handle as u8,
+                pos: other.pos,
+                stance: other.stance,
                 exposure,
             };
         }
@@ -468,8 +609,10 @@ fn look(
 fn decide(
     bot: &mut Bot,
     pos: Pos,
+    team: Team,
     stance: u8,
     health: &Health,
+    friends: &[Pos],
 ) -> Intent {
     let profile = bot.profile;
     let hp = health.fraction();
@@ -487,7 +630,17 @@ fn decide(
         ),
         None => (0, 0, None),
     };
-    let has_stale = if stale.is_some() { FP } else { 0 };
+    // Where to go when there is nothing to shoot at: the last place anyone was
+    // seen if there is one, otherwise the enemy line. How much that is worth is
+    // how far away it still is — a bot that has arrived has nothing left to
+    // advance toward and should be looking around instead of walking into a wall.
+    let (march, ground_to_make) = match stale {
+        Some(s) => (s.pos, FP),
+        None => {
+            let aim = objective(team);
+            (aim, not(nearness(units(dist(pos, aim)), ARRIVED * 6)))
+        }
+    };
     let cowardice = sharp(hurt) * profile.caution / FP;
 
     // Every behavior scores on exactly three considerations — see `score`.
@@ -501,10 +654,47 @@ fn decide(
         (Act::Push, score(profile.aggression, visible, not(near), hp)),
         // Breaking is the mirror: hurt, and someone has eyes on you.
         (Act::Break, score(profile.caution, cowardice, sharp(visible), FP)),
-        // Nothing in sight but somewhere to go.
-        (Act::Hunt, score(profile.aggression, not(visible), has_stale, hp)),
+        // Nothing in sight, but there is always somewhere to go — the enemy
+        // line, if nobody has been seen yet.
+        //
+        // **Weighted by `ADVANCE`, NOT by `aggression`**, and that separation is
+        // the whole reason the dial means anything now. It used to be
+        // `aggression`, which quietly made one number do two jobs: how hard to
+        // push someone you can SEE, and whether to cross the field at all. Under
+        // the old respawning arena those never came apart, because the spawns
+        // were 300 units from each other and there was nothing to cross.
+        //
+        // With the sides a field apart it broke in the most misleading way
+        // possible: 0.2 aggression beats the 0.5 default in EVERY decisive pair
+        // — because it lets the other side do the walking and shoots them as
+        // they arrive — and then 0.2 against ITSELF is two teams sitting on
+        // their own halves. Measured, after adopting 0.2 as the default and
+        // before this split: **330 of 450 rounds drawn**, mean round 101 s of a
+        // 120 s clock. A dial whose best setting makes the game stop is a dial
+        // wired to the wrong thing.
+        //
+        // So closing on a visible enemy is aggression, and walking to an
+        // objective you have seen nobody at is not — it is just playing.
+        (Act::Hunt, score(ADVANCE, not(visible), ground_to_make, hp)),
         // The default. Deliberately weak, so it wins only when nothing else
         // scores at all — a bot that settles while being shot at is a bug.
+        //
+        // **`FP / 8` is the pace of the whole game and it was measured.** In a
+        // field this deep `visible` is a fraction almost everywhere, so
+        // `sharp(visible)` on `Fight` leaves this competitive with real
+        // behaviours far more often than the "only when nothing else scores"
+        // above makes it sound — which is exactly why halving it is such a
+        // violent change. Twenty pairs of identical profiles, mean round length
+        // net of the intermission:
+        //
+        //   FP / 8   — 66 s of fighting, 4 of 360 rounds drawn
+        //   FP / 16  — 5.5 s, 2 of 360 drawn
+        //
+        // Both are decisive; only one is a round. At `FP / 16` eight bots wipe
+        // each other out before a human could cross the field, because nobody
+        // ever holds still and the whole match is one charge. Deep grass plus a
+        // long approach is what makes creeping worth anything, and this weight
+        // is what buys it. Do not treat it as a spare knob.
         (Act::Settle, score(FP / 8, not(visible), FP, FP)),
     ] {
         // Strictly greater, and the list order is fixed, so ties resolve to the
@@ -515,7 +705,7 @@ fn decide(
     }
 
     match best.1 {
-        Act::Fight => engage(bot, pos, target, stance, true),
+        Act::Fight => engage(bot, pos, target, stance, friends, true),
         Act::Push => {
             // Already close enough: hold and shoot rather than walk into them.
             // `engage(hold)` roots the pawn, so this is `Act::Fight` in all but
@@ -523,7 +713,7 @@ fn decide(
             let inside = target
                 .map(|t| units(dist(pos, t.pos)) <= PUSH_STANDOFF)
                 .unwrap_or(true);
-            let mut intent = engage(bot, pos, target, stance, inside);
+            let mut intent = engage(bot, pos, target, stance, friends, inside);
             if let (false, Some(t)) = (inside, target) {
                 let (dx, dy) = toward(pos, t.pos);
                 intent.0.move_x = dx;
@@ -545,11 +735,9 @@ fn decide(
         }
         Act::Hunt => {
             let mut intent = Intent::default();
-            if let Some(t) = stale {
-                let (dx, dy) = toward(pos, t.pos);
-                intent.0.move_x = dx;
-                intent.0.move_y = dy;
-            }
+            let (dx, dy) = toward(pos, march);
+            intent.0.move_x = dx;
+            intent.0.move_y = dy;
             intent
         }
         Act::Settle => {
@@ -569,7 +757,14 @@ fn decide(
 /// Face a target and (optionally) fire, with Quake III's aim model: the shot
 /// goes at where the bot *thinks* they are, which is where they were one
 /// reaction time ago, plus a jitter scaled by how inaccurate it is.
-fn engage(bot: &mut Bot, pos: Pos, target: Option<Sighting>, stance: u8, hold: bool) -> Intent {
+fn engage(
+    bot: &mut Bot,
+    pos: Pos,
+    target: Option<Sighting>,
+    stance: u8,
+    friends: &[Pos],
+    hold: bool,
+) -> Intent {
     let mut intent = Intent(PlayerInput::default());
     intent.0.set_stance(stance.min(STANCE_PRONE));
     let Some(t) = target else { return intent };
@@ -612,10 +807,26 @@ fn engage(bot: &mut Bot, pos: Pos, target: Option<Sighting>, stance: u8, hold: b
         // anywhere. Same bit a player's sights button sets.
         intent.0.buttons |= crate::BTN_ADS;
     }
-    if units(dist(pos, t.pos)) <= ENGAGE_RANGE {
+    // Face them regardless, but only shoot if the lane is your own.
+    if units(dist(pos, t.pos)) <= ENGAGE_RANGE && !blocked_by_a_friend(pos, aim, friends) {
         intent.0.buttons |= BTN_FIRE;
     }
     intent
+}
+
+/// Is one of your own standing in the way?
+///
+/// Tested against the JITTERED aim point rather than the target, because that is
+/// the line the round will actually take. Only friends between the muzzle and
+/// the aim point count — someone standing well behind the target is not in
+/// danger, and a bot that thought otherwise would refuse to fire across half the
+/// field whenever a teammate happened to be beyond it.
+fn blocked_by_a_friend(pos: Pos, aim: Pos, friends: &[Pos]) -> bool {
+    let reach = PLAYER_R + BULLET_R + FRIENDLY_CLEARANCE;
+    let range = dist2(pos, aim);
+    friends
+        .iter()
+        .any(|&friend| dist2(pos, friend) < range && segment_hits_circle(pos, aim, friend, reach))
 }
 
 // ── Small geometry helpers ──────────────────────────────────────────────────

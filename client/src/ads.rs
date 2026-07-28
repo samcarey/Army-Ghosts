@@ -11,8 +11,7 @@ use bevy::prelude::*;
 use bevy_ggrs::LocalPlayers;
 
 use army_ghosts_sim::{
-    Facing, Player, Pos, Rock, Stance, Target, ARENA_HALF_H, ARENA_HALF_W, BULLET_R, PLAYER_R,
-    TARGET_R,
+    Facing, Player, Pos, Rock, Stance, ARENA_HALF_H, ARENA_HALF_W, BULLET_R, PLAYER_R,
 };
 
 /// How far the camera slides toward what you're aiming at, world units (=
@@ -178,13 +177,12 @@ fn local_facing(
 }
 
 /// Stretch the white line from the muzzle along the aim, stopping where the
-/// bullet would: at the first target or boulder it would hit, else at the arena
+/// bullet would: at the first boulder it would hit, else at the arena
 /// edge (bullets outrange the arena, so their tick TTL never decides this).
 pub fn update_aim_line(
     ads: Res<Ads>,
     local_players: Option<Res<LocalPlayers>>,
     players: Query<(&Player, &Pos, &Facing, &Stance)>,
-    targets: Query<&Pos, With<Target>>,
     rocks: Query<(&Rock, &Pos)>,
     mut lines: Query<(&mut Transform, &mut Sprite, &mut Visibility), With<AimLine>>,
 ) {
@@ -210,11 +208,9 @@ pub fn update_aim_line(
         return;
     };
 
-    let blockers = targets
+    let range = rocks
         .iter()
-        .map(|pos| (pos, TARGET_R))
-        .chain(rocks.iter().map(|(rock, pos)| (pos, rock.r)));
-    let range = blockers
+        .map(|(rock, pos)| (pos, rock.r))
         .filter_map(|(pos, radius)| {
             let (x, y) = pos.to_f32();
             ray_circle_range(start, dir, Vec2::new(x, y), (radius + BULLET_R) as f32)

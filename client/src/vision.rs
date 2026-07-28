@@ -54,8 +54,8 @@ use bevy::sprite_render::{AlphaMode2d, Material2d, Material2dKey, Material2dPlug
 use bevy_ggrs::LocalPlayers;
 
 use army_ghosts_sim::{
-    Block as SimBlock, Bush, Player, Pos, Rock, Scenario, Stance, ARENA_HALF_H, ARENA_HALF_W, FP,
-    PLAYER_R, STANCE_HEIGHT,
+    Block as SimBlock, Bush, Player, Pos, Rock, Scenario, Stance, Team, ARENA_HALF_H, ARENA_HALF_W,
+    FP, PLAYER_R, STANCE_HEIGHT,
 };
 
 /// Unlit ground: dark enough to read as "no information", light enough to tell
@@ -699,23 +699,31 @@ fn eye_height(stance: &Stance) -> f32 {
 ///
 /// The grass term multiplies with that — two independent ways of not being seen,
 /// so a bush in front of a pawn already lying in deep grass compounds.
+///
+/// **Your own side is exempt.** Teammates are drawn at full opacity wherever
+/// they are, which is a deliberate departure from "you see what your pawn can
+/// see": in a game without respawns, not knowing whether the four people you are
+/// relying on are alive and where makes the whole thing unplayable, and every
+/// squad shooter solves it the same way. What it costs is that the fog is no
+/// longer a pure statement about sight lines — a teammate visible through a
+/// boulder is you reading a radio, not your eyes.
 pub fn fade_hidden(
     local_players: Option<Res<LocalPlayers>>,
     rocks: Query<(&Rock, &Pos)>,
     bushes: Query<(&Bush, &Pos)>,
-    mut players: Query<(&Player, &Pos, &Stance, &mut Sprite), With<Player>>,
+    mut players: Query<(&Player, &Team, &Pos, &Stance, &mut Sprite), With<Player>>,
     scenario: Res<Scenario>,
 ) {
     let Some(local) = local_players else { return };
     let Some(&handle) = local.0.first() else { return };
-    let eye = players
+    let me = players
         .iter()
-        .find(|(p, _, _, _)| p.handle == handle)
-        .map(|(_, pos, stance, _)| {
+        .find(|(p, ..)| p.handle == handle)
+        .map(|(_, team, pos, stance, _)| {
             let (x, y) = pos.to_f32();
-            (Vec2::new(x, y), eye_height(stance))
+            (*team, Vec2::new(x, y), eye_height(stance))
         });
-    let Some((viewer, viewer_h)) = eye else { return };
+    let Some((my_team, viewer, viewer_h)) = me else { return };
 
     let mut casts: Vec<Cast> = Vec::new();
     for (bush, pos) in &bushes {
@@ -728,9 +736,10 @@ pub fn fade_hidden(
     }
 
     let reach = PLAYER_R as f32 * 0.7;
-    for (player, pos, stance, mut sprite) in &mut players {
-        if player.handle == handle {
-            sprite.color.set_alpha(1.0); // never hide yourself
+    for (player, team, pos, stance, mut sprite) in &mut players {
+        // Never hide yourself, and never hide your own side — see the note above.
+        if player.handle == handle || *team == my_team {
+            sprite.color.set_alpha(1.0);
             continue;
         }
         let (x, y) = pos.to_f32();

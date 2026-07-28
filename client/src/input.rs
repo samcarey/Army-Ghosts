@@ -28,6 +28,7 @@ pub fn read_local_inputs(
     scenario: Res<Scenario>,
     bots: Res<crate::menu::BotCount>,
     aggro: Res<crate::menu::Aggression>,
+    side: Res<crate::menu::SidePick>,
 ) {
     let mut local_inputs = HashMap::new();
     // Inputs drive the *first* local handle; any additional local handles
@@ -48,6 +49,11 @@ pub fn read_local_inputs(
             input.set_aggression(aggro.0);
         }
         if first {
+            // Which side this player wants. Unlike the two dials above it goes
+            // on the FIRST LOCAL handle rather than on handle 0, because it is a
+            // statement about whoever is holding the phone — and every player's
+            // own copy is read, so it does not matter who is host.
+            input.set_team_request(side.0);
             // Keyboard (desktop) …
             let mut x: i32 = 0;
             let mut y: i32 = 0;

@@ -2,13 +2,15 @@
 //!
 //! ```text
 //! tools/selfplay.sh --candidate accuracy=0.9,reaction=8
-//! tools/selfplay.sh -c aggression=0.9 -b aggression=0.1 --ticks 1800
+//! tools/selfplay.sh -c aggression=0.9 -b aggression=0.1 --rounds 5
 //! ```
 //!
-//! Eight bots in the real arena, four per side, for a minute of game time.
-//! Every split of the eight spawn points is played from both sides with the
-//! same dice (a *pair*), scored on kills minus deaths, and fed to a sequential
-//! test that stops as soon as the answer is clear — see [`sprt`].
+//! Eight bots in the real arena, four per side, playing Ghost War rounds:
+//! muster at opposite ends, two minutes or until one side is wiped out, and
+//! **nobody respawns**. A *pair* is the same dice played with the candidate on
+//! each end of the field in turn; it is scored on **rounds won minus rounds
+//! lost** and fed to a sequential test that stops as soon as the answer is clear
+//! — see [`sprt`].
 //!
 //! # What this is for
 //!
@@ -27,24 +29,40 @@ mod sprt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use army_ghosts_sim::{BotProfile, FP, MAX_PLAYERS, MEMORY_TICKS, TICK_HZ};
+use army_ghosts_sim::{
+    BotProfile, FP, INTERMISSION_TICKS, MAX_PLAYERS, MEMORY_TICKS, ROUND_SECONDS, TICK_HZ,
+};
 
-use game::{play, splits, Sides};
+use game::play;
 use sprt::{elo, Sprt, Verdict};
 
-/// A minute of game time. Long enough for several engagements each and for a
-/// bad early trade to be recoverable; short enough that a pair is seconds.
-const DEFAULT_TICKS: usize = 60 * TICK_HZ;
+/// Rounds per match, so eighteen a pair.
+///
+/// **This is set by the tie rate, and the tie rate is the thing to understand
+/// about this harness.** A pair's score is a small integer — rounds won minus
+/// rounds lost, added across the two orientations — so unlike the old
+/// kills-minus-deaths differential it lands on exactly zero a great deal of the
+/// time, and every tie is a pair the sequential test drops. Measured against a
+/// caution=0.1 candidate: 3 rounds a match left 3 of 60 pairs decisive, 9 left
+/// 12, 15 left 13. So it is worth paying for the climb out of 3 and not worth
+/// paying for the plateau past 9.
+///
+/// The 3-round run is worth a second look, because it did not merely say less —
+/// it pointed the OTHER WAY (66% on three decisive pairs, against 25% on twelve).
+/// Three pairs is not a measurement, and a harness that can produce a confident
+/// wrong sign from one is worse than useless.
+const DEFAULT_ROUNDS: u32 = 9;
 
 /// Stop here whatever the LLR says, and report the interval instead of a
 /// verdict. Two profiles that need more than this to separate are separated by
-/// less than is worth acting on.
-const DEFAULT_PAIRS: usize = 200;
+/// less than is worth acting on. Generous, because only about a fifth of pairs
+/// come out decisive — see [`DEFAULT_ROUNDS`].
+const DEFAULT_PAIRS: usize = 150;
 
 struct Args {
     candidate: BotProfile,
     baseline: BotProfile,
-    ticks: usize,
+    rounds: u32,
     pairs: usize,
     jobs: usize,
     p1: f64,
@@ -70,8 +88,8 @@ usage: selfplay [options]
 
   -c, --candidate SPEC   profile under test      (default: the shipping one)
   -b, --baseline  SPEC   what it plays against   (default: the shipping one)
-      --ticks N          match length in ticks   (default: 3600 = 60 s)
-      --pairs N          give up after N pairs   (default: 200)
+      --rounds N         rounds per match        (default: 9)
+      --pairs N          give up after N pairs   (default: 150)
       --jobs N           matches in parallel     (default: cores - 1)
       --p1 F             win rate worth detecting (default: 0.60, ~+70 elo)
       --alpha F --beta F error rates             (default: 0.05 each)
@@ -81,15 +99,15 @@ SPEC is comma separated `key=value`, filling in from the default profile:
   skill, accuracy, aggression, caution   0.0 .. 1.0
   reaction                               ticks, 0 .. 23
 
-A pair is one split of the eight spawn points played from both sides with the
-same dice. Score is kills minus deaths; the sign of the pair's total is the
-result.";
+A pair is the same dice played twice, with the candidate on the west line and
+then on the east one. Score is rounds won minus rounds lost, added across both;
+the sign of the pair's total is the result.";
 
 fn parse_args() -> Result<Args, String> {
     let mut args = Args {
         candidate: BotProfile::default(),
         baseline: BotProfile::default(),
-        ticks: DEFAULT_TICKS,
+        rounds: DEFAULT_ROUNDS,
         pairs: DEFAULT_PAIRS,
         jobs: std::thread::available_parallelism()
             .map(|n| (n.get() - 1).max(1))
@@ -110,7 +128,7 @@ fn parse_args() -> Result<Args, String> {
             "-q" | "--quiet" => args.quiet = true,
             "-c" | "--candidate" => args.candidate = parse_profile(&value()?)?,
             "-b" | "--baseline" => args.baseline = parse_profile(&value()?)?,
-            "--ticks" => args.ticks = number(&value()?)?,
+            "--rounds" => args.rounds = number::<u32>(&value()?)?.max(1),
             "--pairs" => args.pairs = number(&value()?)?,
             "--jobs" => args.jobs = number::<usize>(&value()?)?.max(1),
             "--p1" => args.p1 = number(&value()?)?,
@@ -191,41 +209,54 @@ fn show(profile: &BotProfile) -> String {
     )
 }
 
-/// One pair: the same split, the same dice, played from both sides.
-///
-/// The candidate's score is its differential in both matches added together, so
-/// whatever the split was worth to whoever held it cancels. This is the only
-/// reason a run of a few dozen pairs can say anything — an unpaired comparison
-/// on an arena with asymmetric cover is mostly measuring the spawn points.
-fn play_pair(
-    candidate: BotProfile,
-    baseline: BotProfile,
+/// What one pair produced: the candidate's margin in rounds, plus the kills and
+/// ticks behind it for the cost and sanity lines.
+#[derive(Copy, Clone, Debug, Default)]
+struct Pair {
+    margin: i32,
+    kills: u32,
     ticks: usize,
-    sides: &Sides,
-    salt: u32,
-) -> (i32, u32) {
-    let mut mirrored = *sides;
-    for side in mirrored.iter_mut() {
-        *side = !*side;
+    /// Rounds neither side took. Reported because it is the tell for the failure
+    /// mode this scoring has and the old one didn't: two cautious profiles can
+    /// spend the whole clock not finding each other, and a run full of drawn
+    /// rounds is a run that measured almost nothing.
+    draws: u32,
+}
+
+/// One pair: the same dice, played with the candidate on each end of the field
+/// in turn.
+///
+/// The candidate's score is its round differential in both matches added
+/// together, so whatever the end of the field was worth to whoever held it
+/// cancels. This is the only reason a run of a few dozen pairs can say anything:
+/// the two muster lines are exact mirrors but the rock and bush fields are NOT,
+/// so an unpaired comparison is partly measuring which end a profile drew.
+///
+/// The old harness paired over all 70 ways of splitting eight scattered spawn
+/// points; with two fixed lines there is exactly one split, and the variety has
+/// to come from the salt instead. That is a real loss of an independent source
+/// of variation, and it is why [`run`] says so when the salt is inert.
+fn play_pair(candidate: BotProfile, baseline: BotProfile, rounds: u32, salt: u32) -> Pair {
+    let west = play(candidate, baseline, 0, salt, rounds);
+    let east = play(candidate, baseline, 1, salt, rounds);
+    Pair {
+        margin: west.net(0) + east.net(1),
+        kills: west.total_kills() + east.total_kills(),
+        ticks: west.ticks + east.ticks,
+        draws: west.draws + east.draws,
     }
-    let first = play(candidate, baseline, sides, salt, ticks);
-    let second = play(candidate, baseline, &mirrored, salt, ticks);
-    (
-        first.net(sides) + second.net(&mirrored),
-        first.total_kills() + second.total_kills(),
-    )
 }
 
 fn run(args: Args) {
-    let splits = splits();
     let mut sprt = Sprt::new(args.p1, args.alpha, args.beta);
     let started = Instant::now();
 
     println!(
-        "selfplay: {} bots, {} ticks ({:.0} s) a match, arena",
+        "selfplay: {} bots, {} a side, {} rounds a match ({} s each at most)",
         MAX_PLAYERS,
-        args.ticks,
-        args.ticks as f64 / TICK_HZ as f64
+        MAX_PLAYERS / 2,
+        args.rounds,
+        ROUND_SECONDS
     );
     println!("  candidate  {}", show(&args.candidate));
     println!("  baseline   {}", show(&args.baseline));
@@ -237,25 +268,25 @@ fn run(args: Args) {
         println!("  NOTE both profiles are identical — this measures the harness, not a bot.");
     }
     // A bot that never misses never draws from its RNG, so the salt reaches
-    // nothing and every cycle through the 70 splits replays the same 70 pairs.
-    // Worth saying out loud: the run would still print a confident verdict.
-    if args.candidate.accuracy >= FP && args.baseline.accuracy >= FP && args.pairs > splits.len() {
+    // nothing — and the salt is now the ONLY thing that varies between pairs, so
+    // every pair is the same pair. Worth saying out loud: the run would happily
+    // print the same margin a hundred times and a confident verdict under it.
+    let dice_are_dead = args.candidate.accuracy >= FP && args.baseline.accuracy >= FP;
+    if dice_are_dead && args.pairs > 1 {
         println!(
-            "  NOTE both profiles have accuracy 1.00, so they never touch their dice and the\n\
-             \x20      salt changes nothing — only {} distinct pairs exist. Capping there.",
-            splits.len()
+            "  NOTE both profiles have accuracy 1.00, so they never touch their dice. The salt\n\
+             \x20      is the only thing that varies a pair, so exactly one distinct pair exists.\n\
+             \x20      Capping there — repeating it would not be more evidence."
         );
     }
-    let limit = if args.candidate.accuracy >= FP && args.baseline.accuracy >= FP {
-        args.pairs.min(splits.len())
-    } else {
-        args.pairs
-    };
+    let limit = if dice_are_dead { args.pairs.min(1) } else { args.pairs };
     println!();
 
     let next = AtomicUsize::new(0);
     let mut played = 0usize;
     let mut kills = 0u32;
+    let mut ticks = 0usize;
+    let mut drawn = 0u32;
 
     // Pairs are independent, so they run in parallel — but the test is
     // sequential, so results are folded in strictly in index order and the
@@ -265,19 +296,15 @@ fn run(args: Args) {
     // sequential test stops controlling its error rate.
     while played < limit && sprt.verdict() == Verdict::Undecided {
         let batch = args.jobs.min(limit - played);
-        let results: Vec<(usize, i32, u32)> = std::thread::scope(|scope| {
+        let results: Vec<(usize, Pair)> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..batch)
                 .map(|_| {
                     let next = &next;
                     let args = &args;
-                    let splits = &splits;
                     scope.spawn(move || {
                         let index = next.fetch_add(1, Ordering::Relaxed);
-                        let sides = splits[index % splits.len()];
-                        let salt = (index / splits.len()) as u32 + 1;
-                        let (margin, kills) =
-                            play_pair(args.candidate, args.baseline, args.ticks, &sides, salt);
-                        (index, margin, kills)
+                        let salt = index as u32 + 1;
+                        (index, play_pair(args.candidate, args.baseline, args.rounds, salt))
                     })
                 })
                 .collect();
@@ -286,16 +313,18 @@ fn run(args: Args) {
             out
         });
 
-        for (index, margin, pair_kills) in results {
-            sprt.push(margin);
+        for (index, pair) in results {
+            sprt.push(pair.margin);
             played += 1;
-            kills += pair_kills;
+            kills += pair.kills;
+            ticks += pair.ticks;
+            drawn += pair.draws;
             if !args.quiet {
                 let (lo, hi) = sprt.interval();
                 println!(
                     "  pair {:>3}  {:>+3}   W{:<3} L{:<3} T{:<3}  rate {:.3} [{:.2}-{:.2}]  LLR {:+.3}",
                     index + 1,
-                    margin,
+                    pair.margin,
                     sprt.wins,
                     sprt.losses,
                     sprt.ties,
@@ -334,12 +363,51 @@ fn run(args: Args) {
              \x20        run can see. Widen it with --pairs, or ask a coarser question with --p1."
         ),
     }
+    let matches = (played * 2).max(1);
     println!(
-        "  {played} pairs ({} matches, {kills} kills) in {:.1} s at {:.0} ms a match",
+        "  {played} pairs ({} matches, {} rounds, {kills} kills) in {:.1} s at {:.0} ms a match",
         played * 2,
+        played * 2 * args.rounds as usize,
         elapsed.as_secs_f64(),
-        elapsed.as_secs_f64() * 1000.0 / (played * 2).max(1) as f64
+        elapsed.as_secs_f64() * 1000.0 / matches as f64
     );
+    // How long a round actually took, which is the number to look at when a run
+    // is slow: a side that hides rather than advancing runs the clock out every
+    // time, and a match then costs the full two minutes a round instead of the
+    // twenty-odd seconds a fought round does.
+    if played > 0 {
+        let rounds = played * 2 * args.rounds as usize;
+        // Net of the intermissions, which are in the tick count but are not the
+        // round — without taking them off, the average can read as longer than
+        // the clock a round is actually given, which is nonsense on its face.
+        let fighting = ticks.saturating_sub(rounds * INTERMISSION_TICKS as usize);
+        let per_round = fighting as f64 / rounds as f64;
+        println!(
+            "  rounds lasted {:.0} ticks ({:.1} s) of fighting on average, of a possible {}, \
+             and {drawn} of {rounds} were drawn",
+            per_round,
+            per_round / TICK_HZ as f64,
+            ROUND_SECONDS
+        );
+        if drawn * 2 > rounds as u32 {
+            println!(
+                "  NOTE most rounds ended level, so most of this run measured two sides not\n\
+                 \x20      finding each other rather than one beating the other."
+            );
+        }
+        // Distinct from the note above: those are rounds nobody won, these are
+        // PAIRS that came out level on rounds. A run that is mostly ties has
+        // thrown most of itself away, and the honest response is more rounds a
+        // match rather than more pairs.
+        if sprt.ties as usize * 2 > played {
+            println!(
+                "  NOTE most pairs came out level on rounds and were dropped. The evidence here\n\
+                 \x20      is the {} decisive pairs, not the {played} played — raise --rounds \
+                 before --pairs.",
+                sprt.decisive()
+            );
+        }
+    }
     println!(
         "  decisive {}: won {} ({:.1}%, 95% CI {:.1}-{:.1}%, {}), tied {}",
         sprt.decisive(),
@@ -391,25 +459,22 @@ mod tests {
     ///
     /// Everything else here tests the parts. This runs the whole thing on a
     /// question with a known answer — a bot that reacts in 50 ms against one
-    /// that takes 380, on the same splits with the same dice — and requires it
-    /// to say so. A harness that cannot separate those two is measuring
-    /// something other than fighting, and every number it ever printed was
-    /// noise dressed as evidence.
+    /// that takes 380, on the same dice — and requires it to say so. A harness
+    /// that cannot separate those two is measuring something other than
+    /// fighting, and every number it ever printed was noise dressed as evidence.
     ///
-    /// Short matches and one thread, because it runs in the default (debug)
+    /// One round a match and one thread, because it runs in the default (debug)
     /// test build. It is still the slowest test in the repo by some way.
     #[test]
     fn the_harness_separates_a_quick_bot_from_a_slow_one() {
         let quick = parse_profile("reaction=3").expect("parse");
         let slow = parse_profile("reaction=23").expect("parse");
-        let splits = splits();
         let mut sprt = Sprt::new(0.6, 0.05, 0.05);
-        for sides in splits.iter().take(40) {
+        for salt in 1..=40 {
             if sprt.verdict() != Verdict::Undecided {
                 break;
             }
-            let (margin, _) = play_pair(quick, slow, 600, sides, 1);
-            sprt.push(margin);
+            sprt.push(play_pair(quick, slow, 1, salt).margin);
         }
         assert_eq!(
             sprt.verdict(),
@@ -422,20 +487,20 @@ mod tests {
     }
 
     /// …and it does not invent a difference where there is none. Two identical
-    /// profiles cancel exactly under the pairing — the mirrored match is the
-    /// same match with the labels swapped — so every pair is a tie and the test
-    /// can never reach a bound. A harness that drifted to a verdict here would
-    /// declare a winner between two copies of the same bot.
+    /// profiles cancel exactly under the pairing — with the same profile on both
+    /// ends the mirrored match is literally the same simulation, so its round
+    /// tally is the same tally read the other way round — and every pair is a
+    /// tie. A harness that drifted to a verdict here would declare a winner
+    /// between two copies of the same bot.
     #[test]
     fn identical_profiles_tie_every_time() {
         let profile = BotProfile::default();
-        let splits = splits();
         let mut sprt = Sprt::new(0.6, 0.05, 0.05);
-        for sides in splits.iter().take(6) {
-            let (margin, kills) = play_pair(profile, profile, 600, sides, 1);
-            assert_eq!(margin, 0, "identical profiles produced a margin");
-            assert!(kills > 0, "nobody fired a shot; the tie means nothing");
-            sprt.push(margin);
+        for salt in 1..=6 {
+            let pair = play_pair(profile, profile, 1, salt);
+            assert_eq!(pair.margin, 0, "identical profiles produced a margin");
+            assert!(pair.kills > 0, "nobody fired a shot; the tie means nothing");
+            sprt.push(pair.margin);
         }
         assert_eq!(sprt.ties, 6);
         assert_eq!(sprt.verdict(), Verdict::Undecided);

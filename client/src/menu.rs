@@ -1,13 +1,13 @@
 //! The upper-left menu: a MENU pill that drops down a panel of actions.
 //! NEW ROOM generates a fresh room code and jumps into it (web navigates to
 //! `?room=CODE`, which reloads into that room as its first player / host);
-//! below it, one `−  LABEL n  +` row per [`Dial`] — how many bots, and how hard
-//! they push.
+//! below it, one `−  LABEL n  +` row per [`Dial`] — which side you want to
+//! fight on, how many bots, and how hard they push.
 //!
-//! Both dials are the same widget with a different [`Dial`] on it, because they
-//! do the same thing in every way that matters: each is UI state that reaches
-//! the sim ONLY as bits of this player's input, never by writing to the world.
-//! That is not a style preference — a resource the menu mutates re-reads
+//! All three dials are the same widget with a different [`Dial`] on it, because
+//! they do the same thing in every way that matters: each is UI state that
+//! reaches the sim ONLY as bits of this player's input, never by writing to the
+//! world. That is not a style preference — a resource the menu mutates re-reads
 //! differently on a re-simulated tick, which is a desync. See `PlayerInput`.
 //!
 //! Buttons use bevy_ui's `Interaction` (ui_focus_system handles both mouse
@@ -15,7 +15,9 @@
 
 use bevy::prelude::*;
 
-use army_ghosts_sim::{BotProfile, AGGRO_LEVELS, FP, MAX_PLAYERS};
+use army_ghosts_sim::{BotProfile, AGGRO_LEVELS, FP, MAX_PLAYERS, TEAM_COUNT};
+
+use crate::render::TEAM_NAMES;
 
 #[derive(Component)]
 pub struct MenuToggle;
@@ -29,6 +31,8 @@ pub struct NewRoomButton;
 /// A match setting the player can step up and down from the panel.
 #[derive(Component, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Dial {
+    /// Which side to fight on, or AUTO.
+    Side,
     /// How many bots are in the match, `0..=MAX_PLAYERS - players`.
     Bots,
     /// How hard they push, in [`AGGRO_LEVELS`] positions.
@@ -36,13 +40,58 @@ pub enum Dial {
 }
 
 impl Dial {
-    const ALL: [Dial; 2] = [Dial::Bots, Dial::Aggro];
+    /// Side first: it is the one that decides who you are shooting at, and the
+    /// other two only decide who else is on the field.
+    const ALL: [Dial; 3] = [Dial::Side, Dial::Bots, Dial::Aggro];
 
-    fn label(&self, bots: &BotCount, aggro: &Aggression) -> String {
+    fn label(&self, side: &SidePick, bots: &BotCount, aggro: &Aggression) -> String {
         match self {
+            Dial::Side => format!("TEAM {}", side.name()),
             Dial::Bots => format!("BOTS {}", bots.0),
             Dial::Aggro => format!("AGGRO {}%", percent(aggro.0)),
         }
+    }
+}
+
+/// Which side this player has asked for, or AUTO.
+///
+/// UI state, like the other two, and it reaches the sim only as bits 4-5 of this
+/// player's input (`PlayerInput::set_team_request`). Unlike the other two it is
+/// read from EVERY player's input rather than only the first's, because it is
+/// about the sender rather than about the match.
+///
+/// It is a REQUEST and the readout says so: `round::balance` grants it at the
+/// top of the next round if that side has room and quietly overrules it if not,
+/// so what the dial shows is what you asked for, not necessarily where you will
+/// end up. The roster is where you find out which it was.
+#[derive(Resource, Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SidePick(pub Option<u8>);
+
+impl SidePick {
+    /// The positions the dial steps through: AUTO, then each side in turn.
+    const POSITIONS: usize = TEAM_COUNT + 1;
+
+    fn name(&self) -> &'static str {
+        match self.0 {
+            Some(side) => TEAM_NAMES[(side as usize).min(TEAM_COUNT - 1)],
+            None => "AUTO",
+        }
+    }
+
+    fn position(&self) -> i32 {
+        match self.0 {
+            Some(side) => side as i32 + 1,
+            None => 0,
+        }
+    }
+
+    /// Wrapping rather than clamping, because with three positions a clamped
+    /// dial makes AUTO and the far side unreachable in one direction each, and
+    /// the whole row is two taps wide.
+    fn stepped(&self, step: i32) -> Self {
+        let positions = Self::POSITIONS as i32;
+        let next = (self.position() + step).rem_euclid(positions);
+        Self(if next == 0 { None } else { Some((next - 1) as u8) })
     }
 }
 
@@ -282,6 +331,7 @@ pub fn menu_interactions(
     mouse: Res<ButtonInput<MouseButton>>,
     touches: Res<Touches>,
     launch: Res<crate::LaunchConfig>,
+    mut side: ResMut<SidePick>,
     mut bots: ResMut<BotCount>,
     mut aggro: ResMut<Aggression>,
     toggles: Query<&Interaction, (Changed<Interaction>, With<MenuToggle>)>,
@@ -314,6 +364,17 @@ pub fn menu_interactions(
             continue;
         }
         match dial {
+            // Just a request, and it does not take effect until the next round
+            // — see `SidePick`. Nothing is clamped here because nothing here
+            // knows how full the sides are; `round::balance` does, and it is the
+            // one that decides.
+            Dial::Side => {
+                let next = side.stepped(*step);
+                if next != *side {
+                    *side = next;
+                    info!("menu: asking for team {}", side.name());
+                }
+            }
             // Bots fill the seats the humans aren't using — the sim clamps this
             // too, but clamping here is what stops the readout showing a number
             // the match is never going to reach.
@@ -355,12 +416,13 @@ pub fn menu_interactions(
 /// readout ends up permanently blank. Comparing what is on screen to what
 /// should be is the same answer with none of that reasoning.
 pub fn update_dial_labels(
+    side: Res<SidePick>,
     bots: Res<BotCount>,
     aggro: Res<Aggression>,
     mut labels: Query<(&DialLabel, &mut Text)>,
 ) {
     for (DialLabel(dial), mut text) in &mut labels {
-        let wanted = dial.label(&bots, &aggro);
+        let wanted = dial.label(&side, &bots, &aggro);
         if text.0 != wanted {
             text.0 = wanted;
         }

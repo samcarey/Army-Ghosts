@@ -78,7 +78,7 @@ def gen_ground(path, size=128):
     # It used to be a muted army green, which under the 12% sward tint came out
     # looking like short grass: standing on a bare tile then read as standing in
     # grass with your boots poking out below the blades next to you.
-    # Same luminance as that green on purpose, because `PLAYER_COLORS` were
+    # Same luminance as that green on purpose, because `TEAM_COLORS` were
     # picked to sit above the ground in value.
     base = (88, 76, 54)  # dry earth
     # Low-frequency blotches for variation, wrapped so the tile is seamless.

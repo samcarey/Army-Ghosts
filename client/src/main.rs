@@ -9,6 +9,7 @@ mod input;
 mod menu;
 mod net;
 mod render;
+mod spectate;
 mod stance;
 mod touch;
 mod vision;
@@ -79,6 +80,11 @@ fn main() {
             .unwrap_or_default(),
     )
     .insert_resource(launch)
+    // Which side this player is asking for. Nothing seeds it from the URL: it
+    // is a mid-match choice, not a launch setting, and `round::balance` may well
+    // overrule it anyway.
+    .init_resource::<menu::SidePick>()
+    .init_resource::<spectate::Spectating>()
     .init_resource::<touch::TouchControls>()
     .init_resource::<ads::Ads>()
     .init_resource::<stance::StanceControl>()
@@ -96,6 +102,7 @@ fn main() {
             menu::setup_menu,
             ads::setup_ads,
             stance::setup_stance,
+            spectate::setup_spectate,
             vision::setup_fog,
         )
             .chain(),
@@ -115,6 +122,8 @@ fn main() {
                 hud::update_start_button,
                 hud::update_copy_button,
                 hud::update_health_bar,
+                hud::update_round_text,
+                hud::update_round_banner,
             ),
             (hud::copy_link_pressed, hud::tick_copied_flash).chain(),
             menu::menu_interactions,
@@ -128,6 +137,11 @@ fn main() {
                 ads::update_ads_button,
                 stance::read_stance_input,
                 stance::update_stance_buttons,
+                // Before `camera_follow` below, which reads the target it
+                // picks — so the frame you die is the frame the camera starts
+                // moving, rather than the one after it.
+                spectate::update_spectate,
+                spectate::update_spectate_button,
                 render::attach_sprites,
                 grass::attach_grass_shade,
                 render::animate_players,

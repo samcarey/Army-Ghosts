@@ -172,6 +172,29 @@ Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_SIGNALING` env vars.
     fire. **Scoring on deaths alone is why it exists**: the best bot by that
     measure is the one that lies in the deepest grass it can find and never
     fires, so the harness scores kills MINUS deaths.
+  * **PAWNS ARE SOLID** (`separate_players`), and the reason is worth keeping.
+    Nothing used to stop two pawns occupying the same subunit, and that turned
+    out to be a *stable trap*: `Act::Fight` roots a bot with the same bit the
+    sights button sets, so two that closed to nothing could never walk apart —
+    and could never shoot each other either, because a round is born
+    `PLAYER_R + BULLET_R + 2` (16) units down the barrel and a target 1.6 units
+    away spans only to 15.6, so every shot was born past it and flew away.
+    Measured before the fix: one pair spent **3100 consecutive ticks (52 s)**
+    locked, both firing, neither losing a point of health. Reported from the
+    demo as "two bots stand on top of each other and fire in opposite directions
+    forever" — which is what mutual point-blank aim looks like from above.
+    Mechanics that matter: it runs after `move_players` over EVERY living pawn,
+    not just the ones that moved (both of those bots were standing perfectly
+    still, so a movers-only pass would not have freed them); every push is
+    computed against a snapshot taken before any is applied, so the result can't
+    depend on query order and a pair separates symmetrically; and it early-outs
+    before touching the rock field, which is the common case now that bots hold
+    a standoff. `sim/tests/combat.rs`
+    `bots_never_lock_together_firing_and_unable_to_connect` asserts the
+    DURATION of contact, not that pawns never touch — a scrum is legitimate,
+    being unable to leave one is not. Note `bot.rs`'s `PUSH_STANDOFF` alone does
+    NOT fix this (measured: 1413 ticks still locked with separation off); it
+    only stops them nosing together in the first place.
   * **The spawn→spawn lanes are NOT clear.** Only spawn→dummy is (see
     `rock_layout`); there's a boulder at (30,-23) squarely between spawns 0 and 1.
     Any test that needs a clear shot must pick its lane deliberately —
@@ -288,31 +311,43 @@ Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_SIGNALING` env vars.
   `Scenario`. That constancy is the entire licence for reading a resource inside
   the rollback schedule; mutate it mid-match and it is the same desync that
   keeps the bot COUNT in the input stream instead.
-  **The five dials are now measured rather than picked** (`tools/selfplay.sh`,
-  each against the shipping default, ~200 pairs, elo from the pair win rate):
-  * **`reaction` dominates everything.** 5 ticks is +274, 10 is +110, 20 is -139.
-    Nothing else in the profile moves the result that far.
-  * **`accuracy` matters but saturates.** 0.4 is -330 and 0.9 is +186 — but 1.0
-    is only +88, i.e. *worse than 0.9*. Perfect aim is not the best aim here.
-  * **`skill` 0.6 is already near its own peak, and both directions are worse**:
-    1.0 is -68 and 0.39 (just under `LEAD_SKILL`, so no leading at all) is -97,
-    the same as 0.2. So the gate is what matters, and leading a target *fully*
-    is worse than leading it 60% — the velocity comes from differencing a stale
-    memory, and over-committing to it misses a pawn that turned.
-  * **Aggression is a trap.** 0.9 is -182; 0.1 is level with the default (-16,
-    inside the interval). Pushing gets you shot; holding ground does not.
-  * **Caution is worse than a trap: 0.9 is -492**, the largest single-dial loss
-    of any of them, and 0.1 trends +58. Note caution enters the scoring THREE
-    times — as `Act::Break`'s weight, inside `cowardice` which is `Break`'s own
+  **The five dials are measured rather than picked** (`tools/selfplay.sh`, each
+  against the shipping default, up to 210 pairs, elo from the pair win rate).
+  **These figures are the post-`separate_players` ones and the earlier set was
+  WRONG** — they were taken while bots could lock together permanently (see
+  Health/damage below), and a locked pair contributes nothing to either side, so
+  every difference was diluted and the ones that *caused* locking were
+  understated worst of all. Anything quoting aggression as neutral or 1.0
+  accuracy as worse than 0.9 predates the fix:
+  * **`reaction` dominates everything.** 5 ticks is +566, 10 is +552, 20 is
+    -257. Nothing else moves the result that far, and 10 being level with 5 says
+    the default 15 is the slow side of a plateau rather than a middle.
+  * **`accuracy` matters and then saturates.** 0.4 is -350; 0.9 is +98 and 1.0
+    is +91, whose intervals overlap almost exactly — past about 0.9 more
+    precision buys nothing measurable.
+  * **`skill` barely registers**: 0.2 is -28 and 1.0 is -9, both intervals
+    straddling even. Whether a bot leads its target is worth far less here than
+    how fast it reacts, which is not what the Quake III lineage would predict
+    and is probably about engagement ranges: most of the shooting in this arena
+    happens close enough that lead is a rounding error.
+  * **Aggression is the big trap.** 0.9 loses every decisive pair; **0.1 is
+    +432**. Pushing gets you shot. This is the dial that was most distorted
+    before the fix (it read as neutral), because charging is exactly what put
+    two bots on the same square.
+  * **Caution is a trap in the other direction**: 0.9 also loses every decisive
+    pair, 0.1 is +132. Note caution enters the scoring THREE times — as
+    `Act::Break`'s weight, inside `cowardice` which is `Break`'s own
     consideration, and again as `not(cowardice)` suppressing `Act::Fight` — so
     its effect is roughly cubic while aggression's is linear. The dials are not
     on comparable scales and this is where that shows.
   Read all of that as "which bot beats which bot", which is NOT the same
   question as "which bot is a good opponent for a person". Stacking the wins
-  (`reaction=8,caution=0.25,aggression=0.35,accuracy=0.8`) beats the default by
-  +304 elo and 85% of pairs; the shipping default is deliberately still the
-  documented "competent but beatable" one, because difficulty is a design
-  choice and the harness only knows how to measure lethality.
+  (`reaction=8,caution=0.25,aggression=0.35,accuracy=0.8`) takes every decisive
+  pair; the shipping default is deliberately still the documented "competent but
+  beatable" one, because difficulty is a design choice and the harness only
+  knows how to measure lethality. The one finding that is arguably not about
+  difficulty is aggression: charging is what the deadlock bug looked like from
+  the outside, and it is also simply bad play.
   `sim/tests/combat.rs` covers the three failures worth catching:
   `bots_decide_identically_in_identical_worlds` (two runs, 400 ticks, every pawn
   on the same subunit — catches an unseeded RNG or iteration-order dependence,

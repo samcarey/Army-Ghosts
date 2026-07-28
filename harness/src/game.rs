@@ -95,6 +95,22 @@ pub fn play(
     salt: u32,
     ticks: usize,
 ) -> Outcome {
+    let mut app = arena(candidate, baseline, sides, salt);
+    for _ in 0..ticks {
+        app.update();
+    }
+    read_outcome(&mut app)
+}
+
+/// The match, built and warmed up but not yet played, so a caller that wants to
+/// watch it tick by tick (a diagnostic, a regression test) can drive it itself
+/// instead of only seeing the final score.
+pub fn arena(
+    candidate: BotProfile,
+    baseline: BotProfile,
+    sides: &Sides,
+    salt: u32,
+) -> App {
     let mut roster = BotRoster::default();
     roster.salt = salt;
     for (handle, &is_candidate) in sides.iter().enumerate() {
@@ -138,16 +154,14 @@ pub fn play(
     for _ in 0..MAX_PLAYERS + 2 {
         app.update();
     }
-    for _ in 0..ticks {
-        app.update();
-    }
+    app
+}
 
+/// The scoreboard as it stands.
+pub fn read_outcome(app: &mut App) -> Outcome {
     let mut outcome = Outcome::default();
-    for (player, kills, deaths) in app
-        .world_mut()
-        .query::<(&Player, &Kills, &Deaths)>()
-        .iter(app.world())
-    {
+    let mut query = app.world_mut().query::<(&Player, &Kills, &Deaths)>();
+    for (player, kills, deaths) in query.iter(app.world()) {
         if player.handle < MAX_PLAYERS {
             outcome.kills[player.handle] = kills.0;
             outcome.deaths[player.handle] = deaths.0;
@@ -246,3 +260,4 @@ mod tests {
         );
     }
 }
+

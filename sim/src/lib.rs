@@ -1410,6 +1410,10 @@ impl<C: Config<Input = PlayerInput>> Plugin for SimPlugin<C> {
                     read_human_intent::<C>,
                     bot_think,
                     move_players,
+                    // After movement and before anything reads a position:
+                    // rounds leave the barrel next, and a shot fired from
+                    // inside someone else can't hit them.
+                    separate_players,
                     fire_bullets,
                     move_bullets,
                     resolve_hits,
@@ -1575,6 +1579,108 @@ fn push_out_of_cover(pos: &mut Pos, cover: &[(i32, i32, i32)]) {
         }
         pos.x = rx + (dx * reach / d) as i32;
         pos.y = ry + (dy * reach / d) as i32;
+    }
+}
+
+/// Pawns are solid: shove any two that are inside each other apart until they
+/// aren't.
+///
+/// **This exists because two bots could stand on the same subunit forever.**
+/// Nothing stopped pawns interpenetrating, and `Act::Fight` roots a bot in
+/// place, so two of them that closed to nothing were pinned there permanently —
+/// facing each other, firing, and unable to connect, because a round is born
+/// `PLAYER_R + BULLET_R + 2` units down the barrel and that is *past* a target
+/// standing 1.6 units away. Measured before the fix: one pair spent 3100
+/// consecutive ticks like that and neither lost a single point of health. Two
+/// soldiers occupying the same square metre was always wrong; that it was also
+/// a stable trap is what made it urgent.
+///
+/// Runs after [`move_players`] and over EVERY living pawn, not just the ones
+/// that moved. A rooted pawn has to be separable or the trap above survives the
+/// fix — both of those bots were standing perfectly still.
+///
+/// Determinism: every push is computed against a SNAPSHOT taken before any of
+/// them are applied, so the result doesn't depend on which pawn the query
+/// happened to visit first, and two pawns push off each other symmetrically.
+/// One pass doesn't fully untangle a three-way pile, which is fine — it runs
+/// again next tick, and a bounded amount of work per tick is worth more than a
+/// settled answer this one.
+fn separate_players(
+    mut players: Query<(&Player, &mut Pos, &Health), With<Player>>,
+    rocks: Query<(&Rock, &Pos), Without<Player>>,
+) {
+    let reach = (2 * PLAYER_R * FP) as i64;
+
+    // Sorted by handle: this is the snapshot every push is measured against.
+    let mut standing: Vec<(usize, Pos)> = players
+        .iter()
+        .filter(|(_, _, health)| health.alive())
+        .map(|(player, pos, _)| (player.handle, *pos))
+        .collect();
+    standing.sort_unstable_by_key(|&(handle, _)| handle);
+    if standing.len() < 2 {
+        return;
+    }
+
+    // Nothing is touching almost every tick — bots hold a standoff and players
+    // spread out — so bail before the expensive part rather than rebuilding and
+    // re-sorting the rock field for nobody.
+    let touching = standing.iter().enumerate().any(|(i, &(_, a))| {
+        standing[i + 1..].iter().any(|&(_, b)| {
+            let (dx, dy) = ((a.x - b.x) as i64, (a.y - b.y) as i64);
+            dx * dx + dy * dy < reach * reach
+        })
+    });
+    if !touching {
+        return;
+    }
+
+    let mut cover: Vec<(i32, i32, i32)> = rocks
+        .iter()
+        .map(|(rock, pos)| (pos.x, pos.y, rock.r))
+        .collect();
+    cover.sort_unstable();
+
+    for (player, mut pos, health) in &mut players {
+        if !health.alive() {
+            continue;
+        }
+        let (mut shift_x, mut shift_y) = (0i64, 0i64);
+        for &(other, at) in &standing {
+            if other == player.handle {
+                continue;
+            }
+            let (dx, dy) = ((pos.x - at.x) as i64, (pos.y - at.y) as i64);
+            let d2 = dx * dx + dy * dy;
+            if d2 >= reach * reach {
+                continue;
+            }
+            let d = isqrt(d2);
+            if d == 0 {
+                // Exactly co-located, which a respawn onto an occupied spawn
+                // point can still manage. Any direction will do as long as the
+                // two pick opposite ones and every peer agrees — so it comes
+                // off the handles, which every peer sorts identically.
+                let away = if player.handle < other { -1 } else { 1 };
+                shift_x += away * reach / 2;
+                continue;
+            }
+            // Half the overlap each, so a pair separates without either being
+            // the one that gives way.
+            let overlap = (reach - d) / 2;
+            shift_x += dx * overlap / d;
+            shift_y += dy * overlap / d;
+        }
+        if shift_x == 0 && shift_y == 0 {
+            continue;
+        }
+        pos.x = pos.x.saturating_add(shift_x as i32);
+        pos.y = pos.y.saturating_add(shift_y as i32);
+        // Being shoved off someone must not shove you into a boulder, or out of
+        // the arena.
+        push_out_of_cover(&mut pos, &cover);
+        pos.x = pos.x.clamp(-(ARENA_HALF_W - PLAYER_R) * FP, (ARENA_HALF_W - PLAYER_R) * FP);
+        pos.y = pos.y.clamp(-(ARENA_HALF_H - PLAYER_R) * FP, (ARENA_HALF_H - PLAYER_R) * FP);
     }
 }
 

@@ -384,3 +384,122 @@ fn bots_left_alone_fight_each_other() {
         "30 seconds of bots in one arena and nobody died — they aren't fighting"
     );
 }
+
+/// How far apart two pawns are, in whole world units.
+fn apart(app: &mut App, a: usize, b: usize) -> i64 {
+    let (pa, pb) = (pawn(app, a).0, pawn(app, b).0);
+    let (dx, dy) = ((pa.x - pb.x) as i64, (pa.y - pb.y) as i64);
+    isqrt(dx * dx + dy * dy) / FP as i64
+}
+
+/// Walk one pawn straight into another and it stops against them.
+///
+/// Nothing used to: `move_players` only pushed out of boulders, so two pawns
+/// could stand on the same subunit. That was always wrong — soldiers are not
+/// ghosts — but what made it a bug rather than a blemish is the next test.
+#[test]
+fn pawns_do_not_stand_inside_each_other() {
+    let mut app = arena();
+    // Straight up the clear north-south lane, into the pawn parked at the far
+    // end. No trigger: this is about bodies, not bullets.
+    drive(&mut app, SHOOTER, PlayerInput { move_x: 0, move_y: 127, buttons: 0 });
+
+    let mut closest = i64::MAX;
+    for _ in 0..600 {
+        run(&mut app, 1);
+        closest = closest.min(apart(&mut app, SHOOTER, VICTIM));
+    }
+    assert!(
+        closest >= 2 * PLAYER_R as i64 - 6,
+        "one pawn walked {closest} units into another (a body is {} across)",
+        2 * PLAYER_R
+    );
+}
+
+/// **The stand-on-each-other-and-fire-forever bug.**
+///
+/// Two bots that closed to nothing were pinned there permanently: `Act::Fight`
+/// roots a bot with the same bit the sights button sets, so neither could walk
+/// away, and neither could shoot the other either — a round is born
+/// `PLAYER_R + BULLET_R + 2` units down the barrel, which is *past* a target
+/// standing a unit and a half in front of you, so every shot flew off harmlessly
+/// and nothing ever broke the tie. Measured at the time: one pair spent 3100
+/// consecutive ticks (52 seconds) locked together, both firing, neither losing a
+/// single point of health. It was reported from the demo as two bots standing on
+/// top of each other firing in opposite directions forever, which is exactly what
+/// it looks like from above.
+///
+/// Two things fix it and this test would fail without either: pawns are solid
+/// now (`separate_players`), and a bot stops closing at `PUSH_STANDOFF` instead
+/// of walking into whoever it is shooting.
+///
+/// The assertion is on the DURATION of the lock rather than on pawns never
+/// touching, because a scrum in a crowded arena is legitimate and brief contact
+/// is not a bug — being unable to get out of one is.
+#[test]
+fn bots_never_lock_together_firing_and_unable_to_connect() {
+    const MATCH_TICKS: usize = 1800;
+    /// A second of shooting each other point blank and resolving nothing.
+    const STUCK_LIMIT: usize = 60;
+
+    let mut app = arena_with_bots(4);
+    drive(&mut app, SHOOTER, PlayerInput::default());
+
+    let pawns = PLAYERS + 4;
+    let mut run_len = vec![0usize; pawns * pawns];
+    let mut worst = 0usize;
+    let mut worst_pair = (0, 0);
+    let mut closest = i64::MAX;
+
+    for _ in 0..MATCH_TICKS {
+        run(&mut app, 1);
+        let state: Vec<(usize, Pos, bool, bool)> = app
+            .world_mut()
+            .query::<(&Player, &Pos, &Intent, &Health)>()
+            .iter(app.world())
+            .map(|(player, pos, intent, health)| {
+                (player.handle, *pos, intent.0.fire(), health.alive())
+            })
+            .collect();
+        for a in 0..state.len() {
+            for b in (a + 1)..state.len() {
+                if !state[a].3 || !state[b].3 {
+                    continue;
+                }
+                let (dx, dy) = ((state[a].1.x - state[b].1.x) as i64, (state[a].1.y - state[b].1.y) as i64);
+                let d = isqrt(dx * dx + dy * dy) / FP as i64;
+                closest = closest.min(d);
+                let key = state[a].0 * pawns + state[b].0;
+                if d < 2 * PLAYER_R as i64 && state[a].2 && state[b].2 {
+                    run_len[key] += 1;
+                    if run_len[key] > worst {
+                        worst = run_len[key];
+                        worst_pair = (state[a].0, state[b].0);
+                    }
+                } else {
+                    run_len[key] = 0;
+                }
+            }
+        }
+    }
+
+    println!(
+        "{MATCH_TICKS} ticks: closest approach {closest} units, longest overlapping-and-both-firing \
+         run {worst} ticks (handles {} and {})",
+        worst_pair.0, worst_pair.1
+    );
+    assert!(
+        worst < STUCK_LIMIT,
+        "handles {} and {} spent {worst} ticks inside each other with the trigger down — \
+         that is the deadlock this test exists for",
+        worst_pair.0,
+        worst_pair.1
+    );
+    // …and the reason the deadlock was unbreakable: at point-blank range every
+    // round is born past its target. Staying outside that dead zone is what
+    // makes contact resolve instead of stalemate.
+    assert!(
+        closest > (PLAYER_R + BULLET_R + 2 - (PLAYER_R + BULLET_R)) as i64,
+        "pawns closed to {closest} units, inside the range where a shot is born past its target"
+    );
+}

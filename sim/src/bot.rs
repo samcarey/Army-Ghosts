@@ -81,6 +81,18 @@ const LEAD_SPAN: usize = 8;
 /// Below this share of [`MAX_HEALTH`] a bot starts preferring to break contact.
 const HURT_FRACTION: i32 = FP * 2 / 5;
 
+/// How close [`Act::Push`] will close, world units. Past this it stops walking
+/// and just fights.
+///
+/// `Push`'s score already fades as the range drops (`not(near)`), but "fades"
+/// is not "stops", and a bot that keeps walking at someone it is already
+/// shooting ends up standing on them. `separate_players` makes that survivable
+/// — pawns can no longer interpenetrate — but two soldiers shoving each other
+/// around a field is still not what closing to contact should look like. Three
+/// body widths: inside the range where damage barely falls off, outside arm's
+/// reach.
+const PUSH_STANDOFF: i32 = 72;
+
 /// What a bot knows about the biggest threat at one past tick.
 ///
 /// The enemy's *state at the time*, not a pointer to it — that is the whole
@@ -505,8 +517,14 @@ fn decide(
     match best.1 {
         Act::Fight => engage(bot, pos, target, stance, true),
         Act::Push => {
-            let mut intent = engage(bot, pos, target, stance, false);
-            if let Some(t) = target {
+            // Already close enough: hold and shoot rather than walk into them.
+            // `engage(hold)` roots the pawn, so this is `Act::Fight` in all but
+            // name once the standoff is reached — which is the point.
+            let inside = target
+                .map(|t| units(dist(pos, t.pos)) <= PUSH_STANDOFF)
+                .unwrap_or(true);
+            let mut intent = engage(bot, pos, target, stance, inside);
+            if let (false, Some(t)) = (inside, target) {
                 let (dx, dy) = toward(pos, t.pos);
                 intent.0.move_x = dx;
                 intent.0.move_y = dy;

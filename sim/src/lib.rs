@@ -21,7 +21,7 @@ use bevy_ggrs::{
 use serde::{Deserialize, Serialize};
 
 pub mod bot;
-pub use bot::{bot_think, Bot, BotProfile};
+pub use bot::{bot_think, Bot, BotProfile, BotRoster, MEMORY_TICKS};
 
 /// Fixed-point scale: subunits per world unit (pixel).
 pub const FP: i32 = 256;
@@ -325,6 +325,16 @@ impl Health {
 /// without anyone sending a score message.
 #[derive(Component, Copy, Clone, Default, Debug, Hash)]
 pub struct Deaths(pub u32);
+
+/// How many pawns this one has put down. The other half of the scoreboard, and
+/// the reason the self-play harness can tell a good bot from a hidden one:
+/// score a match on deaths alone and the winner is whoever turtled hardest.
+///
+/// Every death is credited, including a bot shooting its own side — the
+/// harness's teams are bookkeeping the sim knows nothing about, and a kill it
+/// declined to count would quietly reward friendly fire.
+#[derive(Component, Copy, Clone, Default, Debug, Hash)]
+pub struct Kills(pub u32);
 
 /// A live bullet; `owner` is the firing player's handle (no self-hits).
 #[derive(Component, Copy, Clone, Default, Debug, Hash)]
@@ -1147,6 +1157,7 @@ fn spawn_pawn(commands: &mut Commands, handle: usize, x: i32, y: i32) -> Entity 
             Stance::default(),
             Health::default(),
             Deaths::default(),
+            Kills::default(),
         ))
         .add_rollback()
         .id()
@@ -1355,6 +1366,9 @@ impl<C: Config<Input = PlayerInput>> Plugin for SimPlugin<C> {
             // (the combat tests, the harness) panics the moment a bot asks what
             // world it is in.
             .init_resource::<Scenario>()
+            // Same deal: the roster is config the game never varies, so it is
+            // filled in rather than demanded, and only the harness overrides it.
+            .init_resource::<BotRoster>()
             .rollback_component_with_copy::<Pos>()
             .rollback_component_with_copy::<Player>()
             .rollback_component_with_copy::<Intent>()
@@ -1364,6 +1378,7 @@ impl<C: Config<Input = PlayerInput>> Plugin for SimPlugin<C> {
             .rollback_component_with_copy::<Stance>()
             .rollback_component_with_copy::<Health>()
             .rollback_component_with_copy::<Deaths>()
+            .rollback_component_with_copy::<Kills>()
             .rollback_component_with_copy::<Bullet>()
             .rollback_component_with_copy::<Target>()
             .rollback_component_with_copy::<Rock>()
@@ -1426,6 +1441,7 @@ impl<C: Config<Input = PlayerInput>> Plugin for SimPlugin<C> {
 fn reconcile_bots<C: Config<Input = PlayerInput>>(
     mut commands: Commands,
     inputs: Res<PlayerInputs<C>>,
+    roster: Res<BotRoster>,
     pawns: Query<(Entity, &Player, Option<&Bot>)>,
 ) {
     // The first player's copy, and only theirs.
@@ -1456,7 +1472,7 @@ fn reconcile_bots<C: Config<Input = PlayerInput>>(
         let pawn = spawn_pawn(&mut commands, handle, x, y);
         commands
             .entity(pawn)
-            .insert(Bot::new(handle, BotProfile::default()));
+            .insert(Bot::seeded(handle, roster.profile(handle), roster.salt));
     } else {
         bots.sort_unstable();
         if let Some(&(_, entity)) = bots.last() {
@@ -1628,7 +1644,7 @@ enum Impact {
 fn resolve_hits(
     mut commands: Commands,
     bullets: Query<(Entity, &Bullet, &Pos)>,
-    mut players: Query<(&Player, &Pos, &mut Health, &mut Deaths)>,
+    mut players: Query<(&Player, &Pos, &mut Health, &mut Deaths, &mut Kills)>,
     mut targets: Query<(&mut Target, &Pos)>,
     rocks: Query<(&Rock, &Pos)>,
 ) {
@@ -1641,7 +1657,7 @@ fn resolve_hits(
         // position, handle) — position alone would tie between two pawns
         // standing on the same subunit, which nothing prevents.
         let mut hits: Vec<(i64, i32, i32, usize, Impact)> = Vec::new();
-        for (player, pos, health, _) in &players {
+        for (player, pos, health, ..) in &players {
             if player.handle == bullet.owner || !health.alive() {
                 continue;
             }
@@ -1680,7 +1696,8 @@ fn resolve_hits(
                 let flown = (PLAYER_R + BULLET_R + 2) as i64 * FP as i64
                     + (BULLET_TTL - bullet.ttl) as i64 * BULLET_SPEED as i64;
                 let damage = bullet_damage(miss, radius_fp(PLAYER_R + BULLET_R), flown);
-                for (player, _, mut health, mut deaths) in &mut players {
+                let mut killed = false;
+                for (player, _, mut health, mut deaths, _) in &mut players {
                     if player.handle != handle {
                         continue;
                     }
@@ -1690,8 +1707,20 @@ fn resolve_hits(
                         health.hp = 0;
                         health.down = RESPAWN_TICKS;
                         deaths.0 += 1;
+                        killed = true;
                     }
                     break;
+                }
+                // A second pass rather than one: the victim's borrow above is
+                // exclusive, and the shooter is another row of the same query.
+                // Only walked when someone actually went down.
+                if killed {
+                    for (player, _, _, _, mut kills) in &mut players {
+                        if player.handle == bullet.owner {
+                            kills.0 += 1;
+                            break;
+                        }
+                    }
                 }
             }
         }

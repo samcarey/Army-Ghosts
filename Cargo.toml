@@ -1,5 +1,5 @@
 [workspace]
-members = ["sim", "client"]
+members = ["sim", "client", "harness"]
 exclude = ["vendor/matchbox_socket"]
 resolver = "2"
 

@@ -1,12 +1,12 @@
 //! HUD overlays (bevy_ui). The player list (upper right: auto-numbered
-//! players, "(you)" on the local one, death count, per-peer ping in a p2p
+//! players, "(you)" on the local one, kills and deaths, per-peer ping in a p2p
 //! session, lobby status while the room is open), the local player's health
 //! bar, and the host's START button.
 
 use bevy::prelude::*;
 use bevy_ggrs::{LocalPlayers, Session};
 
-use army_ghosts_sim::{Bot, Deaths, Health, Player, FP};
+use army_ghosts_sim::{Bot, Deaths, Health, Kills, Player, FP};
 
 use crate::net::Lobby;
 use crate::{AppState, LaunchConfig, SessionConfig};
@@ -408,14 +408,14 @@ pub fn read_start_input(
     }
 }
 
-/// "3 deaths" / "1 death" — the board is a scoreboard, so everyone carries a
-/// count from the first tick rather than sprouting one the moment they die.
-fn deaths_label(count: u32) -> String {
-    if count == 1 {
-        "1 death".into()
-    } else {
-        format!("{count} deaths")
-    }
+/// `"5k 3d"` — the board is a scoreboard, so everyone carries a count from the
+/// first tick rather than sprouting one the moment they die.
+///
+/// Abbreviated rather than spelled out because this line already carries a name
+/// and, in a room, a ping, and the roster hangs off the right edge of a phone
+/// screen. It is deliberately NARROWER than the "3 deaths" it replaced.
+fn score_label(kills: u32, deaths: u32) -> String {
+    format!("{kills}k {deaths}d")
 }
 
 pub fn update_player_list(
@@ -423,7 +423,7 @@ pub fn update_player_list(
     lobby: Res<Lobby>,
     session: Option<Res<Session<SessionConfig>>>,
     local_players: Option<Res<LocalPlayers>>,
-    scores: Query<(&Player, &Deaths, Option<&Bot>)>,
+    scores: Query<(&Player, &Kills, &Deaths, Option<&Bot>)>,
     mut texts: Query<&mut Text, With<PlayerListText>>,
 ) {
     let Ok(mut text) = texts.single_mut() else { return };
@@ -450,12 +450,14 @@ pub fn update_player_list(
             // a seat, so anything counting seats would leave them off the board
             // while they were busy killing people. Sorted, because query order
             // isn't stable and a roster that reshuffles itself is unreadable.
-            let mut board: Vec<(usize, u32, bool)> = scores
+            let mut board: Vec<(usize, u32, u32, bool)> = scores
                 .iter()
-                .map(|(player, deaths, bot)| (player.handle, deaths.0, bot.is_some()))
+                .map(|(player, kills, deaths, bot)| {
+                    (player.handle, kills.0, deaths.0, bot.is_some())
+                })
                 .collect();
             board.sort_unstable();
-            for (handle, deaths, is_bot) in board {
+            for (handle, kills, deaths, is_bot) in board {
                 let who = if is_bot {
                     // Numbered within the bots rather than continuing the player
                     // numbering: bots take the handles above the humans, so the
@@ -475,9 +477,9 @@ pub fn update_player_list(
                         .unwrap_or_default(),
                     _ => String::new(),
                 };
-                // Deaths come out of the sim, so every peer's board agrees
+                // Both counts come out of the sim, so every peer's board agrees
                 // without anyone sending a score message.
-                lines.push(format!("{}  {}{}", who, deaths_label(deaths), ping));
+                lines.push(format!("{}  {}{}", who, score_label(kills, deaths), ping));
             }
         }
     }

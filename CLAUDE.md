@@ -67,6 +67,10 @@ Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_SIGNALING` env vars.
   `Pos::to_f32`), input collection (`ReadInputs` schedule → `LocalInputs`),
   session bring-up (`net.rs`: launch-config parsing, matchbox socket,
   GGRS session build), camera follow.
+- **`harness/`** (`army-ghosts-harness`, bin `selfplay`) — the bot measuring
+  rig, NOT part of the game build. Runs the real sim headless at whatever rate
+  the CPU manages and decides whether one `BotProfile` beats another. See
+  Testing → `tools/selfplay.sh`.
 - **`client/index.html`** — instant-paint loader (progress bar, streams the
   wasm, parses URL params before init). Mobile hardening: devicePixelRatio cap
   (1.5) so iOS Safari's GPU governor doesn't throttle, touch-action none,
@@ -160,8 +164,14 @@ Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_SIGNALING` env vars.
     hit, and the client hides you via `Visibility` (NOT alpha — `fade_hidden`
     owns pawn alpha and would overwrite it a system later; `update_health_visuals`
     writes rgb only, and must run before it).
-  * `Deaths` is sim state, so every peer's scoreboard agrees without anyone
-    sending a score message.
+  * `Deaths` and `Kills` are both sim state, so every peer's scoreboard agrees
+    without anyone sending a score message. `Kills` credits `Bullet::owner` in a
+    second pass over the same query (the victim's borrow is exclusive), and it
+    credits team kills too — the harness's "teams" are bookkeeping the sim knows
+    nothing about, and a kill it declined to count would quietly reward friendly
+    fire. **Scoring on deaths alone is why it exists**: the best bot by that
+    measure is the one that lies in the deepest grass it can find and never
+    fires, so the harness scores kills MINUS deaths.
   * **The spawn→spawn lanes are NOT clear.** Only spawn→dummy is (see
     `rock_layout`); there's a boulder at (30,-23) squarely between spawns 0 and 1.
     Any test that needs a clear shot must pick its lane deliberately —
@@ -271,7 +281,38 @@ Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_SIGNALING` env vars.
   * The HUD roster walks PAWNS, not session handles, or bots are absent from the
     scoreboard while busy killing people.
   Tuning lives in `BotProfile` (skill / accuracy / reaction / aggression /
-  caution) — one struct precisely so the self-play harness can vary it.
+  caution) — one struct precisely so the self-play harness can vary it, which is
+  `BotRoster`'s whole reason to exist: a per-handle profile table plus an RNG
+  `salt`. It is CONFIG, not tick state — `reconcile_bots` reads it only at the
+  instant a bot spawns and it must be constant for the match, exactly like
+  `Scenario`. That constancy is the entire licence for reading a resource inside
+  the rollback schedule; mutate it mid-match and it is the same desync that
+  keeps the bot COUNT in the input stream instead.
+  **The five dials are now measured rather than picked** (`tools/selfplay.sh`,
+  each against the shipping default, ~200 pairs, elo from the pair win rate):
+  * **`reaction` dominates everything.** 5 ticks is +274, 10 is +110, 20 is -139.
+    Nothing else in the profile moves the result that far.
+  * **`accuracy` matters but saturates.** 0.4 is -330 and 0.9 is +186 — but 1.0
+    is only +88, i.e. *worse than 0.9*. Perfect aim is not the best aim here.
+  * **`skill` 0.6 is already near its own peak, and both directions are worse**:
+    1.0 is -68 and 0.39 (just under `LEAD_SKILL`, so no leading at all) is -97,
+    the same as 0.2. So the gate is what matters, and leading a target *fully*
+    is worse than leading it 60% — the velocity comes from differencing a stale
+    memory, and over-committing to it misses a pawn that turned.
+  * **Aggression is a trap.** 0.9 is -182; 0.1 is level with the default (-16,
+    inside the interval). Pushing gets you shot; holding ground does not.
+  * **Caution is worse than a trap: 0.9 is -492**, the largest single-dial loss
+    of any of them, and 0.1 trends +58. Note caution enters the scoring THREE
+    times — as `Act::Break`'s weight, inside `cowardice` which is `Break`'s own
+    consideration, and again as `not(cowardice)` suppressing `Act::Fight` — so
+    its effect is roughly cubic while aggression's is linear. The dials are not
+    on comparable scales and this is where that shows.
+  Read all of that as "which bot beats which bot", which is NOT the same
+  question as "which bot is a good opponent for a person". Stacking the wins
+  (`reaction=8,caution=0.25,aggression=0.35,accuracy=0.8`) beats the default by
+  +304 elo and 85% of pairs; the shipping default is deliberately still the
+  documented "competent but beatable" one, because difficulty is a design
+  choice and the harness only knows how to measure lethality.
   `sim/tests/combat.rs` covers the three failures worth catching:
   `bots_decide_identically_in_identical_worlds` (two runs, 400 ticks, every pawn
   on the same subunit — catches an unseeded RNG or iteration-order dependence,
@@ -772,6 +813,47 @@ need a TURN server eventually.
   playwright is not a repo dependency, so pass `AG_NODE_PATH=/path/to/node_modules`;
   and `SHOT`'s crop is sized to clear the HUD (health bar and roster above, the
   sights button below, stance buttons right), so a HUD move needs it re-checked.
+- **`tools/selfplay.sh [options]`** — the bot measuring rig: does profile A
+  actually beat profile B? Eight bots in the real arena, four a side, a minute
+  of game time a match, scored on **kills minus deaths**. `-c`/`-b` take
+  `skill=0.8,reaction=6` style specs that fill in from the shipping profile, so
+  a spec says exactly what is being varied. A match is ~30 ms, so a verdict is
+  usually a few seconds — run it before committing any change to `bot.rs` or
+  `BotProfile`.
+  It lives in its own crate (`harness/`, bin `selfplay`) for one reason: sim's
+  rule is NO FLOATS and a likelihood ratio is made of logarithms. Keeping the
+  statistics behind a crate boundary means that rule stays absolute rather than
+  acquiring an exception. Nothing in `client/` or `sim/` depends on it.
+  Three things make it work, and each is the answer to a way it would otherwise
+  lie:
+  * **Trials are PAIRS, not matches.** The arena isn't symmetric — spawn points
+    sit in different cover — so an unpaired run mostly measures which four seats
+    a profile drew. A pair is one split of the eight spawns played from BOTH
+    sides with the same dice, and the two scores added. There are exactly
+    C(8,4) = 70 splits; past that, `BotRoster::salt` varies the RNG. The
+    cancellation is exact: two IDENTICAL profiles score 0 every single pair,
+    because the mirrored match is the same match with the labels swapped
+    (`identical_profiles_tie_every_time` asserts it). A bot that never misses
+    never touches its dice, so `accuracy=1.0` on BOTH sides makes the salt inert
+    and only those 70 pairs exist — the run says so and caps itself.
+  * **A sequential test (Wald's SPRT), so it stops when the answer is in.** H0
+    is "wins half the decisive pairs", H1 is `--p1` (default 0.60, ~+70 elo),
+    alpha = beta = 0.05, bounds ±ln(19). An obvious difference resolves in ~20
+    pairs and a marginal one runs to `--pairs` (200) and reports a confidence
+    interval instead of a verdict. Ties are dropped and counted rather than
+    modelled, which is Wald's binomial test unmodified — no draw model to get
+    wrong, at the cost of a candidate that turns wins into ties looking like one
+    that changed nothing.
+  * **Kills minus deaths**, per the `Kills` note above. Both sides'
+    differentials are exact negatives, so the sign alone decides.
+  Two properties worth knowing before trusting a number: the whole thing is
+  deterministic, so re-running a command gives the identical verdict — repeating
+  it is not extra evidence, only more `--pairs` is. And **`NOT BETTER` means
+  "not ahead by the margin", which covers both "worse" and "the same"** — read
+  the rate line, which is why the output prints which one it was.
+  `the_harness_separates_a_quick_bot_from_a_slow_one` is the test that the
+  instrument works at all: reaction 3 vs reaction 23 on short matches must come
+  out BETTER, or every number it ever printed was noise dressed as evidence.
 - Native smoke: run without a room (synctest re-simulates every frame — it
   catches nondeterminism AND rollback-unsafe state immediately).
 - Web smoke: `tools/build-web.sh` + local http.server + headless chromium

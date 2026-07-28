@@ -56,7 +56,7 @@ use bevy::prelude::*;
 
 use crate::{
     isqrt, visible_fraction, Health, Intent, Occluder, Player, PlayerInput, Pos, Scenario,
-    Stance, BTN_FIRE, FP, STANCE_CROUCH, STANCE_PRONE, STANCE_STAND,
+    Stance, BTN_FIRE, FP, MAX_PLAYERS, STANCE_CROUCH, STANCE_PRONE, STANCE_STAND,
 };
 
 /// How many ticks of sightings a bot keeps. Caps [`BotProfile::reaction`]: at
@@ -196,6 +196,51 @@ impl Default for BotProfile {
     }
 }
 
+/// Which profile each handle's bot is built with, and what salts their dice.
+///
+/// **Configuration, not tick state.** `reconcile_bots` reads it, but
+/// only at the instant a bot spawns, and it must be CONSTANT for the life of a
+/// match — exactly like [`Scenario`]. That constancy is the whole licence for
+/// reading a resource inside the rollback schedule: a re-simulated tick spawns
+/// the same bot it spawned the first time. Mutate it mid-match and you have
+/// rebuilt the bug `BotCount` exists to avoid (the menu writes a resource, a
+/// rollback re-reads it, the peers disagree) — which is why the number of bots
+/// travels in the input stream and this does not.
+///
+/// In a room every peer must therefore build the same roster before the first
+/// tick. Today that is free: the game never varies it, and `Default` gives
+/// every bot [`BotProfile::default`]. It exists so the self-play harness can
+/// put two different profiles in one arena.
+#[derive(Resource, Clone, Copy, Debug)]
+pub struct BotRoster {
+    profiles: [BotProfile; MAX_PLAYERS],
+    /// Mixed into every bot's RNG seed. Without it a deterministic sim plays
+    /// the same match every time, so the harness would learn nothing from
+    /// running a second one; changing the salt is what makes two matches with
+    /// the same profiles genuinely different games.
+    pub salt: u32,
+}
+
+impl Default for BotRoster {
+    fn default() -> Self {
+        Self { profiles: [BotProfile::default(); MAX_PLAYERS], salt: 0 }
+    }
+}
+
+impl BotRoster {
+    /// The profile for a handle. Out-of-range handles get the default rather
+    /// than panicking — `reconcile_bots` runs mid-rollback.
+    pub fn profile(&self, handle: usize) -> BotProfile {
+        self.profiles.get(handle).copied().unwrap_or_default()
+    }
+
+    pub fn set(&mut self, handle: usize, profile: BotProfile) {
+        if let Some(slot) = self.profiles.get_mut(handle) {
+            *slot = profile;
+        }
+    }
+}
+
 /// A pawn the sim drives itself.
 ///
 /// Rollback-registered like every other tick-evolving component: `seed` and
@@ -222,11 +267,23 @@ const BOT_SEED: u32 = 0xB07_5EED;
 
 impl Bot {
     pub fn new(handle: usize, profile: BotProfile) -> Self {
+        Self::seeded(handle, profile, 0)
+    }
+
+    /// The same, with the roster's salt mixed in — see [`BotRoster::salt`].
+    pub fn seeded(handle: usize, profile: BotProfile, salt: u32) -> Self {
         // Hashed rather than `BOT_SEED + handle`: consecutive LCG seeds produce
         // visibly correlated first draws, and "all the bots twitch together" is
-        // exactly the tell that would give it away.
-        let mut seed = (handle as u32).wrapping_mul(0x9E37_79B9) ^ BOT_SEED;
+        // exactly the tell that would give it away. The salt goes through the
+        // same mixing step for the same reason — consecutive salts must not
+        // give two matches correlated opening shots.
+        let mut seed = (handle as u32)
+            .wrapping_mul(0x9E37_79B9)
+            .wrapping_add(salt.wrapping_mul(0x85EB_CA6B))
+            ^ BOT_SEED;
         seed ^= seed >> 15;
+        seed = seed.wrapping_mul(0xC2B2_AE35);
+        seed ^= seed >> 13;
         Self { seed: seed | 1, profile, memory: Memory::default() }
     }
 

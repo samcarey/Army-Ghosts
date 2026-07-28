@@ -190,6 +190,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "army-ghosts-harness"
+version = "0.1.0"
+dependencies = [
+ "army-ghosts-sim",
+ "bevy",
+ "bevy_ggrs",
+]
+
+[[package]]
 name = "army-ghosts-sim"
 version = "0.1.0"
 dependencies = [

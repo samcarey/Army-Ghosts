@@ -1,0 +1,21 @@
+[package]
+name = "army-ghosts-harness"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+# The bot self-play harness. NOT part of the game build — nothing in `client`
+# or `sim` depends on it, and `tools/build-web.sh` never sees it.
+#
+# It lives in its own crate rather than as a bin inside `sim` for one reason:
+# the sim crate's rule is NO FLOATS, and a sequential probability ratio test is
+# made of logarithms. Keeping the statistics on this side of a crate boundary
+# means the rule stays absolute over there instead of acquiring an exception.
+[[bin]]
+name = "selfplay"
+path = "src/main.rs"
+
+[dependencies]
+army-ghosts-sim = { workspace = true }
+bevy = { workspace = true }
+bevy_ggrs = { workspace = true }

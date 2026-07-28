@@ -248,6 +248,28 @@ Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_SIGNALING` env vars.
   * `SimPlugin` `init_resource::<Scenario>()`s, because `bot_think` asks what
     world it is in and anything building a bare app (the combat tests, the
     harness) would otherwise panic on the first tick.
+  **How many bots there are rides in the INPUT STREAM** (`BTN_BOTS_SHIFT`, bits
+  4-7 of the input byte, `0..=8`), applied by `reconcile_bots`. "Read it from a
+  resource the menu writes" is the obvious implementation and is WRONG: a
+  rollback re-runs a tick from a restored snapshot, and a resource the UI
+  changed in between makes the re-run differ. An absolute count in the inputs is
+  idempotent — replaying reconciles to the same number however often it happens
+  — and it reaches every peer through the one channel they already agree on, so
+  bots work in a room with no lobby message and no extra protocol. Same trick as
+  the stance level, for the same reason.
+  * Only the FIRST player's copy is honoured, so two people can't fight over it.
+  * **`spawn_world` spawns no bots.** They arrive one per tick from the
+    reconciler. Spawning some there as well gives the count two sources of truth
+    and the reconciler — correctly — immediately undoes whichever it disagrees
+    with. (This is exactly what happened when both existed.)
+  * The reconciler picks the LOWEST FREE handle to add and the HIGHEST to
+    remove, never query order: two peers must pick the same pawn.
+  * `client/src/menu.rs` `BotCount` is UI state only; `input.rs` writes it into
+    handle 0's input every tick. `?bots=N` / `AG_BOTS=N` seeds the same dial, so
+    the URL and the menu are one setting (index.html must forward `bots` into
+    `__AG_NET__` — it was missed once and the param silently did nothing).
+  * The HUD roster walks PAWNS, not session handles, or bots are absent from the
+    scoreboard while busy killing people.
   Tuning lives in `BotProfile` (skill / accuracy / reaction / aggression /
   caution) — one struct precisely so the self-play harness can vary it.
   `sim/tests/combat.rs` covers the three failures worth catching:

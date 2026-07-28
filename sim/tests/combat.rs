@@ -38,6 +38,9 @@ const VICTIM: usize = 3;
 struct Script {
     handle: usize,
     input: PlayerInput,
+    /// How many bots to ask for. Rides on handle 0's input, because that is the
+    /// only copy `reconcile_bots` honours — the same path the menu uses.
+    bots: u8,
 }
 
 fn read_inputs(mut commands: Commands, script: Res<Script>) {
@@ -46,6 +49,7 @@ fn read_inputs(mut commands: Commands, script: Res<Script>) {
         inputs.insert(handle, PlayerInput::default());
     }
     inputs.insert(script.handle, script.input);
+    inputs.entry(0).and_modify(|i| i.set_bots(script.bots));
     commands.insert_resource(LocalInputs::<TestConfig>(inputs));
 }
 
@@ -71,6 +75,10 @@ fn arena() -> App {
 /// still built for `PLAYERS` handles — that is the whole point: bot pawns carry
 /// handles beyond the session's range, so anything still reaching into
 /// `PlayerInputs` by handle panics here rather than in a match.
+///
+/// Bots arrive one per tick through `reconcile_bots`, so this ticks far enough
+/// for all of them to be present before handing the app back — otherwise every
+/// caller would have to know that and remember it.
 fn arena_with_bots(bots: usize) -> App {
     let mut app = App::new();
     // Manual clock: one update is one tick's worth of time, so tests count
@@ -83,8 +91,8 @@ fn arena_with_bots(bots: usize) -> App {
         .add_plugins(SimPlugin::<TestConfig>::default())
         .init_resource::<Script>()
         .add_systems(ReadInputs, read_inputs)
-        .add_systems(Startup, move |mut commands: Commands| {
-            spawn_world(&mut commands, PLAYERS, bots, Scenario::Arena)
+        .add_systems(Startup, |mut commands: Commands| {
+            spawn_world(&mut commands, PLAYERS, Scenario::Arena)
         });
 
     let mut builder = SessionBuilder::<TestConfig>::new()
@@ -97,11 +105,17 @@ fn arena_with_bots(bots: usize) -> App {
         builder.start_synctest_session().expect("start synctest"),
     ));
     app.update(); // Startup: the world exists from here on
+    app.world_mut().resource_mut::<Script>().bots = bots as u8;
+    run(&mut app, bots + 1); // one tick per bot, plus one to settle
     app
 }
 
+/// Drive a handle, leaving the bot count alone — `arena_with_bots` set it, and
+/// clearing it here would have the reconciler quietly remove every bot.
 fn drive(app: &mut App, handle: usize, input: PlayerInput) {
-    *app.world_mut().resource_mut::<Script>() = Script { handle, input };
+    let mut script = app.world_mut().resource_mut::<Script>();
+    script.handle = handle;
+    script.input = input;
 }
 
 fn run(app: &mut App, updates: usize) {
@@ -318,13 +332,14 @@ fn bots_decide_identically_in_identical_worlds() {
     assert!(interesting, "nothing happened in 400 ticks; the comparison proved nothing");
 }
 
-/// A bot shoots at somebody it can see, and doesn't shoot at somebody it can't.
+/// Bots find each other and open fire unprompted.
 ///
-/// The reaction queue makes the first half non-trivial: a bot that fires on the
-/// tick it sees you has no reaction time, and one that never fires has a broken
-/// memory index. Both are easy mistakes and both look fine from the outside.
+/// The reaction *delay* itself is tested precisely in `bot.rs` (the ring buffer
+/// is the mechanism, and a unit test can pin it to the tick); this only asserts
+/// the end of that chain works at all — a broken memory index reads as a bot
+/// that never shoots, which every other test here would pass.
 #[test]
-fn bots_open_fire_only_after_their_reaction_time() {
+fn bots_open_fire_unprompted() {
     let mut app = arena_with_bots(4);
     // Nobody drives a human; the bots are the only thing that can shoot.
     drive(&mut app, SHOOTER, PlayerInput::default());
@@ -338,12 +353,7 @@ fn bots_open_fire_only_after_their_reaction_time() {
             break;
         }
     }
-    let first_shot = first_shot.expect("four bots in an arena together should find each other");
-    assert!(
-        first_shot >= BotProfile::default().reaction as usize,
-        "a bot fired on tick {first_shot}, inside its own {}-tick reaction time",
-        BotProfile::default().reaction
-    );
+    first_shot.expect("four bots in an arena together should find each other and shoot");
 }
 
 /// Bots actually fight: left alone in an arena together they find each other,

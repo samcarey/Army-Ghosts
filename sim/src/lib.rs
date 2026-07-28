@@ -127,6 +127,21 @@ pub const BTN_ADS: u8 = 1 << 1;
 /// matter how often the frame is replayed.
 pub const BTN_STANCE_SHIFT: u8 = 2;
 pub const BTN_STANCE_MASK: u8 = 0b11 << BTN_STANCE_SHIFT;
+/// Bits 4-7 carry how many bots the *first* player wants in the match, `0..=8`.
+///
+/// It rides in the input stream for exactly the reason the stance level does,
+/// and it is worth spelling out because "read it from a resource the menu
+/// writes" is the obvious implementation and is wrong: a rollback re-runs a
+/// tick from a restored snapshot, and a resource the UI has changed in the
+/// meantime makes that re-run differ from the original. An **absolute count**
+/// carried in the inputs is idempotent — replaying the tick reconciles to the
+/// same number however many times it happens — and it arrives on every peer
+/// through the one channel they already agree on.
+///
+/// Only the first player's copy is honoured ([`reconcile_bots`]); everyone
+/// else's is ignored, so two people pressing the button can't fight over it.
+pub const BTN_BOTS_SHIFT: u8 = 4;
+pub const BTN_BOTS_MASK: u8 = 0b1111 << BTN_BOTS_SHIFT;
 
 impl PlayerInput {
     pub fn fire(&self) -> bool {
@@ -143,6 +158,15 @@ impl PlayerInput {
     pub fn set_stance(&mut self, level: u8) {
         self.buttons &= !BTN_STANCE_MASK;
         self.buttons |= (level.min(STANCE_PRONE)) << BTN_STANCE_SHIFT;
+    }
+    /// How many bots this player is asking for, clamped so a peer sending 15
+    /// can't ask for more pawns than there are spawn points.
+    pub fn bots(&self) -> u8 {
+        ((self.buttons & BTN_BOTS_MASK) >> BTN_BOTS_SHIFT).min(MAX_PLAYERS as u8)
+    }
+    pub fn set_bots(&mut self, count: u8) {
+        self.buttons &= !BTN_BOTS_MASK;
+        self.buttons |= count.min(MAX_PLAYERS as u8) << BTN_BOTS_SHIFT;
     }
 }
 
@@ -1128,32 +1152,24 @@ fn spawn_pawn(commands: &mut Commands, handle: usize, x: i32, y: i32) -> Entity 
         .id()
 }
 
-/// Spawn the initial world: one pawn per player, `num_bots` more the sim drives
-/// itself, the practice targets, and the procedural rock and bush fields. Both
-/// clients run this identically before the first tick.
+/// Spawn the initial world: one pawn per player, the practice targets, and the
+/// procedural rock and bush fields. Both clients run this identically before
+/// the first tick.
 ///
-/// Bots take handles straight on from the humans, so the pawns are always
-/// `0..num_players + num_bots` with no gaps — and that total is capped at
-/// [`MAX_PLAYERS`], because [`SPAWN_POINTS`] is what there is room for.
-pub fn spawn_world(
-    commands: &mut Commands,
-    num_players: usize,
-    num_bots: usize,
-    scenario: Scenario,
-) {
+/// **No bots.** They are not spawned here on purpose: the number of them is
+/// carried in the input stream and applied by [`reconcile_bots`], which is the
+/// only way it can be rollback-safe and the only way two peers can be sure to
+/// agree. Spawning some here as well would give the count two sources of truth,
+/// and the reconciler — correctly — would immediately undo whichever one it
+/// disagreed with. They appear over the first few ticks instead, one per tick.
+pub fn spawn_world(commands: &mut Commands, num_players: usize, scenario: Scenario) {
     if let Scenario::GrassStrip { east_stance, .. } = scenario {
         spawn_grass_strip(commands, east_stance);
         return;
     }
-    let total = (num_players + num_bots).min(MAX_PLAYERS);
-    for handle in 0..total {
+    for handle in 0..num_players.min(MAX_PLAYERS) {
         let (x, y) = SPAWN_POINTS[handle];
-        let pawn = spawn_pawn(commands, handle, x, y);
-        if handle >= num_players {
-            commands
-                .entity(pawn)
-                .insert(Bot::new(handle, BotProfile::default()));
-        }
+        spawn_pawn(commands, handle, x, y);
     }
     for (x, y) in TARGET_POINTS {
         commands
@@ -1373,6 +1389,9 @@ impl<C: Config<Input = PlayerInput>> Plugin for SimPlugin<C> {
                     // want the world as the previous tick left it — fully
                     // settled, including respawns — and everything after them
                     // wants this tick's decisions.
+                    // First: it changes the pawn set, and everything after
+                    // wants a settled one.
+                    reconcile_bots::<C>,
                     read_human_intent::<C>,
                     bot_think,
                     move_players,
@@ -1388,6 +1407,63 @@ impl<C: Config<Input = PlayerInput>> Plugin for SimPlugin<C> {
 }
 
 // ── Fixed-tick systems (run inside the GGRS rollback schedule) ──────────────
+
+/// Add or remove bot pawns until the match has as many as the first player is
+/// asking for.
+///
+/// **Reconciliation, not a command.** The input carries an absolute count, and
+/// this closes the gap by one pawn per tick; replaying a tick therefore reaches
+/// the same world however many times GGRS runs it. A "+1 bot" edge would apply
+/// once per re-simulation instead, which is the same trap stance avoided by
+/// sending a level rather than a "go down".
+///
+/// Every choice here is made on a sorted key rather than query order: the new
+/// bot takes the lowest free handle, and the one removed is the highest. Two
+/// peers must pick the same pawn or they diverge immediately.
+///
+/// One pawn per tick is deliberate — it keeps the work bounded, and at 60 Hz
+/// filling an arena still looks instant.
+fn reconcile_bots<C: Config<Input = PlayerInput>>(
+    mut commands: Commands,
+    inputs: Res<PlayerInputs<C>>,
+    pawns: Query<(Entity, &Player, Option<&Bot>)>,
+) {
+    // The first player's copy, and only theirs.
+    let Some(&(input, _status)) = inputs.get(0) else { return };
+
+    let mut taken = [false; MAX_PLAYERS];
+    let (mut humans, mut bots) = (0usize, Vec::new());
+    for (entity, player, is_bot) in &pawns {
+        if player.handle < MAX_PLAYERS {
+            taken[player.handle] = true;
+        }
+        match is_bot {
+            Some(_) => bots.push((player.handle, entity)),
+            None => humans += 1,
+        }
+    }
+
+    // Bots fill the seats the humans aren't using; asking for more than that is
+    // asking for a spawn point that doesn't exist.
+    let wanted = (input.bots() as usize).min(MAX_PLAYERS.saturating_sub(humans));
+    if bots.len() == wanted {
+        return;
+    }
+
+    if bots.len() < wanted {
+        let Some(handle) = (0..MAX_PLAYERS).find(|&h| !taken[h]) else { return };
+        let (x, y) = SPAWN_POINTS[handle];
+        let pawn = spawn_pawn(&mut commands, handle, x, y);
+        commands
+            .entity(pawn)
+            .insert(Bot::new(handle, BotProfile::default()));
+    } else {
+        bots.sort_unstable();
+        if let Some(&(_, entity)) = bots.last() {
+            commands.entity(entity).despawn();
+        }
+    }
+}
 
 /// Copy this tick's inputs off the wire onto the human pawns.
 ///

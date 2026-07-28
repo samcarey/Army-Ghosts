@@ -146,6 +146,8 @@
     //   ?players=N      seat cap, max 8 (default 8) — the host starts the
     //                   match with whoever's present; a full room auto-starts
     //   ?signaling=URL  override the signaling server (testing)
+    //   ?bots=N         start with N bots (the MENU has -/+ for it too, and
+    //                   both feed the same dial)
     //   ?ice=none       host-candidates-only (fast local/LAN testing; some
     //                   networks stall browser STUN for ~40s per handshake);
     //                   or ?ice=stun:host:port,... for custom servers
@@ -156,6 +158,7 @@
       const p = new URLSearchParams(location.search);
       const room = p.get('room') || '';
       const players = p.get('players') || '';
+      const bots = p.get('bots') || '';
       const ice = p.get('ice') || '';
       // Dev measuring rig, offline only (net.rs ignores it with a room set):
       // ?scenario=strip[:depth[:east stance]] — see sim's `Scenario`.
@@ -176,7 +179,7 @@
          : isTailnet ? 'wss://' + location.hostname + ':9451'
          : isCaddy ? 'wss://' + location.host + '/ws'
                    : 'wss://army-ghosts.dev.whoeverwants.com:7443/ws');
-      window.__AG_NET__ = { room, players, signaling, ice, scenario };
+      window.__AG_NET__ = { room, players, bots, signaling, ice, scenario };
       if (room) {
         document.getElementById('room').textContent =
           'multiplayer · room ' + room + (players ? ' · ' + players + ' players' : '');

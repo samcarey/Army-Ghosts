@@ -23,6 +23,7 @@ pub fn read_local_inputs(
     stance: Res<StanceControl>,
     local_players: Res<LocalPlayers>,
     scenario: Res<Scenario>,
+    bots: Res<crate::menu::BotCount>,
 ) {
     let mut local_inputs = HashMap::new();
     // Inputs drive the *first* local handle; any additional local handles
@@ -30,6 +31,13 @@ pub fn read_local_inputs(
     let mut first = true;
     for handle in &local_players.0 {
         let mut input = PlayerInput::default();
+        // The bot count rides on handle 0's input and only handle 0's — that
+        // is the copy `reconcile_bots` honours. Sent every tick as an absolute
+        // number, not a "+1" edge, so replaying a tick reconciles to the same
+        // world however many times rollback runs it.
+        if *handle == 0 {
+            input.set_bots(bots.0 as u8);
+        }
         if first {
             // Keyboard (desktop) …
             let mut x: i32 = 0;

@@ -6,7 +6,7 @@
 use bevy::prelude::*;
 use bevy_ggrs::{LocalPlayers, Session};
 
-use army_ghosts_sim::{Deaths, Health, Player, FP};
+use army_ghosts_sim::{Bot, Deaths, Health, Player, FP};
 
 use crate::net::Lobby;
 use crate::{AppState, LaunchConfig, SessionConfig};
@@ -423,7 +423,7 @@ pub fn update_player_list(
     lobby: Res<Lobby>,
     session: Option<Res<Session<SessionConfig>>>,
     local_players: Option<Res<LocalPlayers>>,
-    scores: Query<(&Player, &Deaths)>,
+    scores: Query<(&Player, &Deaths, Option<&Bot>)>,
     mut texts: Query<&mut Text, With<PlayerListText>>,
 ) {
     let Ok(mut text) = texts.single_mut() else { return };
@@ -446,12 +446,30 @@ pub fn update_player_list(
                 _ => 0,
             };
             let local = local_players.map(|l| l.0.clone()).unwrap_or_default();
-            for handle in 0..num_players {
-                let you = if local.contains(&handle) { " (you)" } else { "" };
+            // Walk the PAWNS, not the session's handles: bots are pawns without
+            // a seat, so anything counting seats would leave them off the board
+            // while they were busy killing people. Sorted, because query order
+            // isn't stable and a roster that reshuffles itself is unreadable.
+            let mut board: Vec<(usize, u32, bool)> = scores
+                .iter()
+                .map(|(player, deaths, bot)| (player.handle, deaths.0, bot.is_some()))
+                .collect();
+            board.sort_unstable();
+            for (handle, deaths, is_bot) in board {
+                let who = if is_bot {
+                    // Numbered within the bots rather than continuing the player
+                    // numbering: bots take the handles above the humans, so the
+                    // first one is `num_players`.
+                    format!("Bot {}", handle.saturating_sub(num_players) + 1)
+                } else {
+                    let you = if local.contains(&handle) { " (you)" } else { "" };
+                    format!("Player {}{}", handle + 1, you)
+                };
                 // GGRS-measured roundtrip time to each remote peer. Errors
-                // (local handles, or a peer still synchronizing) → no ping.
+                // (local handles, or a peer still synchronizing) → no ping. Bots
+                // are local by construction and never have one.
                 let ping = match session.as_deref() {
-                    Some(Session::P2P(s)) => s
+                    Some(Session::P2P(s)) if !is_bot => s
                         .network_stats(handle)
                         .map(|stats| format!(" {}ms", stats.ping))
                         .unwrap_or_default(),
@@ -459,18 +477,7 @@ pub fn update_player_list(
                 };
                 // Deaths come out of the sim, so every peer's board agrees
                 // without anyone sending a score message.
-                let deaths = scores
-                    .iter()
-                    .find(|(p, _)| p.handle == handle)
-                    .map(|(_, d)| d.0)
-                    .unwrap_or(0);
-                lines.push(format!(
-                    "Player {}{}  {}{}",
-                    handle + 1,
-                    you,
-                    deaths_label(deaths),
-                    ping
-                ));
+                lines.push(format!("{}  {}{}", who, deaths_label(deaths), ping));
             }
         }
     }

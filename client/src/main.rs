@@ -67,6 +67,9 @@ fn main() {
     // builds, so everything downstream reads one value instead of pattern
     // matching on the launch config.
     .insert_resource(launch.scenario)
+    // Seeds the menu's dial from `?bots=` / `AG_BOTS`, so the URL and the UI
+    // are the same setting rather than two.
+    .insert_resource(menu::BotCount(launch.bots))
     .insert_resource(launch)
     .init_resource::<touch::TouchControls>()
     .init_resource::<ads::Ads>()
@@ -107,6 +110,7 @@ fn main() {
             ),
             (hud::copy_link_pressed, hud::tick_copied_flash).chain(),
             menu::menu_interactions,
+            menu::update_bot_label,
             (touch::read_touches, touch::update_overlay).chain(),
             // advance_ads owns the aim transition; the aim line and the camera
             // shift both read it, so they follow it in the same frame.

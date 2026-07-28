@@ -188,7 +188,7 @@ pub struct Lobby {
     pub start_requested: bool,
 }
 
-fn start_local_session(commands: &mut Commands, players: usize, bots: usize, scenario: Scenario) {
+fn start_local_session(commands: &mut Commands, players: usize, scenario: Scenario) {
     let mut builder = SessionBuilder::<SessionConfig>::new()
         .with_num_players(players)
         .with_check_distance(2);
@@ -199,7 +199,7 @@ fn start_local_session(commands: &mut Commands, players: usize, bots: usize, sce
     }
     let session = builder.start_synctest_session().expect("start synctest");
     commands.insert_resource(Session::SyncTest(session));
-    spawn_world(commands, players, bots, scenario);
+    spawn_world(commands, players, scenario);
 }
 
 /// Startup: always start playing immediately. With a room, that's a 1-player
@@ -233,16 +233,14 @@ pub fn begin_session_setup(
             // Warmup: run around and shoot while waiting for the room to fill.
             // Always the real arena — `parse_scenario` refuses the rig with a
             // room set, but spell it out rather than rely on that here.
-            // No bots in warmup: the world is torn down and rebuilt when the
-            // match starts, and bots that vanish on START read as a bug.
-            start_local_session(&mut commands, 1, 0, Scenario::Arena);
+            start_local_session(&mut commands, 1, Scenario::Arena);
         }
         None => {
             info!(
                 "no room — starting local synctest session ({} players, {} bots, {:?})",
                 launch.players, launch.bots, launch.scenario
             );
-            start_local_session(&mut commands, launch.players, launch.bots, launch.scenario);
+            start_local_session(&mut commands, launch.players, launch.scenario);
             next_state.set(AppState::InGame);
         }
     }
@@ -385,12 +383,10 @@ pub fn finalize_p2p_session(
     // A p2p match is the arena, full stop: every peer must build the same world
     // and only one of them typed the URL.
     //
-    // Bot count is 0 here for exactly that reason and NOT `launch.bots`: two
-    // peers joining with different `?bots=` would build different worlds, which
-    // is a desync before the first tick. In a room the count has to be *agreed*,
-    // so it rides in the host's start roster — until that lands, rooms are
-    // humans only and bots are an offline feature.
-    spawn_world(&mut commands, num_players, 0, Scenario::Arena);
+    // No bots here either: they are never spawned with the world. The count
+    // rides in the input stream and `reconcile_bots` applies it, which is what
+    // makes it agree across peers without anyone sending a bot message.
+    spawn_world(&mut commands, num_players, Scenario::Arena);
     next_state.set(AppState::InGame);
 }
 

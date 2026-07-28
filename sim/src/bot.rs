@@ -577,3 +577,86 @@ fn toward(from: Pos, to: Pos) -> (i8, i8) {
 pub fn is_concealed(scenario: &Scenario, pos: Pos, stance: u8) -> bool {
     scenario.cover(pos.x / FP, pos.y / FP, stance) >= FP
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seen(who: u8, x: i32) -> Sighting {
+        Sighting { who, pos: Pos::from_units(x, 0), stance: STANCE_STAND, exposure: FP }
+    }
+
+    /// The delay line returns what was pushed N ticks ago, which is the whole
+    /// mechanism: `attended` is how stale the bot's picture of the world is,
+    /// and an off-by-one here is a bot that reacts a tick early or late for
+    /// every engagement it ever has.
+    #[test]
+    fn memory_recalls_the_tick_it_was_asked_for() {
+        let mut m = Memory::default();
+        for tick in 0..MEMORY_TICKS {
+            m.push(seen(1, tick as i32));
+        }
+        // 0 ticks back is the newest.
+        assert_eq!(m.recall(0).unwrap().pos.x, Pos::from_units(MEMORY_TICKS as i32 - 1, 0).x);
+        for back in 0..MEMORY_TICKS {
+            let want = MEMORY_TICKS as i32 - 1 - back as i32;
+            assert_eq!(
+                m.recall(back).unwrap().pos.x,
+                Pos::from_units(want, 0).x,
+                "recall({back}) should be the sighting from {back} ticks ago"
+            );
+        }
+    }
+
+    /// A bot that has only just spawned must not "remember" ticks it was never
+    /// alive for — otherwise its first engagement is fought against a sighting
+    /// at the origin that never happened.
+    #[test]
+    fn memory_refuses_to_recall_before_it_existed() {
+        let mut m = Memory::default();
+        assert!(m.recall(0).is_none(), "an empty memory recalled something");
+        m.push(seen(1, 5));
+        assert!(m.recall(0).is_some());
+        assert!(m.recall(1).is_none(), "recalled a tick that never happened");
+        assert!(m.attended(10).is_none(), "attended a tick that never happened");
+    }
+
+    /// Sightings of nobody are still pushed, so the buffer stays in step with
+    /// the tick count — but they must not read as contact.
+    #[test]
+    fn empty_sightings_advance_time_without_becoming_contact() {
+        let mut m = Memory::default();
+        m.push(seen(3, 40));
+        for _ in 0..5 {
+            m.push(Sighting::default());
+        }
+        assert!(m.attended(0).is_none(), "an empty sighting read as contact");
+        assert_eq!(m.attended(5).unwrap().who, 3, "the real sighting moved off its tick");
+        // Last contact ignores the gap and finds the real one.
+        assert_eq!(m.last_contact().unwrap().who, 3);
+    }
+
+    /// Two bots with different handles draw different jitter. Consecutive LCG
+    /// seeds would leave them visibly correlated, which is what the hash in
+    /// `Bot::new` is for.
+    #[test]
+    fn bots_with_different_handles_do_not_move_in_lockstep() {
+        let (mut a, mut b) = (Bot::new(4, BotProfile::default()), Bot::new(5, BotProfile::default()));
+        let draws: Vec<(i32, i32)> = (0..16).map(|_| (a.jitter(100), b.jitter(100))).collect();
+        assert!(
+            draws.iter().filter(|(x, y)| x == y).count() < 4,
+            "two bots drew the same jitter too often: {draws:?}"
+        );
+    }
+
+    /// The same handle always starts from the same seed — a bot is deterministic
+    /// from its identity, not from when it happened to be created.
+    #[test]
+    fn a_bot_is_reproducible_from_its_handle() {
+        let mut a = Bot::new(6, BotProfile::default());
+        let mut b = Bot::new(6, BotProfile::default());
+        for _ in 0..32 {
+            assert_eq!(a.rand(), b.rand());
+        }
+    }
+}

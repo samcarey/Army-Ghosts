@@ -109,12 +109,21 @@ pub const STANCE_HEIGHT: [i32; STANCE_COUNT] = [64, 52, 15];
 
 /// The only thing that crosses the network: one player's input for one tick.
 /// Kept tiny (ggrs serializes it with serde every tick). Joystick axes are
-/// quantized to i8 (-127..=127); `buttons` is a bitflag byte.
+/// quantized to i8 (-127..=127); `buttons` and `dials` are bitfield bytes.
+///
+/// `dials` is a second byte because `buttons` ran out — fire, sights, two bits
+/// of stance and four of bot count fill it exactly. Everything in either byte
+/// is an **absolute value re-sent every tick**, never an edge, for the reason
+/// spelled out on [`BTN_BOTS_SHIFT`]: rollback replays a tick as often as it
+/// likes, and only an idempotent input replays to the same world.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub struct PlayerInput {
     pub move_x: i8,
     pub move_y: i8,
     pub buttons: u8,
+    /// Match settings the first player is dialling. Bits 0-3: bot aggression
+    /// ([`DIAL_AGGRO_MASK`]). Bits 4-7 spare.
+    pub dials: u8,
 }
 
 pub const BTN_FIRE: u8 = 1 << 0;
@@ -143,6 +152,23 @@ pub const BTN_STANCE_MASK: u8 = 0b11 << BTN_STANCE_SHIFT;
 pub const BTN_BOTS_SHIFT: u8 = 4;
 pub const BTN_BOTS_MASK: u8 = 0b1111 << BTN_BOTS_SHIFT;
 
+/// Bits 0-3 of [`PlayerInput::dials`]: how aggressive the first player wants
+/// the bots, as a LEVEL rather than the raw `0..=FP` value — four bits is all
+/// there is, and a tenth is finer than anyone can judge by eye anyway.
+///
+/// **Zero means "don't touch it"**, which is what makes this safe to add: a
+/// caller that never sets the dial (the self-play harness, whose whole job is
+/// to give the two sides *different* aggression from a [`BotRoster`]) keeps the
+/// profile it asked for. Levels `1..=AGGRO_LEVELS` map onto `0.0..=1.0`, so the
+/// menu's lowest setting is genuinely zero rather than "nearly zero".
+///
+/// Applied by [`apply_bot_dials`] every tick, to every bot, from an absolute
+/// value — the same idempotence argument as the bot count, and the reason the
+/// dial can be turned mid-match instead of only at spawn.
+pub const DIAL_AGGRO_MASK: u8 = 0b1111;
+/// How many positions the aggression dial has. 11, so the steps are tenths.
+pub const AGGRO_LEVELS: u8 = 11;
+
 impl PlayerInput {
     pub fn fire(&self) -> bool {
         self.buttons & BTN_FIRE != 0
@@ -167,6 +193,17 @@ impl PlayerInput {
     pub fn set_bots(&mut self, count: u8) {
         self.buttons &= !BTN_BOTS_MASK;
         self.buttons |= count.min(MAX_PLAYERS as u8) << BTN_BOTS_SHIFT;
+    }
+    /// The aggression this player is dialling, `0..=FP`, or `None` for "leave
+    /// the bots' own profiles alone" — see [`DIAL_AGGRO_MASK`].
+    pub fn aggression(&self) -> Option<i32> {
+        let level = (self.dials & DIAL_AGGRO_MASK).min(AGGRO_LEVELS);
+        (level > 0).then(|| (level as i32 - 1) * FP / (AGGRO_LEVELS as i32 - 1))
+    }
+    /// `level` is `1..=AGGRO_LEVELS`; 0 clears the dial.
+    pub fn set_aggression(&mut self, level: u8) {
+        self.dials &= !DIAL_AGGRO_MASK;
+        self.dials |= level.min(AGGRO_LEVELS);
     }
 }
 
@@ -1407,6 +1444,10 @@ impl<C: Config<Input = PlayerInput>> Plugin for SimPlugin<C> {
                     // First: it changes the pawn set, and everything after
                     // wants a settled one.
                     reconcile_bots::<C>,
+                    // Between the two: the bot set is settled by now, and
+                    // `bot_think` should decide on this tick's dial rather than
+                    // last tick's.
+                    apply_bot_dials::<C>,
                     read_human_intent::<C>,
                     bot_think,
                     move_players,
@@ -1481,6 +1522,33 @@ fn reconcile_bots<C: Config<Input = PlayerInput>>(
         bots.sort_unstable();
         if let Some(&(_, entity)) = bots.last() {
             commands.entity(entity).despawn();
+        }
+    }
+}
+
+/// Push the first player's match dials onto every bot, every tick.
+///
+/// **Every tick, not at spawn**, and that is the point: the dial can be turned
+/// mid-match and the bots already standing there change their minds, instead of
+/// the setting only reaching whoever is spawned next. It is safe to do that
+/// only because the input carries an ABSOLUTE level — writing the same value
+/// onto the same bot twice is writing it once, so a replayed tick lands on the
+/// identical world however many times GGRS runs it. A "+1 aggression" edge, or
+/// a resource the menu mutated, would not survive the first rollback.
+///
+/// A zero dial means the sender isn't asking, and the bots keep whatever
+/// [`BotRoster`] gave them. That is what lets the self-play harness put two
+/// different profiles in one arena while still driving handle 0's input.
+fn apply_bot_dials<C: Config<Input = PlayerInput>>(
+    inputs: Res<PlayerInputs<C>>,
+    mut bots: Query<&mut Bot>,
+) {
+    let Some(&(input, _status)) = inputs.get(0) else { return };
+    let Some(aggression) = input.aggression() else { return };
+    for mut bot in &mut bots {
+        // Guarded so an unchanged dial doesn't mark every bot dirty each tick.
+        if bot.profile.aggression != aggression {
+            bot.profile.aggression = aggression;
         }
     }
 }
@@ -1871,6 +1939,59 @@ fn tick_targets(mut targets: Query<&mut Target>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The aggression dial spans the whole range, and its ends are the ends —
+    /// the lowest position must be genuinely 0, not "nearly 0", or the menu
+    /// can't ask for the setting the self-play harness says is best.
+    #[test]
+    fn the_aggression_dial_covers_zero_to_one() {
+        let mut input = PlayerInput::default();
+        input.set_aggression(1);
+        assert_eq!(input.aggression(), Some(0));
+        input.set_aggression(AGGRO_LEVELS);
+        assert_eq!(input.aggression(), Some(FP));
+        input.set_aggression(AGGRO_LEVELS / 2 + 1);
+        assert_eq!(input.aggression(), Some(FP / 2));
+        // Monotone, so a step of the dial is always a step of the value.
+        let mut last = -1;
+        for level in 1..=AGGRO_LEVELS {
+            input.set_aggression(level);
+            let value = input.aggression().expect("a set dial reads back");
+            assert!(value > last, "dial position {level} didn't raise the value");
+            last = value;
+        }
+    }
+
+    /// Zero means "not asking", which is the whole reason this could be added
+    /// to the input byte without disturbing the harness: it drives handle 0's
+    /// input to set the bot count, and must not thereby flatten the two sides'
+    /// aggression to one value and silently invalidate every measurement.
+    #[test]
+    fn an_unset_aggression_dial_leaves_profiles_alone() {
+        assert_eq!(PlayerInput::default().aggression(), None);
+        // And it doesn't collide with the bits next door.
+        let mut input = PlayerInput::default();
+        input.set_bots(5);
+        input.set_stance(STANCE_PRONE);
+        input.buttons |= BTN_FIRE;
+        assert_eq!(input.aggression(), None, "another field leaked into the dial");
+        input.set_aggression(4);
+        assert_eq!(input.bots(), 5, "the dial disturbed the bot count");
+        assert_eq!(input.stance(), STANCE_PRONE, "the dial disturbed the stance");
+        assert!(input.fire(), "the dial disturbed the trigger");
+    }
+
+    /// A peer sending garbage in the spare bits can't index anything out of
+    /// range or ask for an aggression outside `0..=FP`.
+    #[test]
+    fn a_hostile_dial_byte_stays_in_range() {
+        for raw in 0..=u8::MAX {
+            let input = PlayerInput { move_x: 0, move_y: 0, buttons: 0, dials: raw };
+            if let Some(value) = input.aggression() {
+                assert!((0..=FP).contains(&value), "dials {raw} gave aggression {value}");
+            }
+        }
+    }
 
     /// Walking straight at a boulder stops you; walking at it on an angle
     /// slides you around it (the whole point of pushing out along the normal).

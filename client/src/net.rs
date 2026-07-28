@@ -42,6 +42,10 @@ pub struct LaunchConfig {
     /// way in; this is the starting value, so a test can ask for a full arena
     /// without touching the UI (`?bots=5`, `AG_BOTS=5`).
     pub bots: usize,
+    /// Where the menu's aggression dial starts, as a percentage `0..=100`
+    /// rounded to the nearest position (`?aggro=20`, `AG_AGGRO=20`). Same
+    /// arrangement as `bots`: the URL and the menu are one setting, not two.
+    pub aggro: Option<u32>,
 }
 
 const DEFAULT_SIGNALING: &str = "ws://127.0.0.1:3536";
@@ -121,10 +125,11 @@ pub fn launch_config() -> LaunchConfig {
         players,
         scenario,
     );
+    let aggro = std::env::var("AG_AGGRO").ok().and_then(|a| a.parse().ok());
     let signaling =
         std::env::var("AG_SIGNALING").unwrap_or_else(|_| DEFAULT_SIGNALING.to_string());
     let ice = parse_ice(std::env::var("AG_ICE").ok());
-    LaunchConfig { room, players, signaling, ice, scenario, bots }
+    LaunchConfig { room, players, signaling, ice, scenario, bots, aggro }
 }
 
 /// Web: `window.__AG_NET__ = { room, players, signaling }`, set by index.html
@@ -147,9 +152,10 @@ pub fn launch_config() -> LaunchConfig {
         scenario,
     );
     let bots = resolve_bots(get(&net, "bots").and_then(|b| b.parse().ok()), players, scenario);
+    let aggro = get(&net, "aggro").and_then(|a| a.parse().ok());
     let signaling = get(&net, "signaling").unwrap_or_else(|| DEFAULT_SIGNALING.to_string());
     let ice = parse_ice(get(&net, "ice"));
-    LaunchConfig { room, players, signaling, ice, scenario, bots }
+    LaunchConfig { room, players, signaling, ice, scenario, bots, aggro }
 }
 
 /// Handoff between `run_lobby` (which tears the warmup world down) and

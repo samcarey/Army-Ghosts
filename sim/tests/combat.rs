@@ -41,6 +41,8 @@ struct Script {
     /// How many bots to ask for. Rides on handle 0's input, because that is the
     /// only copy `reconcile_bots` honours — the same path the menu uses.
     bots: u8,
+    /// The aggression dial position, or 0 for "not asking".
+    aggro: u8,
 }
 
 fn read_inputs(mut commands: Commands, script: Res<Script>) {
@@ -49,7 +51,10 @@ fn read_inputs(mut commands: Commands, script: Res<Script>) {
         inputs.insert(handle, PlayerInput::default());
     }
     inputs.insert(script.handle, script.input);
-    inputs.entry(0).and_modify(|i| i.set_bots(script.bots));
+    inputs.entry(0).and_modify(|i| {
+        i.set_bots(script.bots);
+        i.set_aggression(script.aggro);
+    });
     commands.insert_resource(LocalInputs::<TestConfig>(inputs));
 }
 
@@ -150,7 +155,7 @@ fn rounds_kill_and_the_dead_come_back() {
     // Pawns face north by default and the victim is due north, so the trigger
     // is the whole input: no walking, so the range stays the 300 units between
     // the two spawns.
-    drive(&mut app, SHOOTER, PlayerInput { move_x: 0, move_y: 0, buttons: BTN_FIRE });
+    drive(&mut app, SHOOTER, PlayerInput { move_x: 0, move_y: 0, buttons: BTN_FIRE, ..default() });
 
     // ~300 units of flight is about 18 ticks, and rounds leave every
     // FIRE_COOLDOWN, so the first one lands well inside this.
@@ -218,9 +223,9 @@ fn dummies_still_take_rounds() {
     let mut app = arena();
     // Handle 0 spawns at (-150, 0) with the dummy at (-300, 0) behind it, and
     // the lane between them is kept clear by the layout.
-    drive(&mut app, 0, PlayerInput { move_x: -127, move_y: 0, buttons: 0 });
+    drive(&mut app, 0, PlayerInput { move_x: -127, move_y: 0, buttons: 0, ..default() });
     run(&mut app, 2);
-    drive(&mut app, 0, PlayerInput { move_x: 0, move_y: 0, buttons: BTN_FIRE });
+    drive(&mut app, 0, PlayerInput { move_x: 0, move_y: 0, buttons: BTN_FIRE, ..default() });
     run(&mut app, 40);
 
     let hits: u32 = app
@@ -263,7 +268,7 @@ fn bot_pawns_are_simulated_without_a_session_seat() {
 
     // A human walks around and shoots while the bots are present, so the tick
     // does real work rather than just not crashing.
-    let mut input = PlayerInput { move_x: 90, move_y: 40, buttons: 0 };
+    let mut input = PlayerInput { move_x: 90, move_y: 40, buttons: 0, ..default() };
     input.buttons |= BTN_FIRE;
     drive(&mut app, SHOOTER, input);
     run(&mut app, 180);
@@ -305,7 +310,7 @@ fn bot_pawns_are_simulated_without_a_session_seat() {
 fn bots_decide_identically_in_identical_worlds() {
     fn play() -> Vec<(usize, Pos, i32, u32)> {
         let mut app = arena_with_bots(4);
-        drive(&mut app, SHOOTER, PlayerInput { move_x: 0, move_y: 0, buttons: BTN_FIRE });
+        drive(&mut app, SHOOTER, PlayerInput { move_x: 0, move_y: 0, buttons: BTN_FIRE, ..default() });
         run(&mut app, 400);
         let mut out: Vec<(usize, Pos, i32, u32)> = app
             .world_mut()
@@ -402,7 +407,7 @@ fn pawns_do_not_stand_inside_each_other() {
     let mut app = arena();
     // Straight up the clear north-south lane, into the pawn parked at the far
     // end. No trigger: this is about bodies, not bullets.
-    drive(&mut app, SHOOTER, PlayerInput { move_x: 0, move_y: 127, buttons: 0 });
+    drive(&mut app, SHOOTER, PlayerInput { move_x: 0, move_y: 127, buttons: 0, ..default() });
 
     let mut closest = i64::MAX;
     for _ in 0..600 {
@@ -501,5 +506,66 @@ fn bots_never_lock_together_firing_and_unable_to_connect() {
     assert!(
         closest > (PLAYER_R + BULLET_R + 2 - (PLAYER_R + BULLET_R)) as i64,
         "pawns closed to {closest} units, inside the range where a shot is born past its target"
+    );
+}
+
+/// The menu's aggression dial reaches bots that are already standing there.
+///
+/// It has to be applied every tick rather than at spawn, or turning the dial
+/// would do nothing until the bots were removed and re-added — which is not
+/// what a dial in a menu means. Every tick is only safe because the input
+/// carries an ABSOLUTE level: writing the same value onto the same bot twice is
+/// writing it once, so a replayed tick lands on the identical world. This runs
+/// under `with_check_distance(2)`, so if that reasoning were wrong it would
+/// fail here as a checksum mismatch rather than as a desync in a match.
+#[test]
+fn the_aggression_dial_reaches_bots_already_in_the_match() {
+    let mut app = arena_with_bots(4);
+
+    let aggression = |app: &mut App| -> Vec<i32> {
+        let mut values: Vec<(usize, i32)> = app
+            .world_mut()
+            .query::<(&Player, &Bot)>()
+            .iter(app.world())
+            .map(|(player, bot)| (player.handle, bot.profile.aggression))
+            .collect();
+        values.sort_unstable();
+        values.into_iter().map(|(_, a)| a).collect()
+    };
+
+    // They spawned on the shipping profile, and nobody has touched the dial.
+    let before = aggression(&mut app);
+    assert_eq!(before.len(), 4);
+    assert!(
+        before.iter().all(|&a| a == BotProfile::default().aggression),
+        "bots didn't start on the default profile: {before:?}"
+    );
+
+    // Turn it to the bottom of its range on bots that already exist.
+    app.world_mut().resource_mut::<Script>().aggro = 1;
+    run(&mut app, 2);
+    assert!(
+        aggression(&mut app).iter().all(|&a| a == 0),
+        "the dial didn't reach bots already in the match: {:?}",
+        aggression(&mut app)
+    );
+
+    // And back up again — a dial, not a one-way switch.
+    app.world_mut().resource_mut::<Script>().aggro = AGGRO_LEVELS;
+    run(&mut app, 2);
+    assert!(
+        aggression(&mut app).iter().all(|&a| a == FP),
+        "the dial only moved one way: {:?}",
+        aggression(&mut app)
+    );
+
+    // Releasing it leaves them where they were rather than snapping back to a
+    // default — "not asking" has to mean not asking, which is what lets the
+    // self-play harness drive handle 0's input without flattening its rosters.
+    app.world_mut().resource_mut::<Script>().aggro = 0;
+    run(&mut app, 4);
+    assert!(
+        aggression(&mut app).iter().all(|&a| a == FP),
+        "an unset dial overwrote the profiles it was supposed to leave alone"
     );
 }

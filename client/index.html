@@ -148,6 +148,8 @@
     //   ?signaling=URL  override the signaling server (testing)
     //   ?bots=N         start with N bots (the MENU has -/+ for it too, and
     //                   both feed the same dial)
+    //   ?aggro=PCT      how hard the bots push, 0-100 (MENU has -/+ too).
+    //                   Snapped to the nearest of the dial's 11 positions.
     //   ?ice=none       host-candidates-only (fast local/LAN testing; some
     //                   networks stall browser STUN for ~40s per handshake);
     //                   or ?ice=stun:host:port,... for custom servers
@@ -159,6 +161,7 @@
       const room = p.get('room') || '';
       const players = p.get('players') || '';
       const bots = p.get('bots') || '';
+      const aggro = p.get('aggro') || '';
       const ice = p.get('ice') || '';
       // Dev measuring rig, offline only (net.rs ignores it with a room set):
       // ?scenario=strip[:depth[:east stance]] — see sim's `Scenario`.
@@ -179,7 +182,7 @@
          : isTailnet ? 'wss://' + location.hostname + ':9451'
          : isCaddy ? 'wss://' + location.host + '/ws'
                    : 'wss://army-ghosts.dev.whoeverwants.com:7443/ws');
-      window.__AG_NET__ = { room, players, bots, signaling, ice, scenario };
+      window.__AG_NET__ = { room, players, bots, aggro, signaling, ice, scenario };
       if (room) {
         document.getElementById('room').textContent =
           'multiplayer · room ' + room + (players ? ' · ' + players + ' players' : '');

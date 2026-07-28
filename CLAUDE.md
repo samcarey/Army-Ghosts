@@ -52,8 +52,9 @@ python3 -m http.server -d _site 8080
 (the web build is `--no-default-features --features default,web`).
 
 URL params (parsed by index.html into `window.__AG_NET__` pre-WASM):
-`?room=CODE&players=N&signaling=wss://…`. No `room` ⇒ local synctest mode.
-Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_SIGNALING` env vars.
+`?room=CODE&players=N&bots=N&aggro=PCT&signaling=wss://…`. No `room` ⇒ local
+synctest mode. Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_BOTS`,
+`AG_AGGRO`, `AG_SIGNALING` env vars.
 
 ## Architecture
 
@@ -91,8 +92,11 @@ Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_SIGNALING` env vars.
 
 ### Netcode model
 
-- **bevy_ggrs rollback**: peers exchange only `PlayerInput` (3 bytes:
-  quantized i8 move x/y + button bitflags), each peer simulates everything.
+- **bevy_ggrs rollback**: peers exchange only `PlayerInput` (4 bytes:
+  quantized i8 move x/y, a `buttons` bitflag byte, and a `dials` byte for match
+  settings), each peer simulates everything. Everything in both flag bytes is an
+  ABSOLUTE value re-sent every tick, never an edge — see the stance and bot
+  notes below for why rollback makes that the only workable choice.
 - **Lobby (open rooms)**: matchbox room string from `?room=`; socket URL is
   plain `{signaling}/{room}` (no `?next=` — everyone in the room meshes as
   they join). Two channels in builder order: 0 reliable (lobby control),
@@ -303,6 +307,30 @@ Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_SIGNALING` env vars.
     `__AG_NET__` — it was missed once and the param silently did nothing).
   * The HUD roster walks PAWNS, not session handles, or bots are absent from the
     scoreboard while busy killing people.
+  **How aggressive they are rides the same way** (`DIAL_AGGRO_MASK`, bits 0-3 of
+  a SECOND input byte, applied by `apply_bot_dials`), and the menu's `− AGGRO n%
+  +` row is the other half of it. Three things about it are load-bearing:
+  * **`buttons` was full** — fire, sights, two bits of stance, four of bot count
+    — so `PlayerInput` grew a `dials` byte and is 4 bytes on the wire, not 3.
+    There are four spare bits in it for the next setting.
+  * **It is applied EVERY TICK to bots that already exist**, not at spawn, or
+    turning the dial would do nothing until you removed and re-added them, which
+    is not what a dial in a menu means. That is only safe because the value is
+    ABSOLUTE: writing the same level onto the same bot twice is writing it once,
+    so a replayed tick lands on the identical world. `combat.rs`
+    `the_aggression_dial_reaches_bots_already_in_the_match` runs it at
+    `check_distance(2)`, so if that were wrong it fails as a checksum mismatch.
+  * **Level 0 means "not asking"**, and that sentinel is what let this be added
+    to the input at all: the self-play harness drives handle 0's input to set the
+    bot count, and without it every run would have flattened both sides'
+    aggression to one value and silently invalidated the measurement. The dial's
+    lowest *position* is 1, which is aggression 0.0.
+  `?aggro=PCT` / `AG_AGGRO=PCT` seeds it, same as `?bots=`. UI-side, the two
+  rows are one widget (`menu.rs` `Dial` + `dial_row`) rather than two that have
+  to be kept looking alike — a third setting is one line in `Dial::ALL`.
+  Aggression is the dial that got a button because it is the one the harness
+  says is worth turning (0.9 loses every decisive pair, 0.1 is about +432 elo);
+  the other four stay in `tools/selfplay.sh` where a number is measurable.
   Tuning lives in `BotProfile` (skill / accuracy / reaction / aggression /
   caution) — one struct precisely so the self-play harness can vary it, which is
   `BotRoster`'s whole reason to exist: a per-handle profile table plus an RNG

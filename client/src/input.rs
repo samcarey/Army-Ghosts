@@ -15,6 +15,9 @@ use crate::stance::StanceControl;
 use crate::touch::TouchControls;
 use crate::SessionConfig;
 
+// A bevy system takes one parameter per thing it reads; nine is what this one
+// legitimately reads.
+#[allow(clippy::too_many_arguments)]
 pub fn read_local_inputs(
     mut commands: Commands,
     keys: Res<ButtonInput<KeyCode>>,
@@ -24,6 +27,7 @@ pub fn read_local_inputs(
     local_players: Res<LocalPlayers>,
     scenario: Res<Scenario>,
     bots: Res<crate::menu::BotCount>,
+    aggro: Res<crate::menu::Aggression>,
 ) {
     let mut local_inputs = HashMap::new();
     // Inputs drive the *first* local handle; any additional local handles
@@ -37,6 +41,11 @@ pub fn read_local_inputs(
         // world however many times rollback runs it.
         if *handle == 0 {
             input.set_bots(bots.0 as u8);
+            // Same channel, same reasoning: an absolute level every tick, so a
+            // replayed frame dials the bots to the same place. Unlike the bot
+            // count this one is applied to bots that already exist, which is
+            // what makes turning it mid-match do anything.
+            input.set_aggression(aggro.0);
         }
         if first {
             // Keyboard (desktop) …

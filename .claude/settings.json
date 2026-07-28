@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo check *)",
+      "Bash(cargo build *)",
+      "Bash(cargo test *)",
+      "Bash(cargo clippy *)",
+      "Bash(cargo tree *)",
+      "Bash(tools/build-web.sh)",
+      "Bash(tools/build-web.sh *)",
+      "Bash(tools/grass-table.sh)",
+      "Bash(tools/grass-table.sh *)",
+      "Bash(git fetch *)"
+    ]
+  }
+}

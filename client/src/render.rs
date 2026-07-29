@@ -645,7 +645,7 @@ pub fn camera_follow(
     local_players: Option<Res<LocalPlayers>>,
     spectating: Res<crate::spectate::Spectating>,
     players: Query<(&Player, &Pos)>,
-    mut cameras: Query<(&mut Transform, &Projection), (With<Camera2d>, Without<Player>)>,
+    mut cameras: Query<&mut Transform, (With<Camera2d>, Without<Player>)>,
     mut focus: ResMut<CameraFocus>,
     ads: Res<Ads>,
     time: Res<Time>,
@@ -665,33 +665,21 @@ pub fn camera_follow(
     let Some((_, pos)) = players.iter().find(|(p, _)| p.handle == watched) else {
         return;
     };
-    let Ok((mut camera, projection)) = cameras.single_mut() else { return };
+    let Ok(mut camera) = cameras.single_mut() else { return };
     let (x, y) = pos.to_f32();
     let t = (time.delta_secs() * 5.0).min(1.0);
     focus.0 = focus.0.lerp(Vec2::new(x, y), t);
-    let aim = clamp_to_arena(focus.0 + ads.camera_offset(), projection);
+    let aim = focus.0 + ads.camera_offset();
     camera.translation.x = aim.x;
     camera.translation.y = aim.y;
 }
 
-/// Keep the view on the map.
-///
-/// This became necessary when the two sides moved to opposite ENDS of the arena:
-/// the muster posts sit 70 units from the wall and 105 from the corner, so a
-/// pawn standing on one used to put roughly a third of the screen outside the
-/// world — black on three sides, with the fight happening in the corner you were
-/// not looking at. The old scattered spawns were all 150 units from the middle
-/// and never came close to an edge, which is why nothing needed this before.
-///
-/// Along an axis where the arena is SMALLER than the view there is nothing to
-/// clamp to and the whole map is on screen anyway, so it centres instead —
-/// otherwise the two bounds cross and the camera snaps to a corner.
-fn clamp_to_arena(aim: Vec2, projection: &Projection) -> Vec2 {
-    let Projection::Orthographic(ortho) = projection else { return aim };
-    let half = ortho.area.size() / 2.0;
-    let arena = Vec2::new(ARENA_HALF_W as f32, ARENA_HALF_H as f32);
-    Vec2::new(
-        if half.x >= arena.x { 0.0 } else { aim.x.clamp(-(arena.x - half.x), arena.x - half.x) },
-        if half.y >= arena.y { 0.0 } else { aim.y.clamp(-(arena.y - half.y), arena.y - half.y) },
-    )
-}
+// NOTE: **do not clamp this camera to the arena.** It was, briefly, on the
+// reasoning that a pawn standing on a muster post puts a third of the screen
+// outside the world and that looks like a bug. Clamping looks far worse and was
+// reported immediately: on any view wider than the arena the bound pins the axis
+// outright, so the camera stops following you at all, and on a view slightly
+// narrower it follows you *partly*, which reads as the camera being broken
+// rather than as a deliberate edge. A camera locked to the player is the thing
+// players actually notice; black beyond the wall is not.
+

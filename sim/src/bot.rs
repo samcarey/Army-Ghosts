@@ -55,7 +55,7 @@
 use bevy::prelude::*;
 
 use crate::{
-    isqrt, segment_hits_circle, spawn_post, visible_fraction, Health, Intent, Occluder, Player,
+    isqrt, spawn_post, visible_fraction, Health, Intent, Occluder, Player,
     PlayerInput, Pos, Scenario, Stance, Team, BTN_FIRE, BULLET_R, FP, MAX_PLAYERS,
     PLAYER_R, STANCE_CROUCH, STANCE_PRONE, STANCE_STAND, TEAM_SIZE,
 };
@@ -817,16 +817,46 @@ fn engage(
 /// Is one of your own standing in the way?
 ///
 /// Tested against the JITTERED aim point rather than the target, because that is
-/// the line the round will actually take. Only friends between the muzzle and
-/// the aim point count — someone standing well behind the target is not in
-/// danger, and a bot that thought otherwise would refuse to fire across half the
-/// field whenever a teammate happened to be beyond it.
+/// the line the round will actually take, and only over the stretch the round
+/// actually covers: from where it leaves the barrel to where it is going.
+///
+/// **The two ends of that stretch are both load-bearing, and getting them from a
+/// clamped point-segment distance does not work.** `segment_hits_circle` folds
+/// everything before the start of the segment onto the start point, so a
+/// teammate standing BEHIND the shooter reads as being on the line at range
+/// zero. Since `separate_players` holds pawns exactly `2 * PLAYER_R` (24) apart
+/// and the block radius is 26, that made *any* two adjacent teammates jam each
+/// other's triggers permanently, whichever way either of them was facing.
+/// Measured: three bots stood in a huddle 32 units from a live enemy, all three
+/// rooted and aiming, not one of them firing, for the rest of the round. It is
+/// the same shape as the two-bots-on-one-subunit deadlock `separate_players`
+/// exists for, and it reads the same way from outside — "then nothing happens".
+///
+/// So the test is an explicit projection along the shot with both ends open:
+/// * nearer than the MUZZLE and you are not in front of the barrel at all — the
+///   round is born `PLAYER_R + BULLET_R + 2` units out and is already past you;
+/// * beyond the aim point and you are behind the target, which is not danger.
 fn blocked_by_a_friend(pos: Pos, aim: Pos, friends: &[Pos]) -> bool {
-    let reach = PLAYER_R + BULLET_R + FRIENDLY_CLEARANCE;
-    let range = dist2(pos, aim);
-    friends
-        .iter()
-        .any(|&friend| dist2(pos, friend) < range && segment_hits_circle(pos, aim, friend, reach))
+    let reach = radius_fp(PLAYER_R + BULLET_R + FRIENDLY_CLEARANCE);
+    let muzzle = radius_fp(PLAYER_R + BULLET_R + 2);
+    let (dx, dy) = ((aim.x - pos.x) as i64, (aim.y - pos.y) as i64);
+    let len = isqrt(dx * dx + dy * dy);
+    if len == 0 {
+        return false;
+    }
+    friends.iter().any(|&friend| {
+        let (fx, fy) = ((friend.x - pos.x) as i64, (friend.y - pos.y) as i64);
+        // How far down the shot they stand, and how far off it.
+        let along = (fx * dx + fy * dy) / len;
+        let across = (fx * dy - fy * dx).abs() / len;
+        along > muzzle && along < len && across <= reach
+    })
+}
+
+/// `r` world units as subunits — the same conversion `radius_fp` does in the
+/// sim, repeated here so this file does not need it exported.
+fn radius_fp(units: i32) -> i64 {
+    units as i64 * FP as i64
 }
 
 // ── Small geometry helpers ──────────────────────────────────────────────────
@@ -933,6 +963,66 @@ mod tests {
             draws.iter().filter(|(x, y)| x == y).count() < 4,
             "two bots drew the same jitter too often: {draws:?}"
         );
+    }
+
+    /// **Which friends block a shot, and — the part that bit — which do not.**
+    ///
+    /// A clamped point-to-segment distance answers this wrongly at both ends,
+    /// and the near end is the one that matters: it folds everything behind the
+    /// shooter onto the muzzle, so a teammate standing at your shoulder reads as
+    /// standing in your line. `separate_players` holds pawns 24 units apart and
+    /// the block radius is 26, so that made every adjacent pair of teammates jam
+    /// each other permanently — three bots huddled near an enemy, all aiming,
+    /// none firing, for the rest of the round.
+    #[test]
+    fn only_a_friend_actually_in_the_lane_blocks_the_shot() {
+        let me = Pos::from_units(0, 0);
+        let target = Pos::from_units(200, 0);
+        let at = |x: i32, y: i32| vec![Pos::from_units(x, y)];
+
+        assert!(
+            blocked_by_a_friend(me, target, &at(100, 0)),
+            "a teammate squarely in the lane must block"
+        );
+        assert!(
+            blocked_by_a_friend(me, target, &at(100, PLAYER_R + BULLET_R)),
+            "a teammate a body's width off the lane is still in danger"
+        );
+        assert!(
+            !blocked_by_a_friend(me, target, &at(100, 60)),
+            "a teammate well clear of the lane must not block"
+        );
+        // The regression, in both directions along the line.
+        assert!(
+            !blocked_by_a_friend(me, target, &at(-24, 0)),
+            "a teammate BEHIND the shooter blocked the shot — this is the deadlock"
+        );
+        assert!(
+            !blocked_by_a_friend(me, target, &at(-24, 8)),
+            "a teammate behind and to one side blocked the shot"
+        );
+        assert!(
+            !blocked_by_a_friend(me, target, &at(260, 0)),
+            "a teammate beyond the target is not in the round's way"
+        );
+        // Right against the muzzle: the round is born 16 units out, so a friend
+        // inside that is already behind it.
+        assert!(
+            !blocked_by_a_friend(me, target, &at(10, 0)),
+            "a teammate inside the muzzle offset blocked a round born past them"
+        );
+        assert!(!blocked_by_a_friend(me, target, &[]), "nobody about, nothing to block");
+    }
+
+    /// Two pawns at the minimum separation `separate_players` allows, facing
+    /// opposite ways. Neither is in the other's lane, and this is the exact
+    /// configuration the old test got wrong.
+    #[test]
+    fn touching_teammates_do_not_jam_each_other() {
+        let a = Pos::from_units(0, 0);
+        let b = Pos::from_units(2 * PLAYER_R, 0);
+        assert!(!blocked_by_a_friend(a, Pos::from_units(-200, 0), &[b]));
+        assert!(!blocked_by_a_friend(b, Pos::from_units(200, 0), &[a]));
     }
 
     /// The same handle always starts from the same seed — a bot is deterministic

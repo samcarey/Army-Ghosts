@@ -936,3 +936,82 @@ fn bots_close_the_distance_at_the_start_of_a_round() {
          they are waiting for a contact that will never come to them"
     );
 }
+
+/// **The game must not stop happening.**
+///
+/// This is the test for the bug reported from the demo as "a bunch of bots run
+/// off at the beginning and disappear, then nothing happens". It watches a whole
+/// match from the seat that found it — a player who stands on their post and
+/// does nothing — and asserts that the world keeps moving around them.
+///
+/// It is deliberately about MOTION rather than about kills. Every stall this has
+/// caught looked identical from outside: pawns alive, round clock running, and
+/// every position byte-identical for tens of seconds. The causes were varied (a
+/// hurt bot lying down blind, a bot standing on a stale contact, three bots
+/// jamming each other's shot lines) and each of them was invisible to the
+/// kills-and-rounds tests, which happily reported a decided match. What they
+/// share is that nothing moved, and that is a thing a test can see.
+#[test]
+fn a_match_never_stops_moving_around_an_idle_player() {
+    const SAMPLE: usize = 120; // two seconds
+    const SAMPLES: usize = 45; // …of a minute and a half
+    /// Consecutive samples with every pawn on exactly the same subunit. Contact
+    /// legitimately pauses — a rooted firefight is pawns holding still on
+    /// purpose — so this is generous, and still nowhere near the 30-plus seconds
+    /// the reported stalls ran for.
+    const STUCK_LIMIT: usize = 5;
+
+    let mut app = arena_with(1, MAX_PLAYERS - 1);
+    // The player does nothing at all, which is the whole point: the bug hid
+    // behind every test that had someone driving.
+    drive(&mut app, 0, PlayerInput::default());
+
+    let snapshot = |app: &mut App| -> Vec<(usize, Pos, bool)> {
+        let mut rows: Vec<(usize, Pos, bool)> = app
+            .world_mut()
+            .query::<(&Player, &Pos, &Health)>()
+            .iter(app.world())
+            .map(|(player, pos, health)| (player.handle, *pos, health.alive()))
+            .collect();
+        rows.sort_unstable_by_key(|&(handle, ..)| handle);
+        rows
+    };
+
+    let (mut frozen, mut worst, mut worst_at) = (0usize, 0usize, 0usize);
+    let mut rounds_seen = 0;
+    let mut last = snapshot(&mut app);
+    for sample in 0..SAMPLES {
+        run(&mut app, SAMPLE);
+        rounds_seen = rounds_seen.max(round(&app).number);
+        let now = snapshot(&mut app);
+        // Only living pawns: a field of corpses is meant to hold still.
+        let moved = now
+            .iter()
+            .zip(last.iter())
+            .any(|(a, b)| a.2 && (a.1 != b.1 || a.2 != b.2));
+        frozen = if moved { 0 } else { frozen + 1 };
+        if frozen > worst {
+            worst = frozen;
+            worst_at = (sample + 1) * SAMPLE;
+        }
+        last = now;
+    }
+
+    println!(
+        "{} rounds in {} ticks; longest frozen stretch {} samples ({:.1}s), ending at tick {worst_at}",
+        rounds_seen,
+        SAMPLES * SAMPLE,
+        worst,
+        (worst * SAMPLE) as f32 / TICK_HZ as f32
+    );
+    assert!(
+        worst <= STUCK_LIMIT,
+        "the whole match stood still for {} samples ({:.1}s) ending at tick {worst_at} — \
+         nothing moved, which is what 'then nothing happens' looks like from the inside",
+        worst,
+        (worst * SAMPLE) as f32 / TICK_HZ as f32
+    );
+    // And it was a real match, not a quiet one: the clock alone would give 2
+    // rounds in this window, so anything less means rounds are not resolving.
+    assert!(rounds_seen >= 2, "only {rounds_seen} round(s) in 90 seconds");
+}

@@ -331,9 +331,18 @@ synctest mode. Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_BOTS`,
     be aimed at, led, hunted or broken away from. Everything downstream reads
     the buffer, so there is no second place to get it wrong.
   * **A bot holds fire when a teammate is on the shot line**
-    (`blocked_by_a_friend`, against the JITTERED aim point, and only for friends
-    NEARER than the target). Friendly fire is on and now costs a round rather
-    than a walk, so this is arithmetic rather than politeness.
+    (`blocked_by_a_friend`, against the JITTERED aim point). Friendly fire is on
+    and now costs a round rather than a walk, so this is arithmetic rather than
+    politeness — but the GEOMETRY has to be an explicit projection along the
+    shot, open at both ends, and a clamped point-to-segment distance is NOT that.
+    `segment_hits_circle` folds everything behind the shooter onto the muzzle, so
+    a teammate at your shoulder read as standing in your line; since
+    `separate_players` holds pawns 24 units apart and the block radius is 26,
+    every adjacent pair of teammates jammed each other's trigger permanently,
+    whichever way either was facing. That is a DEADLOCK, not a missed shot: three
+    bots huddled 32 units from a live enemy, all rooted and aiming, none firing,
+    for the rest of the round. `only_a_friend_actually_in_the_lane_blocks_the_shot`
+    and `touching_teammates_do_not_jam_each_other` pin both ends.
   * **`Act::Hunt` has an OBJECTIVE**, because a round opens with 660 units of
     grass between the two sides and nobody has a last known position to walk to.
     Without one the whole field crouches where it stands and every round is a
@@ -1047,6 +1056,18 @@ need a TURN server eventually.
   rounds were DRAWN, which is the tell for the failure mode this scoring has and
   the old one didn't: two cautious profiles can spend the whole clock not finding
   each other, and a run full of drawn rounds measured almost nothing.
+- **`a_match_never_stops_moving_around_an_idle_player`** (`sim/tests/combat.rs`)
+  — the test for "then nothing happens", which is how the worst class of bug in
+  this game gets reported. It watches 90 seconds from the seat that finds them:
+  a player who stands on their post and does nothing, which is exactly the case
+  every other test hides, because every other test has someone driving.
+  It asserts MOTION, not kills, and that is the point. Three separate stalls have
+  now been found here — a hurt bot lying down blind, a bot standing on a stale
+  contact, and teammates jamming each other's shot lines — with unrelated causes
+  and one identical signature: pawns alive, clock running, every position
+  byte-identical for tens of seconds. The kills-and-rounds tests passed through
+  all three, happily reporting a decided match. Without the friendly-fire fix it
+  reports **50 seconds frozen and 3 rounds**; with it, 6 seconds and 7 rounds.
 - Native smoke: run without a room (synctest re-simulates every frame — it
   catches nondeterminism AND rollback-unsafe state immediately).
 - Web smoke: `tools/build-web.sh` + local http.server + headless chromium

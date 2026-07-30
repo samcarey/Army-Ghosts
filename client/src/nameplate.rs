@@ -9,13 +9,23 @@
 //! `client/src/vision.rs` and `client/src/spectate.rs` do: it reads the
 //! rolled-back world and writes only pixels.
 //!
-//! # Why the names are green rather than the team tint
+//! # This is the ONLY thing that tells friend from foe
 //!
-//! `render::TEAM_COLORS` says which side a figure is on; a nameplate says
-//! *friend*, which is a different message and only ever appears for friends. On
-//! the TAN side a tan name over a tan soldier would be the one case where the
-//! label is least readable and most needed, so the colour here is fixed and
-//! bright rather than borrowed from the team.
+//! Both sides wear `render::ARMY_GREEN` — one bag of green army men — so the
+//! tint says nothing about who anyone is fighting for and a plate is the whole
+//! signal. An unnamed figure is an enemy. That is why this module is worth more
+//! than it looks: it is not a convenience layered over a colour code, it IS the
+//! code, and anything that stops a plate appearing over a living teammate makes
+//! them shootable by their own side rather than merely anonymous.
+//!
+//! It also has to be that way round. Which pawns are yours is a fact about who
+//! is holding this phone, and the sim has no point of view — so the reading that
+//! depends on the viewer is exactly the one that cannot be painted onto the
+//! sprite, and the sprite is left saying the one thing every peer agrees on.
+//!
+//! The label's own colour is fixed and bright rather than borrowed from
+//! anywhere: it has to carry over the dark olive sward, the pale dry earth of a
+//! bare tile, and a green soldier directly underneath it.
 //!
 //! # Concealment does not hide a nameplate
 //!
@@ -52,10 +62,15 @@ pub struct NameplateArrow;
 #[derive(Component)]
 pub struct NameplateLabel;
 
-/// What an edge plate has to keep out of the way of: every button, plus the three
-/// HUD readouts that aren't buttons (the round line, the health bar, the roster).
-/// Written as one query type because it is one idea — "the parts of the screen
-/// that already belong to something".
+/// What an edge plate has to keep out of the way of: every button, plus the HUD
+/// readouts that aren't buttons — the round line, the health bar, the troop count
+/// and the between-rounds banner. Written as one query type because it is one
+/// idea: "the parts of the screen that already belong to something".
+///
+/// The banner enters as its PILL rather than as `RoundBanner`, whose node is the
+/// whole window (it is what centres the pill) and would push every plate clean
+/// off the screen. Both are invisible outside an intermission, and `hud_boxes`
+/// filters on visibility, so neither costs anything while a round is live.
 type HudBox = (
     &'static ComputedNode,
     &'static UiGlobalTransform,
@@ -67,6 +82,7 @@ type HudBoxFilter = Or<(
     With<crate::hud::RoundText>,
     With<crate::hud::HealthBar>,
     With<crate::hud::PlayerListText>,
+    With<crate::hud::BannerPill>,
 )>;
 
 /// Friendly green. Bright and slightly desaturated so it reads over both the
@@ -301,10 +317,11 @@ fn set(slot: &mut Val, value: Val) {
 /// Every piece of HUD currently on screen, as logical-px rectangles.
 ///
 /// ASK THE UI where its boxes are rather than keeping a second copy of the
-/// layout — same reason `touch.rs` asks the buttons where they are. The roster
-/// grows a line per pawn, the START button comes and goes with the lobby, the
-/// spectate button only exists while you are out: any number written down here
-/// would be wrong for some match, and thin margins make being wrong visible.
+/// layout — same reason `touch.rs` asks the buttons where they are. The banner
+/// grows a line per pawn and is only up between rounds, the START button comes
+/// and goes with the lobby, the spectate button only exists while you are out:
+/// any number written down here would be wrong for some match, and thin margins
+/// make being wrong visible.
 ///
 /// `ComputedNode` works in PHYSICAL pixels and everything else here is logical,
 /// which is the one conversion that has to happen (and the one `touch.rs` got
@@ -328,16 +345,16 @@ fn hud_boxes(windows: &Query<&Window>, hud: &Query<HudBox, HudBoxFilter>) -> Vec
 ///
 /// Only ever applied to a plate that was CLAMPED to an edge: that one has no
 /// natural home, so anywhere legible will do. A plate sitting over a pawn's head
-/// is left where it is even if the roster is behind it — a name that jumped a
-/// third of the way down the screen to get out of the way would no longer be
-/// telling you which soldier it belongs to, which is the whole job.
+/// is left where it is even if the HUD is behind it — a name that jumped a third
+/// of the way down the screen to get out of the way would no longer be telling
+/// you which soldier it belongs to, which is the whole job.
 ///
 /// It steps AWAY from the edge it was pinned to: a plate at the top goes down past
-/// the round line, the health bar and the roster, one at the bottom goes up over
-/// the sights button. Either way it ends up between the HUD and the middle of the
-/// screen rather than on top of anything, which is what lets the margin be six
-/// pixels instead of a guess at how much HUD might be in the way. The arrow is
-/// recomputed from where the plate ended up, so it still points at the pawn.
+/// the round line, the health bar and the troop count, one at the bottom goes up
+/// over the sights button. Either way it ends up between the HUD and the middle of
+/// the screen rather than on top of anything, which is what lets [`EDGE_MARGIN`]
+/// be two pixels instead of a guess at how much HUD might be in the way. The arrow
+/// is recomputed from where the plate ended up, so it still points at the pawn.
 fn dodge(mut placed: Placement, target: Vec2, boxes: &[Rect]) -> Placement {
     if placed.arrow.is_none() {
         return placed;

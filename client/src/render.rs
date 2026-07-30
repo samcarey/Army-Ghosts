@@ -218,37 +218,47 @@ pub struct TrailSegment {
     ttl: f32,
 }
 
-/// Team tints, multiplied over the grayscale sheet: the classic army-men GREEN
-/// and TAN, which is the whole reason this game looks the way it does.
+/// The tint every soldier wears, multiplied over the grayscale sheet: one bag of
+/// green army men, which is the whole reason this game looks the way it does.
 ///
-/// Colour is now what tells friend from foe, which makes it a gameplay reading
-/// rather than decoration and changes what it has to satisfy. Two constraints,
-/// and they pull against each other:
-/// * **Both must sit well ABOVE the ground tile in value.** The grass is a dark
-///   olive (62,74,42) and a soldier tinted down into that range vanishes into
-///   it. That was true when these were per-player uniforms and it is worse now —
-///   the green side is the one at risk, so its green is a pale sage rather than
-///   anything field-coloured.
-/// * **They must differ in HUE AND VALUE, not hue alone.** Under the fog these
-///   are drawn at reduced alpha over a green field, and two colours separated
-///   only by hue converge as they fade. Tan is the brighter of the two by a
-///   clear margin, so a half-faded figure is still identifiable.
-const TEAM_COLORS: [Color; TEAM_COUNT] = [
-    Color::srgb(0.60, 0.78, 0.52), // green — pale sage, deliberately not field green
-    Color::srgb(0.88, 0.79, 0.58), // tan
-];
+/// Pale sage rather than anything field-coloured, and that is the one hard
+/// constraint on it: the grass is a dark olive (62,74,42) and a soldier tinted
+/// down into that range vanishes into it, which is the difference between
+/// concealment the terrain grants you and a figure nobody can see anywhere.
+///
+/// **BOTH SIDES ARE THIS COLOUR, and it is the same constant twice rather than
+/// two entries that happen to match**, so nobody drifts them apart by editing
+/// one. Colour used to be the friend-from-foe reading and it deliberately isn't
+/// any more — [`crate::nameplate`] is, and it says something colour cannot: an
+/// unnamed figure is an enemy *from where you are standing*, which is a fact
+/// about the viewer and so cannot live in a sim every peer runs identically.
+/// The knock-on is that identifying someone is now a thing you do rather than a
+/// thing the palette does for you, which is the point.
+const ARMY_GREEN: Color = Color::srgb(0.60, 0.78, 0.52);
+const TEAM_COLORS: [Color; TEAM_COUNT] = [ARMY_GREEN, ARMY_GREEN];
 
 /// Human-facing names for the two sides. Used by the menu's team dial, the round
 /// banner and the roster, so all three agree.
-pub const TEAM_NAMES: [&str; TEAM_COUNT] = ["GREEN", "TAN"];
+///
+/// Phonetic rather than coloured, because the sides no longer differ in colour
+/// and a scoreboard reading `GREEN 2 - 1 TAN` over two green armies would be
+/// naming something you cannot see.
+pub const TEAM_NAMES: [&str; TEAM_COUNT] = ["ALPHA", "BRAVO"];
 
 /// How far a pawn's tint is nudged per slot within its side, so four figures in
-/// the same colours are still four figures. Small on purpose: this must never
-/// grow far enough to make one side's darkest read as the other side's
-/// lightest.
+/// one view are still four figures. Small on purpose, and now for a second
+/// reason: it must never grow far enough to read as a side marker. It is keyed
+/// on the slot WITHIN a side, so slot 2 of one side and slot 2 of the other wear
+/// exactly the same shade — the nudge separates neighbours and says nothing
+/// whatever about who they are fighting for, which is the whole arrangement
+/// [`ARMY_GREEN`] describes.
+///
+/// Four steps is also the ceiling on how dark this may go. The bottom of the
+/// range is what [`ARMY_GREEN`]'s note is about: keep stepping and the last man
+/// on the line is field-coloured.
 const TEAM_SHADE_STEP: f32 = 0.05;
 
-/// The tint a pawn wears: its side's colour, shaded a little by its handle.
+/// The tint a pawn wears: army green, shaded a little by its place on the line.
 pub fn team_color(team: Team, handle: usize) -> Color {
     let base = TEAM_COLORS[team.index()];
     // Handles alternate between the sides, so `handle / TEAM_COUNT` is the

@@ -91,6 +91,7 @@ fn main() {
     .init_resource::<stance::StanceControl>()
     .init_resource::<render::CameraFocus>()
     .init_resource::<net::Lobby>()
+    .init_resource::<hud::BoardFlash>()
     .init_state::<AppState>()
     .add_systems(
         Startup,
@@ -125,7 +126,9 @@ fn main() {
                 hud::update_copy_button,
                 hud::update_health_bar,
                 hud::update_round_text,
-                hud::update_round_banner,
+                // The watcher owns the flash timer the banner reads, so it
+                // goes first: a roster change shows the board the same frame.
+                (hud::watch_roster, hud::update_round_banner).chain(),
             ),
             (hud::copy_link_pressed, hud::tick_copied_flash).chain(),
             menu::menu_interactions,

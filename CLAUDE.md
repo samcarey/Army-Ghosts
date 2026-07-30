@@ -261,6 +261,66 @@ synctest mode. Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_BOTS`,
     arrives.
   * `run_round` returns immediately on any scenario but `Arena`, which is what
     keeps the grass rig's two carefully placed pawns where they were put.
+- **What the HUD says while a round is live, and what it saves** (`client/src/hud.rs`)
+  — the top of the screen carries the series score and the clock, the upper right
+  carries a **troop count** (`> ALPHA 3` over `  BRAVO 2`), and that is all. The
+  full scoreboard lives on the centred banner instead.
+  * **The board used to sit in the upper right for the whole match**, and it was
+    the wrong thing to have there: eight lines over a quarter of a phone screen,
+    covering the field, answering a question nobody asks with a round in the air.
+    What you want mid-round is one number per side — with no respawns, how many
+    are left on each IS the state of the round.
+  * The `> ` marker on your own side is not decoration. It is a PREFIX of fixed
+    width on both lines rather than a suffix on one, because the block is
+    right-justified against the screen edge and a marker only one line carries
+    would step the other sideways. And it exists at all because the sides no
+    longer differ in colour — with a tan army opposite you, which count was yours
+    went without saying. `TEAM_NAMES` being two five-letter words is what makes
+    the two lines the same width with no padding.
+  * The banner shows the board **between rounds** (under the result and
+    `NEXT ROUND IN 0:04`) and **for `ROSTER_FLASH` seconds whenever a pawn joins
+    or leaves** — bots come and go on a dial, so "who am I actually playing with"
+    changes mid-match and needs saying. `hud::watch_roster` owns that timer and
+    `update_round_banner` only reads it.
+  * `BoardFlash` stores each pawn's NAME beside its handle rather than re-deriving
+    it, because a pawn that has just left cannot be asked what it was called and
+    "BOT 3 LEFT" is the whole message. Two arming rules are deliberate: a change
+    to or from an EMPTY roster does not count (the warmup→p2p swap walks through
+    empty on its way, and announcing that would be reporting the machinery), and
+    names are refreshed even when the handles didn't move, because the seat count
+    bots are numbered from shifts at exactly that swap.
+  * The count-in moved OFF the round line when it moved onto the banner. Two
+    countdowns on one screen is one too many, and the top line is about the
+    SERIES, which between rounds has not changed.
+  * The banner's two text lines are one `BannerLine` enum component, not two
+    marker types: one system writes both and two separate `&mut Text` queries
+    would each need a `Without` filter against the other. An empty line is
+    `Display::None`, not an empty string — `row_gap` spaces children whatever
+    their size, so a zero-height node still costs the gap either side.
+  * The board's columns line up because bevy's embedded `default_font` is
+    **FiraMono**; padding to `NAME_COL` would be pointless in a proportional face.
+  * **A red skull (`skull.png`, `gen_assets.py` `gen_skull`) marks who is out of
+    the round**, in a gutter to the LEFT of the names so alive and dead still
+    start on the same column. It replaced a `" +"` suffix on the name, which was
+    meant as a printer's dagger and got asked what it meant — which is the answer.
+    Three things about it:
+    - **The icon is hidden with `Visibility`, NOT `Display::None`**, because a
+      hidden node keeps its box and that box IS the gutter. `Display::None` would
+      take it away and step every living pawn's name 22 px left.
+      (`nameplate.rs` uses `Display::None` on its arrow for the opposite reason.)
+    - It is what forced the board from one multi-line `Text` into a **pool of
+      row nodes** — an icon has to be an `ImageNode` and a `Text` cannot hold one.
+      Pooled at `BOARD_ROWS`, same pattern as `setup_nameplates`.
+    - **Each row carries its own `index`.** Handing board lines out in query
+      iteration order scattered them: a row's place on screen is its place among
+      the container's children, and iteration order is ARCHETYPE order. The tell
+      was the `ALPHA` heading appearing under the `BRAVO` block with the right
+      names on the wrong side — found by screenshot, invisible to the tests.
+    - Judge the art SHRUNK. It ships at 17 px, an 8x downscale, and the first
+      version — jaw nearly as wide as the cranium, three narrow tooth gaps, a
+      2 px mouth line — read as a red blob with two eyes. A narrow jaw (the waist
+      is what says "skull" when nothing else survives), two fat tooth gaps and a
+      thicker mouth line fixed it. Those numbers are measurements, not taste.
 - **Teammate nameplates** (`client/src/nameplate.rs`) — a small green name over
   everyone on your own side, and an arrow on the edge of the screen for the ones
   who are off it. Render-only, on the same line as `spectate.rs` and `vision.rs`:
@@ -272,10 +332,14 @@ synctest mode. Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_BOTS`,
     its raw handle, so the button said "BOT 5" about the pawn the roster called
     "Bot 4". Survivable while the two sat in opposite corners; not once the name is
     also floating over the soldier.
-  * **The names are GREEN, not the team tint.** `render::TEAM_COLORS` says which
-    side a figure is on; a plate says *friend* and only ever appears over one. On
-    the TAN side a tan label over a tan soldier would be the least readable case
-    and the one that needs reading most.
+  * **This is the ONLY thing that tells friend from foe**, since both sides wear
+    the same `ARMY_GREEN` (see Character art). A plate says *friend* and only ever
+    appears over one, so an unnamed figure is an enemy — which means anything that
+    stops a plate reaching a living teammate makes them shootable by their own
+    side rather than merely anonymous. Weigh changes here accordingly.
+  * The label's colour is fixed and bright rather than borrowed from anywhere: it
+    has to carry over the dark olive sward, the pale dry earth of a bare tile, and
+    a green soldier directly underneath it.
   * **Concealment does not dim a plate.** `fade_hidden` fades a teammate the grass
     is hiding and the name over them stays lit: concealment is about what the ENEMY
     can find, and nobody else's screen draws this.
@@ -289,15 +353,18 @@ synctest mode. Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_BOTS`,
     with a margin wide enough to hold the name is what "the arrows need to be
     closer to the edge" was reporting.
   * **Which means the HUD has to be dodged rather than avoided.** `hud_boxes` asks
-    every button plus the round line, health bar and roster where they are
-    (`ComputedNode`, in PHYSICAL px — the conversion `touch.rs` got caught by), and
-    `dodge` walks an edge plate AWAY from the edge it was pinned to until it is
-    clear: down past the roster at the top, up over the sights button at the
-    bottom. Written down as numbers instead, it would be wrong for some match — the
-    roster grows a line per pawn, START comes and goes, the spectate button only
-    exists while you are out.
+    every button plus the round line, health bar, troop count and the banner's
+    PILL where they are (`ComputedNode`, in PHYSICAL px — the conversion `touch.rs`
+    got caught by), and `dodge` walks an edge plate AWAY from the edge it was
+    pinned to until it is clear: down past the troop count at the top, up over the
+    sights button at the bottom. Written down as numbers instead, it would be wrong
+    for some match — the banner grows a line per pawn and is only up between
+    rounds, START comes and goes, the spectate button only exists while you are
+    out. The banner enters as `BannerPill` and NOT as `RoundBanner`, whose node is
+    the whole window (that is what centres the pill) and would push every plate
+    clean off the screen.
   * `dodge` deliberately leaves ON-SCREEN plates alone: a name that jumped clear of
-    the roster would no longer say which soldier it belonged to.
+    the HUD would no longer say which soldier it belonged to.
   * A side musters on ONE LINE, so at the top of a round every plate clamped to the
     same pixel and the three names read as one smear; `destack` drops each onto its
     own line.
@@ -445,8 +512,9 @@ synctest mode. Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_BOTS`,
     handle 0's input every tick. `?bots=N` / `AG_BOTS=N` seeds the same dial, so
     the URL and the menu are one setting (index.html must forward `bots` into
     `__AG_NET__` — it was missed once and the param silently did nothing).
-  * The HUD roster walks PAWNS, not session handles, or bots are absent from the
-    scoreboard while busy killing people.
+  * `hud::board_lines` walks PAWNS, not session handles, or bots are absent from
+    the scoreboard while busy killing people. A bot arriving or leaving is also
+    what puts that board on screen mid-match (`hud::BoardFlash`).
   **How aggressive they are rides the same way** (`DIAL_AGGRO_MASK`, bits 0-3 of
   a SECOND input byte, applied by `apply_bot_dials`), and the menu's `− AGGRO n%
   +` row is the other half of it. Three things about it are load-bearing:
@@ -555,16 +623,28 @@ synctest mode. Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_BOTS`,
     prone) or tracers and the ADS aim line appear to leave the soldier's boots.
     Bullets carry the lift they were FIRED at in a render-only `MuzzleLift`
     (the shooter may stand up mid-flight); trails and the aim line apply it too.
-  * **`TEAM_COLORS` are what tell friend from foe**, so they are a gameplay
-    reading rather than decoration, and they have to satisfy two things at once.
-    Both must sit well ABOVE the ground tile in value — the grass is a dark olive
-    (62,74,42) and a soldier tinted into that range vanishes into it, which is
-    worse now that the green side is one of two rather than one of eight. And
-    they must differ in HUE AND VALUE, not hue alone, because under the fog they
-    are drawn at reduced alpha over a green field and two colours separated only
-    by hue converge as they fade. Hence a pale sage green against a distinctly
-    brighter tan, with a small per-slot shade so four figures in the same colours
-    are still four figures.
+  * **BOTH SIDES ARE THE SAME GREEN** (`ARMY_GREEN`, and `TEAM_COLORS` is that
+    one constant twice rather than two entries that happen to match, so nobody
+    drifts them apart by editing one). One bag of army men — which is the look —
+    and the consequence is that **the tint no longer tells friend from foe;
+    `nameplate.rs` does, and it is now the only thing that does.** An unnamed
+    figure is an enemy. That is not a downgrade of a colour code, it is the
+    reading moving to where it belongs: who is on your side is a fact about who
+    is holding the phone, and the sim has no point of view, so it cannot be
+    painted onto a sprite every peer draws identically. Identifying someone
+    became something you do.
+    The one hard constraint on the colour survives unchanged: it must sit well
+    ABOVE the ground tile in value — the grass is a dark olive (62,74,42) and a
+    soldier tinted into that range vanishes everywhere rather than only where the
+    terrain hides him — hence a pale sage rather than anything field-coloured.
+    `TEAM_SHADE_STEP` still nudges each pawn by its slot so four figures in one
+    view are four figures, and it is keyed on the slot WITHIN a side precisely so
+    slot 2 of each side matches: the nudge separates neighbours and must never
+    grow into a side marker of its own.
+  * **The sides are named ALPHA and BRAVO** (`TEAM_NAMES`, read by the menu's
+    team dial, the round line and the roster so all three agree). Phonetic
+    because they are no longer coloured — `GREEN 2 - 1 TAN` over two green
+    armies would be a scoreboard naming something you cannot see.
 - **Cover** (`sim/src/lib.rs`: `rock_layout` / `bush_layout`): two procedural
   fields, both pure integer rejection sampling from fixed seeds (`ROCK_SEED`,
   `BUSH_SEED`) — no floats, no RNG crate, so every peer builds the identical
@@ -1037,7 +1117,7 @@ need a TURN server eventually.
   grass tile. Notes for whoever edits it: it needs a CURRENT `_site` build
   (`tools/build-web.sh`) — it photographs the built wasm, not the source tree;
   playwright is not a repo dependency, so pass `AG_NODE_PATH=/path/to/node_modules`;
-  and `SHOT`'s crop is sized to clear the HUD (health bar and roster above, the
+  and `SHOT`'s crop is sized to clear the HUD (health bar and troop count above, the
   sights button below, stance buttons right), so a HUD move needs it re-checked.
 - **`tools/selfplay.sh [options]`** — the bot measuring rig: does profile A
   actually beat profile B? Eight bots in the real arena, four a side, playing

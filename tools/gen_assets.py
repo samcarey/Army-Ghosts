@@ -488,6 +488,62 @@ def gen_crosshair(path, size=128):
     write_png(path, size, size, rows, color_type=6)  # RGBA
 
 
+def gen_skull(path, size=128):
+    """Scoreboard icon for a pawn that is out of the round. White on transparent
+    — the engine tints it (`hud::SKULL_RED`), same as every other icon here.
+
+    CHUNKY ON PURPOSE, and JUDGE IT SHRUNK — it ships at about 17 px beside a
+    13 px name, an 8x downscale, and anything with the proportions of a real skull
+    turns to mush there. Measured, not guessed: the first version had a jaw nearly
+    as wide as the cranium, three narrow tooth gaps and a 2 px mouth line, and at
+    17 px it read as a red blob with two eyes — no jaw, no teeth. What fixed it was
+    a NARROW jaw (the waist is what says "skull" when nothing else survives), TWO
+    fat tooth gaps instead of three thin ones, and a mouth line half again as
+    thick. Every hole here is at the floor of what lives through the downscale, so
+    treat them as measurements rather than as taste.
+
+    Preview it composited red-on-pill at the size it ships at; white-on-transparent
+    at 128 px flatters every one of these decisions."""
+    def blob(px, py, cx, cy, rx, ry):
+        # Positive inside, roughly in pixels, so `min`/`max` compose as union and
+        # intersection and a +0.5 clamp gives a pixel of antialiasing.
+        d = (((px - cx) / rx) ** 2 + ((py - cy) / ry) ** 2) ** 0.5
+        return (1.0 - d) * min(rx, ry)
+
+    def box(px, py, cx, cy, hw, hh):
+        return min(hw - abs(px - cx), hh - abs(py - cy))
+
+    s = size / 128.0
+    rows = []
+    for y in range(size):
+        row = bytearray()
+        for x in range(size):
+            px, py = (x + 0.5) / s, (y + 0.5) / s
+            # A wide cranium sitting on a much narrower jaw. The union of the two
+            # is the whole silhouette — no outline, nothing else to keep in step —
+            # and the WAIST between them is what still reads as a skull at 17 px
+            # after the sockets have blurred.
+            body = max(
+                blob(px, py, 64, 50, 44, 40),
+                blob(px, py, 64, 86, 22, 24),
+            )
+            # Sockets, nose and the gaps between the teeth are all cut OUT of it,
+            # so the icon is one shape with holes and reads at any size the holes
+            # survive.
+            holes = max(
+                blob(px, py, 45, 52, 18, 17),
+                blob(px, py, 83, 52, 18, 17),
+                blob(px, py, 64, 78, 6, 9),
+                box(px, py, 64, 82, 18, 3.2),       # the mouth line
+                box(px, py, 57, 95, 3.6, 12),       # two fat tooth gaps, not
+                box(px, py, 71, 95, 3.6, 12),       # three thin ones
+            )
+            a = max(0.0, min(1.0, min(body, -holes) * s + 0.5))
+            row += bytes((255, 255, 255, int(a * 255)))
+        rows.append(row)
+    write_png(path, size, size, rows, color_type=6)  # RGBA
+
+
 def gen_chevron(path, size=128):
     """Stance-button icon: a fat chevron pointing UP. The engine flips it
     vertically for the get-down button, so there is only ever one of these."""
@@ -1020,6 +1076,7 @@ if __name__ == '__main__':
     gen_tracer(os.path.join(out, 'tracer.png'))
     gen_crosshair(os.path.join(out, 'crosshair.png'))
     gen_chevron(os.path.join(out, 'chevron.png'))
+    gen_skull(os.path.join(out, 'skull.png'))
     gen_rocks(os.path.join(out, 'rocks.png'))
     gen_bushes(os.path.join(out, 'bushes.png'))
     gen_grass_tex(os.path.join(out, 'grass.png'))

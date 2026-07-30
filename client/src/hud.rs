@@ -555,6 +555,27 @@ pub fn read_start_input(
     }
 }
 
+/// What a pawn is called, everywhere a pawn is called anything: the roster here,
+/// the spectate button (`spectate.rs`) and the nameplate over its head
+/// (`nameplate.rs`).
+///
+/// ONE function on purpose. Three spellings of the same pawn is worse than any
+/// one of them, and it had already happened — the spectate button used to print a
+/// bot's raw handle, so the button said "BOT 5" about the pawn the roster called
+/// "Bot 4". That was survivable while the two were on opposite corners of the
+/// screen and stops being so now that the name is also floating over the soldier.
+///
+/// `num_players` is how many SEATS the session has. Bots take the handles above
+/// the humans, so numbering them from there makes "Bot 1" the first bot rather
+/// than the first pawn that happens to be one.
+pub fn pawn_name(handle: usize, is_bot: bool, num_players: usize) -> String {
+    if is_bot {
+        format!("Bot {}", handle.saturating_sub(num_players) + 1)
+    } else {
+        format!("Player {}", handle + 1)
+    }
+}
+
 /// `"5k 3d"` — the board is a scoreboard, so everyone carries a count from the
 /// first tick rather than sprouting one the moment they die.
 ///
@@ -620,15 +641,10 @@ pub fn update_player_list(
                     lines.push(format!("- {} -", TEAM_NAMES[(side as usize).min(TEAM_COUNT - 1)]));
                     shown_side = Some(side);
                 }
-                let who = if is_bot {
-                    // Numbered within the bots rather than continuing the player
-                    // numbering: bots take the handles above the humans, so the
-                    // first one is `num_players`.
-                    format!("Bot {}", handle.saturating_sub(num_players) + 1)
-                } else {
-                    let you = if local.contains(&handle) { " (you)" } else { "" };
-                    format!("Player {}{}", handle + 1, you)
-                };
+                let mut who = pawn_name(handle, is_bot, num_players);
+                if !is_bot && local.contains(&handle) {
+                    who.push_str(" (you)");
+                }
                 // GGRS-measured roundtrip time to each remote peer. Errors
                 // (local handles, or a peer still synchronizing) → no ping. Bots
                 // are local by construction and never have one.
@@ -651,5 +667,29 @@ pub fn update_player_list(
     let joined = lines.join("\n");
     if text.0 != joined {
         text.0 = joined;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The numbering three places now share. Bots start at 1 from the first BOT,
+    /// not from the first pawn — a one-seat game with seven bots has a "Bot 1",
+    /// and the pawn on handle 7 is "Bot 7" rather than "Bot 8".
+    #[test]
+    fn bots_are_numbered_from_the_first_bot_not_the_first_pawn() {
+        assert_eq!(pawn_name(0, false, 1), "Player 1");
+        assert_eq!(pawn_name(1, true, 1), "Bot 1");
+        assert_eq!(pawn_name(7, true, 1), "Bot 7");
+        // Two humans in a room: the bots start again from one above them.
+        assert_eq!(pawn_name(2, true, 2), "Bot 1");
+    }
+
+    /// No session yet (the lobby, the warmup) means no seat count, and a bot's
+    /// name still has to come out as a name rather than as a panic.
+    #[test]
+    fn a_bot_without_a_session_to_count_seats_is_still_named() {
+        assert_eq!(pawn_name(0, true, 0), "Bot 1");
     }
 }

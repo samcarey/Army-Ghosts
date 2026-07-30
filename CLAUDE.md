@@ -261,6 +261,46 @@ synctest mode. Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_BOTS`,
     arrives.
   * `run_round` returns immediately on any scenario but `Arena`, which is what
     keeps the grass rig's two carefully placed pawns where they were put.
+- **Teammate nameplates** (`client/src/nameplate.rs`) — a small green name over
+  everyone on your own side, and an arrow on the edge of the screen for the ones
+  who are off it. Render-only, on the same line as `spectate.rs` and `vision.rs`:
+  which pawns are *yours* is a fact about who is holding the phone, and the sim
+  has no point of view. Names keep showing while you are dead, which is when
+  knowing who is who is worth most.
+  * **`hud::pawn_name` is the one place a pawn is named**, and it exists because
+    three places had drifted: the spectate button used to spell a bot's number off
+    its raw handle, so the button said "BOT 5" about the pawn the roster called
+    "Bot 4". Survivable while the two sat in opposite corners; not once the name is
+    also floating over the soldier.
+  * **The names are GREEN, not the team tint.** `render::TEAM_COLORS` says which
+    side a figure is on; a plate says *friend* and only ever appears over one. On
+    the TAN side a tan label over a tan soldier would be the least readable case
+    and the one that needs reading most.
+  * **Concealment does not dim a plate.** `fade_hidden` fades a teammate the grass
+    is hiding and the name over them stays lit: concealment is about what the ENEMY
+    can find, and nobody else's screen draws this.
+  * It runs AFTER `render::camera_follow` and reads the camera's `Transform`, NOT
+    its `GlobalTransform` — propagation happens in `PostUpdate`, so the global one
+    is a frame stale and every name would lag the camera as you walked.
+  * **An edge plate is anchored BY ITS EDGE, not by its centre** (`Placement::pivot`,
+    which rides out as the `UiTransform` percentage translation). That is what lets
+    `EDGE_MARGIN` be two pixels: pinned to the left, the plate hangs to the RIGHT of
+    its anchor, so nothing has to leave room for half a name. Centred anchoring
+    with a margin wide enough to hold the name is what "the arrows need to be
+    closer to the edge" was reporting.
+  * **Which means the HUD has to be dodged rather than avoided.** `hud_boxes` asks
+    every button plus the round line, health bar and roster where they are
+    (`ComputedNode`, in PHYSICAL px — the conversion `touch.rs` got caught by), and
+    `dodge` walks an edge plate AWAY from the edge it was pinned to until it is
+    clear: down past the roster at the top, up over the sights button at the
+    bottom. Written down as numbers instead, it would be wrong for some match — the
+    roster grows a line per pawn, START comes and goes, the spectate button only
+    exists while you are out.
+  * `dodge` deliberately leaves ON-SCREEN plates alone: a name that jumped clear of
+    the roster would no longer say which soldier it belonged to.
+  * A side musters on ONE LINE, so at the top of a round every plate clamped to the
+    same pixel and the three names read as one smear; `destack` drops each onto its
+    own line.
 - **Pawns are not seats** (`sim/src/lib.rs`: `Intent`, `Bot`, `read_human_intent`).
   `move_players`/`fire_bullets` used to index `PlayerInputs[player.handle]`
   directly, which made "is a pawn" and "has a seat in the GGRS session" the same

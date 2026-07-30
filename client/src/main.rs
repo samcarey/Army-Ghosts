@@ -7,6 +7,7 @@ mod grass;
 mod hud;
 mod input;
 mod menu;
+mod nameplate;
 mod net;
 mod render;
 mod spectate;
@@ -103,6 +104,7 @@ fn main() {
             ads::setup_ads,
             stance::setup_stance,
             spectate::setup_spectate,
+            nameplate::setup_nameplates,
             vision::setup_fog,
         )
             .chain(),
@@ -154,6 +156,9 @@ fn main() {
                 vision::update_fog,
                 vision::fade_hidden,
                 render::camera_follow,
+                // AFTER the camera: nameplates are screen positions, and one
+                // computed against last frame's camera slides about as you walk.
+                nameplate::update_nameplates,
             )
                 .chain(),
         ),

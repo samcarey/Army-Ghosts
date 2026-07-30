@@ -19,9 +19,12 @@
 //! is told to follow.
 
 use bevy::prelude::*;
-use bevy_ggrs::LocalPlayers;
+use bevy_ggrs::{LocalPlayers, Session};
 
 use army_ghosts_sim::{Health, Player, Team};
+
+use crate::hud::pawn_name;
+use crate::SessionConfig;
 
 /// Who the camera is watching, when it isn't watching you.
 ///
@@ -162,6 +165,7 @@ fn choose(current: Option<usize>, mates: &[usize], advance: bool) -> Option<usiz
 /// Show the button only while there is someone to watch, and name them on it.
 pub fn update_spectate_button(
     spectating: Res<Spectating>,
+    session: Option<Res<Session<SessionConfig>>>,
     pawns: Query<(&Player, Option<&army_ghosts_sim::Bot>)>,
     mut buttons: Query<&mut Visibility, With<SpectateButton>>,
     mut labels: Query<&mut Text, With<SpectateLabel>>,
@@ -177,10 +181,17 @@ pub fn update_spectate_button(
     let is_bot = pawns
         .iter()
         .any(|(player, bot)| player.handle == handle && bot.is_some());
+    let num_players = match session.as_deref() {
+        Some(Session::P2P(s)) => s.num_players(),
+        Some(Session::SyncTest(s)) => s.num_players(),
+        _ => 0,
+    };
     // The chevron is the affordance: the label says who, the arrow says there
     // are more. ASCII, because the embedded default font is missing most of
-    // what a nicer glyph would need.
-    let line = format!("{} {} >", if is_bot { "BOT" } else { "PLAYER" }, handle + 1);
+    // what a nicer glyph would need. The name comes from `hud::pawn_name` — this
+    // used to spell a bot's number its own way and disagree with the roster about
+    // who you were watching.
+    let line = format!("{} >", pawn_name(handle, is_bot, num_players));
     for mut text in &mut labels {
         if text.0 != line {
             text.0 = line.clone();

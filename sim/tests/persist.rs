@@ -417,6 +417,44 @@ fn the_bots_survive_whoever_holds_the_dial_dropping_out() {
     let _ = pawn(&mut app, 0);
 }
 
+/// **Two peers who waited different lengths of time in the lobby must still
+/// start the match on the same clock.**
+///
+/// This is the regression test for a bug that desynced every p2p match this
+/// game has ever played, found while testing the rejoin and fixed in
+/// `spawn_world`. [`Round`] is a checksummed rollback RESOURCE and so is not
+/// part of the world; the warmup session's clock therefore ran straight into
+/// the match, and two peers cannot have warmed up equally — the host sits
+/// waiting for everyone else to turn up. Measured in two browser tabs at GGRS
+/// frame 0, before a tick of the match had run: 467 ticks against 149.
+///
+/// The failure is invisible to a synctest, which only ever compares a peer
+/// against itself, and the symptom is a `DESYNC at frame 10` — frame 10 being
+/// merely the first checksum comparison, not the moment anything went wrong.
+#[test]
+fn a_fresh_world_starts_a_fresh_round() {
+    let (mut early, mut late) = (arena(1, 0), arena(1, 0));
+    run(&mut early, 300);
+    run(&mut late, 60);
+    assert_ne!(
+        early.world().resource::<Round>().ticks,
+        late.world().resource::<Round>().ticks,
+        "the setup never got the two clocks apart, so this proves nothing"
+    );
+
+    // Now each builds the match world, as `finalize_p2p_session` does.
+    for app in [&mut early, &mut late] {
+        let world = app.world_mut();
+        let mut commands = world.commands();
+        spawn_world(&mut commands, 2, Scenario::Arena);
+        world.flush();
+    }
+
+    let (a, b) = (*early.world().resource::<Round>(), *late.world().resource::<Round>());
+    assert_eq!(a, b, "two peers started the same match on different clocks");
+    assert_eq!(a, Round::default(), "a fresh world did not start a fresh round");
+}
+
 /// The round clock comes back running.
 ///
 /// [`Round`] is the only rollback-registered RESOURCE in the sim, and a resume

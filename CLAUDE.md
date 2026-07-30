@@ -1090,6 +1090,25 @@ nothing.
   rooms — new pairings then stall even at the signaling stage. When p2p
   "mysteriously stops working": `pkill matchbox_server` and restart it, and
   always use FRESH room codes per test (rooms remember dead peers).
+- **A FRESH WORLD MUST START A FRESH ROUND**, and forgetting it desynced every
+  p2p match this game ever played. `Round` is a rollback-registered, CHECKSUMMED
+  resource, so it is not part of the world — it outlives one. The warmup
+  session's clock therefore ran straight into the match, and two peers cannot
+  have warmed up for the same length of time, because the host sits waiting for
+  the others to arrive. Measured in two browser tabs at GGRS frame 0, before a
+  single tick of the match had been simulated: one peer's `Round.ticks` read
+  **467** and the other's **149** — exactly the five seconds one spent waiting.
+  Every match began desynced and said so at frame 10.
+  **Frame 10 is not when it went wrong; it is `DesyncDetection { interval: 10 }`
+  making its first comparison** — chasing what happens around frame 10 is
+  chasing nothing. `spawn_world` now installs `Round::default()`, and
+  `a_fresh_world_starts_a_fresh_round` is the regression test. Two lessons worth
+  more than the fix: **a synctest can never catch this class of bug**, because
+  it only ever compares a peer against itself, so the whole `check_distance(2)`
+  suite passed through it; and when hunting one, align the two peers' state on
+  the GGRS FRAME (`RollbackFrameCount`) rather than on anything the game counts
+  — keying on the round clock compared a warmup world against a match world and
+  read as noise for a run.
 - **`RollbackOrdered` MUST be reset when a GGRS session is rebuilt**, and this
   one is a landmine. bevy_ggrs mixes `RollbackOrdered::order(rollback)` — a
   global, monotonically increasing registration index — into the PER-COMPONENT
@@ -1330,16 +1349,15 @@ need a TURN server eventually.
   real browser, which is the only place it actually lives (a native build does
   not have a window to refresh). `refresh` is offline and reliable: walk off the
   post, go prone, reload, prove the world that comes back is the stored one.
-  `rejoin` is two tabs in a room with one refreshing mid-match. `control` is the
-  BASELINE and not a test of this feature at all — read it first.
-  **Browser-to-browser p2p in this repo desyncs at frame 10 with nobody
-  refreshing, no bots, on `main`** (verified by stashing this branch entirely
-  and rebuilding). That is a real pre-existing bug and a separate
-  investigation; until it is fixed, "did the resume desync" is not a question
-  this environment can answer, so `rejoin` REPORTS desyncs rather than asserting
-  on them, and asserts instead what it can prove: the returning player is
-  recognised by its stored id, exactly one peer answers, both move to the next
-  generation, and both restore the same round from the same blob.
+  `rejoin` is two tabs in a room with one refreshing mid-match; it asserts that
+  the returning player is recognised by its stored id, that exactly one peer
+  answers, that both move to the next generation, that both restore the same
+  round from the same blob, and that nothing desyncs afterwards. `control` is
+  the BASELINE and not a test of this feature at all: the same two tabs with
+  nobody refreshing. **Run the control first whenever `rejoin` reports a
+  desync** — it says whether the baseline is broken or the rejoin is, and it is
+  exactly how the round-clock bug in "Gotchas" was separated from the feature
+  that exposed it.
   Needs a current `_site` (`tools/build-web.sh`) and `AG_NODE_PATH`, same as
   `grass-shots.sh`.
 - **`tools/rejoin-test.sh`** — the native two-process equivalent, and **it has

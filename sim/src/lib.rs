@@ -1313,6 +1313,24 @@ pub fn spawn_world(commands: &mut Commands, num_players: usize, scenario: Scenar
         spawn_grass_strip(commands, east_stance);
         return;
     }
+    // **A fresh world starts a fresh round, and forgetting this desynced every
+    // p2p match ever played.**
+    //
+    // [`Round`] is a rollback-registered, CHECKSUMMED resource, and it is not
+    // part of the world — it is a resource that outlives one. So the clock the
+    // warmup session was running kept running straight into the match, and two
+    // peers cannot have warmed up for the same length of time: the host waits
+    // for everyone else to arrive. Measured in two browser tabs, at GGRS frame
+    // 0, before a single tick of the match had been simulated: one peer's
+    // `Round.ticks` read 467 and the other's 149 — exactly the five seconds one
+    // spent waiting for the other. Every match therefore began desynced, and
+    // reported it at frame 10, the first checksum comparison.
+    //
+    // It belongs here rather than in the client because the clock is a fact
+    // about the world, and this is the one place a world is made. A restore
+    // (`save::restore`) does not call this and installs the round it was given,
+    // which is the whole point of a resume.
+    commands.insert_resource(Round::default());
     for handle in 0..num_players.min(MAX_PLAYERS) {
         // Alternating, so two players are 1v1 rather than 2v0 — see
         // [`default_side`]. The slot follows from it, so the first pair take the

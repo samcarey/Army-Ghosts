@@ -15,9 +15,12 @@
 #            from the same blob.
 #   control  The same two tabs with NOBODY refreshing. This is not a test of
 #            this feature — it is the baseline the rejoin has to be read
-#            against, because browser-to-browser p2p in this repo desyncs at
-#            frame 10 on `main` with no bots and no refresh. Run it before
-#            believing any desync the rejoin check reports.
+#            against. Run it FIRST whenever the rejoin check reports a desync:
+#            it says whether the baseline is broken or the rejoin is. That is
+#            not hypothetical — it is how the round-clock bug was found, where
+#            every p2p match started desynced because the warmup's clock ran
+#            into the match and no two peers warm up for the same length of
+#            time. The rejoin check looked broken; the baseline was.
 #
 # Notes for whoever edits this:
 #   * it photographs the BUILT wasm, so `tools/build-web.sh` first;

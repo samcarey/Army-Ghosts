@@ -8,12 +8,7 @@ const { chromium } = require('playwright');
 
 const PORT = process.env.PORT || '8151';
 const ROOM = process.env.ROOM || `rj${Date.now().toString(36)}`;
-// bots=0 DELIBERATELY. Two tabs with bots desync at frame 10 whether or not
-// anybody refreshes — verified against main, which has none of this branch's
-// code, at the identical frame. That is a real pre-existing bug and a separate
-// investigation; leaving it in here would only mean this test measured it
-// instead of measuring the rejoin. `control.js` is the reduction.
-const URL = `http://127.0.0.1:${PORT}/?room=${ROOM}&players=2&bots=0`;
+const URL = `http://127.0.0.1:${PORT}/?room=${ROOM}&players=2&bots=2`;
 
 const strip = (s) => s.replace(/%c/g, '').replace(/color:[^%]*/g, '').trim();
 
@@ -101,18 +96,13 @@ const strip = (s) => s.replace(/%c/g, '').replace(/color:[^%]*/g, '').trim();
   }
   console.log(`both resumed into round ${round(A)}`);
 
-  // Let the resumed session run, then REPORT what happened to it rather than
-  // asserting on it.
-  //
-  // That is honesty, not a soft assertion. Two browser tabs in this repo's own
-  // p2p desync at frame 10 with NOBODY refreshing, NO bots, on `main`, which
-  // has none of this feature's code — `persist-control.js` is that reduction,
-  // and it reproduces every run. Until that is fixed, "did the resume desync"
-  // is not a question this environment can answer, and a test that failed on
-  // it would be reporting somebody else's bug as this feature's. What IS
-  // asserted above still means something: the returning player was recognised,
-  // one peer answered, both moved to the next generation, and both restored
-  // the same round from the same blob.
+  // A resumed session that immediately desyncs would have passed everything
+  // above, so this is the assertion that matters — and it is only assertable
+  // at all since the round-clock fix. Before it, two tabs desynced at frame 10
+  // with nobody refreshing and no bots (`persist-control.js` is that
+  // reduction), so this had to report rather than assert. Run the control if
+  // this ever starts failing again: it says whether the baseline is broken or
+  // the rejoin is.
   await A.page.waitForTimeout(15000);
 
   // Both peers autosave their world, so a divergence can be read off as "which
@@ -127,9 +117,9 @@ const strip = (s) => s.replace(/%c/g, '').replace(/color:[^%]*/g, '').trim();
   }
   for (const tab of tabs) {
     const desync = tab.log.find((l) => l.includes('DESYNC'));
-    console.log(`tab ${tab.name} after the resume: ${desync || 'no desync'}`);
+    if (desync) die(`tab ${tab.name} desynced after the resume: ${desync}`);
   }
 
   await browser.close();
-  console.log(`\nPASSED: tab B refreshed and rejoined into round ${round(A)}`);
+  console.log(`\nPASSED: tab B refreshed and rejoined into round ${round(A)}, no desync`);
 })().catch((e) => { console.error(e); process.exit(1); });

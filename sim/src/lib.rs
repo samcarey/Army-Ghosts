@@ -22,8 +22,10 @@ use serde::{Deserialize, Serialize};
 
 pub mod bot;
 pub mod round;
+pub mod save;
 pub use bot::{bot_think, Bot, BotProfile, BotRoster, MEMORY_TICKS};
 pub use round::{Phase, Round, Winner, INTERMISSION_TICKS, ROUND_SECONDS, ROUND_TICKS};
+pub use save::{Dials, Save};
 
 /// Fixed-point scale: subunits per world unit (pixel).
 pub const FP: i32 = 256;
@@ -119,6 +121,22 @@ pub const STANCE_HEIGHT: [i32; STANCE_COUNT] = [64, 52, 15];
 /// is an **absolute value re-sent every tick**, never an edge, for the reason
 /// spelled out on [`BTN_BOTS_SHIFT`]: rollback replays a tick as often as it
 /// likes, and only an idempotent input replays to the same world.
+///
+/// # Every multi-bit field reads zero as "not asking"
+///
+/// Stance, bot count, aggression and the team request are all encoded as
+/// `1 + value`, so `PlayerInput::default()` asks for **nothing at all** rather
+/// than asking to stand up, for no bots, for side zero. That is not tidiness:
+/// `default()` is exactly what GGRS hands the sim for a **disconnected**
+/// player (`sync_layer::synchronized_inputs` substitutes `T::Input::default()`
+/// from the disconnect frame on), so the zero encoding is the one an absent
+/// player transmits whether they mean to or not.
+///
+/// Before this, refreshing the browser stood your pawn up out of the grass it
+/// was hiding in — and if you happened to hold handle 0, deleted every bot in
+/// the match on the way out, because bots-not-asked-for and bots-none were the
+/// same four bits. See `persist.rs` and [`save`] for what a player is expected
+/// to do while gone: nothing, in the position they left, still shootable.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub struct PlayerInput {
     pub move_x: i8,
@@ -134,14 +152,21 @@ pub struct PlayerInput {
 pub const BTN_FIRE: u8 = 1 << 0;
 /// Aiming down sights: the shooter plants their feet (stick only turns them).
 pub const BTN_ADS: u8 = 1 << 1;
-/// Bits 2-3 carry the stance the player *wants* (0 stand, 1 crouch, 2 prone) —
-/// an absolute level, not a "go down" edge. Edge-triggered inputs would need
-/// the sim to remember last tick's buttons, which is exactly the kind of hidden
-/// state rollback punishes; a level re-sent every tick re-applies identically no
+/// Bits 2-3 carry the stance the player *wants*, as `1 + level` — an absolute
+/// level, not a "go down" edge. Edge-triggered inputs would need the sim to
+/// remember last tick's buttons, which is exactly the kind of hidden state
+/// rollback punishes; a level re-sent every tick re-applies identically no
 /// matter how often the frame is replayed.
+///
+/// **Zero is "not asking", not "stand"**, and the two bits hold `0..=3` so the
+/// three levels still fit exactly. A pawn nobody is asking anything of keeps the
+/// stance it had, which is what a disconnected player has to do: see the type
+/// doc on [`PlayerInput`].
 pub const BTN_STANCE_SHIFT: u8 = 2;
 pub const BTN_STANCE_MASK: u8 = 0b11 << BTN_STANCE_SHIFT;
-/// Bits 4-7 carry how many bots the *first* player wants in the match, `0..=8`.
+/// Bits 4-7 carry how many bots the *first* player wants in the match, as
+/// `1 + count` for `0..=8` (so `0` is "not asking" and the largest code is 9,
+/// inside the four bits).
 ///
 /// It rides in the input stream for exactly the reason the stance level does,
 /// and it is worth spelling out because "read it from a resource the menu
@@ -196,23 +221,32 @@ impl PlayerInput {
     pub fn ads(&self) -> bool {
         self.buttons & BTN_ADS != 0
     }
-    /// The requested stance, clamped: a peer sending 3 must not index anything
-    /// out of range on our side.
-    pub fn stance(&self) -> u8 {
-        ((self.buttons & BTN_STANCE_MASK) >> BTN_STANCE_SHIFT).min(STANCE_PRONE)
+    /// The stance this player is asking for, or `None` for "leave them as they
+    /// are" — see [`BTN_STANCE_SHIFT`]. Clamped, so a peer sending the top code
+    /// can't index anything out of range on our side.
+    pub fn stance(&self) -> Option<u8> {
+        match (self.buttons & BTN_STANCE_MASK) >> BTN_STANCE_SHIFT {
+            0 => None,
+            code => Some((code - 1).min(STANCE_PRONE)),
+        }
     }
     pub fn set_stance(&mut self, level: u8) {
         self.buttons &= !BTN_STANCE_MASK;
-        self.buttons |= (level.min(STANCE_PRONE)) << BTN_STANCE_SHIFT;
+        self.buttons |= (level.min(STANCE_PRONE) + 1) << BTN_STANCE_SHIFT;
     }
-    /// How many bots this player is asking for, clamped so a peer sending 15
-    /// can't ask for more pawns than there are spawn points.
-    pub fn bots(&self) -> u8 {
-        ((self.buttons & BTN_BOTS_MASK) >> BTN_BOTS_SHIFT).min(MAX_PLAYERS as u8)
+    /// How many bots this player is asking for, or `None` for "however many
+    /// there are" — the same sentinel as the stance, and the reason a
+    /// disconnected handle 0 doesn't empty the arena. Clamped so a peer sending
+    /// the top code can't ask for more pawns than there are spawn points.
+    pub fn bots(&self) -> Option<u8> {
+        match (self.buttons & BTN_BOTS_MASK) >> BTN_BOTS_SHIFT {
+            0 => None,
+            code => Some((code - 1).min(MAX_PLAYERS as u8)),
+        }
     }
     pub fn set_bots(&mut self, count: u8) {
         self.buttons &= !BTN_BOTS_MASK;
-        self.buttons |= count.min(MAX_PLAYERS as u8) << BTN_BOTS_SHIFT;
+        self.buttons |= (count.min(MAX_PLAYERS as u8) + 1) << BTN_BOTS_SHIFT;
     }
     /// The aggression this player is dialling, `0..=FP`, or `None` for "leave
     /// the bots' own profiles alone" — see [`DIAL_AGGRO_MASK`].
@@ -1578,14 +1612,37 @@ fn round_is_live(round: Res<Round>) -> bool {
 ///
 /// One pawn per tick is deliberate — it keeps the work bounded, and at 60 Hz
 /// filling an arena still looks instant.
+/// A match-wide setting, read from the LOWEST HANDLE THAT IS ACTUALLY ASKING.
+///
+/// The bot count and the bot aggression are one setting for the whole match, so
+/// exactly one player's copy can be honoured or two menus fight over it. It used
+/// to be handle 0's, flatly — which stopped working the moment a seat could be
+/// empty. A player who walks away sends a blank input forever (GGRS substitutes
+/// `default()` for a disconnected player, and `net.rs` does the same for a
+/// vacated seat), so "handle 0's copy" became "nobody's copy" and the dials
+/// froze for everyone else until that one person came back.
+///
+/// Scanning for the first handle that is asking fixes that without giving
+/// anything up: it is still one player's copy, still chosen by a rule every peer
+/// computes identically from the input stream alone, and still impossible to
+/// fight over — the lower handle simply wins. The client half is
+/// `MatchRoom::dial_holder`, which is what stops two clients sending at once.
+fn dialled<C: Config<Input = PlayerInput>, T>(
+    inputs: &PlayerInputs<C>,
+    ask: impl Fn(&PlayerInput) -> Option<T>,
+) -> Option<T> {
+    (0..MAX_PLAYERS)
+        .filter_map(|handle| inputs.get(handle))
+        .find_map(|&(input, _status)| ask(&input))
+}
+
 fn reconcile_bots<C: Config<Input = PlayerInput>>(
     mut commands: Commands,
     inputs: Res<PlayerInputs<C>>,
     roster: Res<BotRoster>,
     pawns: Query<(Entity, &Player, &Team, Option<&Bot>)>,
 ) {
-    // The first player's copy, and only theirs.
-    let Some(&(input, _status)) = inputs.get(0) else { return };
+    let Some(asked) = dialled(&inputs, |input| input.bots()) else { return };
 
     let mut taken = [false; MAX_PLAYERS];
     let mut on_side = [0usize; TEAM_COUNT];
@@ -1603,7 +1660,7 @@ fn reconcile_bots<C: Config<Input = PlayerInput>>(
 
     // Bots fill the seats the humans aren't using; asking for more than that is
     // asking for a spawn point that doesn't exist.
-    let wanted = (input.bots() as usize).min(MAX_PLAYERS.saturating_sub(humans));
+    let wanted = (asked as usize).min(MAX_PLAYERS.saturating_sub(humans));
     if bots.len() == wanted {
         return;
     }
@@ -1647,8 +1704,7 @@ fn apply_bot_dials<C: Config<Input = PlayerInput>>(
     inputs: Res<PlayerInputs<C>>,
     mut bots: Query<&mut Bot>,
 ) {
-    let Some(&(input, _status)) = inputs.get(0) else { return };
-    let Some(aggression) = input.aggression() else { return };
+    let Some(aggression) = dialled(&inputs, |input| input.aggression()) else { return };
     for mut bot in &mut bots {
         // Guarded so an unchanged dial doesn't mark every bot dirty each tick.
         if bot.profile.aggression != aggression {
@@ -1698,7 +1754,10 @@ fn move_players(
         let input = intent.0;
         // Stance first: the requested level rides in the input bits, so every
         // peer starts (and finishes) the same transition on the same tick.
-        stance.advance(input.stance());
+        // Nobody asking — a disconnected player, whose input GGRS blanks — holds
+        // the stance they had rather than climbing to their feet unbidden.
+        let wanted = input.stance().unwrap_or(stance.level);
+        stance.advance(wanted);
         let (mx, my) = (input.move_x as i32, input.move_y as i32);
         if mx == 0 && my == 0 {
             continue;
@@ -2048,8 +2107,8 @@ mod tests {
         input.buttons |= BTN_FIRE;
         assert_eq!(input.aggression(), None, "another field leaked into the dial");
         input.set_aggression(4);
-        assert_eq!(input.bots(), 5, "the dial disturbed the bot count");
-        assert_eq!(input.stance(), STANCE_PRONE, "the dial disturbed the stance");
+        assert_eq!(input.bots(), Some(5), "the dial disturbed the bot count");
+        assert_eq!(input.stance(), Some(STANCE_PRONE), "the dial disturbed the stance");
         assert!(input.fire(), "the dial disturbed the trigger");
     }
 
@@ -2123,7 +2182,7 @@ mod tests {
         // A garbage level from a peer must not index out of the table.
         let mut input = PlayerInput::default();
         input.set_stance(9);
-        assert_eq!(input.stance(), STANCE_PRONE);
+        assert_eq!(input.stance(), Some(STANCE_PRONE));
         assert!(STANCE_SPEED[STANCE_PRONE as usize] < STANCE_SPEED[STANCE_CROUCH as usize]);
         assert!(STANCE_SPEED[STANCE_CROUCH as usize] < STANCE_SPEED[STANCE_STAND as usize]);
     }
@@ -2135,10 +2194,39 @@ mod tests {
         let mut input = PlayerInput { buttons: BTN_FIRE | BTN_ADS, ..default() };
         input.set_stance(STANCE_CROUCH);
         assert!(input.fire() && input.ads());
-        assert_eq!(input.stance(), STANCE_CROUCH);
+        assert_eq!(input.stance(), Some(STANCE_CROUCH));
         input.set_stance(STANCE_STAND);
         assert!(input.fire() && input.ads());
-        assert_eq!(input.stance(), STANCE_STAND);
+        assert_eq!(input.stance(), Some(STANCE_STAND));
+    }
+
+    /// **A blank input asks for nothing**, which is the one property the whole
+    /// disconnected-player story rests on: GGRS substitutes `default()` for a
+    /// player who has dropped, so every multi-bit field has to read zero as
+    /// "not asking" rather than as its own zero value. Standing up and losing
+    /// every bot are what the previous encoding did on a browser refresh.
+    #[test]
+    fn a_blank_input_asks_for_nothing() {
+        let blank = PlayerInput::default();
+        assert_eq!(blank.stance(), None, "an absent player would stand up");
+        assert_eq!(blank.bots(), None, "an absent handle 0 would empty the arena");
+        assert_eq!(blank.aggression(), None);
+        assert_eq!(blank.team_request(), None);
+        assert!(!blank.fire() && !blank.ads());
+
+        // …and every value a player can actually ask for still survives the
+        // round trip, including the zeroes that used to be indistinguishable
+        // from silence.
+        for level in 0..=STANCE_PRONE {
+            let mut input = PlayerInput::default();
+            input.set_stance(level);
+            assert_eq!(input.stance(), Some(level));
+        }
+        for count in 0..=MAX_PLAYERS as u8 {
+            let mut input = PlayerInput::default();
+            input.set_bots(count);
+            assert_eq!(input.bots(), Some(count), "asking for {count} bots did not survive");
+        }
     }
 
     /// Thickets have to actually land: the per-bush rejections (round the

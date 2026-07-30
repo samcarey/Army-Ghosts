@@ -53,9 +53,14 @@ python3 -m http.server -d _site 8080
 (the web build is `--no-default-features --features default,web`).
 
 URL params (parsed by index.html into `window.__AG_NET__` pre-WASM):
-`?room=CODE&players=N&bots=N&aggro=PCT&signaling=wss://…`. No `room` ⇒ local
-synctest mode. Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_BOTS`,
-`AG_AGGRO`, `AG_SIGNALING` env vars.
+`?room=CODE&players=N&bots=N&aggro=PCT&resume=0&signaling=wss://…`. No `room` ⇒
+local synctest mode; `resume=0` starts a fresh world instead of picking up the
+match this browser was in (see "Coming back"). Native equivalents: `AG_ROOM`,
+`AG_PLAYERS`, `AG_BOTS`, `AG_AGGRO`, `AG_RESUME`, `AG_SIGNALING` env vars, plus
+`AG_PLAYER_ID` and `AG_STATE_DIR`, which are native-only test hooks standing in
+for `localStorage`. **index.html must forward every new param into
+`__AG_NET__`** — it was missed once for `bots` and the param silently did
+nothing.
 
 ## Architecture
 
@@ -64,11 +69,15 @@ synctest mode. Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_BOTS`,
   velocity/collision/isqrt math. All tick-state components are registered for
   GGRS rollback (snapshot/restore) and `Pos` is checksummed for desync
   detection. Generic over the ggrs `Config` so it never depends on matchbox.
-  Runs in `GgrsSchedule` at `TICK_HZ` (60).
+  Runs in `GgrsSchedule` at `TICK_HZ` (60). `save.rs` is the one place it hands
+  the world out whole — an integer/ASCII blob that is both the storage format
+  and the wire format for a rejoin.
 - **`client/`** — rendering (sprites; the ONLY place fixed-point → f32, via
   `Pos::to_f32`), input collection (`ReadInputs` schedule → `LocalInputs`),
   session bring-up (`net.rs`: launch-config parsing, matchbox socket,
-  GGRS session build), camera follow.
+  GGRS session build, and the rejoin handshake), camera follow, and everything
+  that has to outlive the process (`persist.rs`: this browser's identity, and
+  the match written to `localStorage`).
 - **`harness/`** (`army-ghosts-harness`, bin `selfplay`) — the bot measuring
   rig, NOT part of the game build. Runs the real sim headless at whatever rate
   the CPU manages and decides whether one `BotProfile` beats another. See
@@ -99,15 +108,28 @@ synctest mode. Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_BOTS`,
   spare), each peer simulates everything. Everything in both flag bytes is an
   ABSOLUTE value re-sent every tick, never an edge — see the stance and bot
   notes below for why rollback makes that the only workable choice.
+  **Every multi-bit field encodes `1 + value`, so ZERO MEANS "NOT ASKING"** —
+  stance, bot count, aggression and the team request alike. That is not
+  tidiness. `PlayerInput::default()` is exactly what GGRS substitutes for a
+  DISCONNECTED player (`sync_layer::synchronized_inputs` returns
+  `T::Input::default()` from the disconnect frame on), so the all-zero encoding
+  is the one an absent player transmits whether they mean to or not. Before
+  this, refreshing your browser stood your pawn up out of the grass it was
+  hiding in and — if you happened to hold handle 0 — deleted every bot in the
+  match on the way out, because "no bots wanted" and "not asking about bots"
+  were the same four bits. `a_blank_input_asks_for_nothing` pins it, and
+  `sim/tests/persist.rs` pins what the sim does about it.
 - **Lobby (open rooms)**: matchbox room string from `?room=`; socket URL is
   plain `{signaling}/{room}` (no `?next=` — everyone in the room meshes as
-  they join). Two channels in builder order: 0 reliable (lobby control),
-  1 unreliable (GGRS). Host = lowest sorted PeerId (identical on all peers).
-  Host taps START (or the room hits the `?players=` cap, default
-  `MAX_PLAYERS = 8`) → broadcasts `start:<uuid>,...` (sorted roster) on
-  channel 0; every peer builds the session from that roster (Local for self;
-  sorted order = handle order), waiting until its own mesh contains all
-  members. Late joiners after start idle in warmup. Offline (no room)
+  they join). Channels in builder order: 0 reliable (lobby control), then a
+  POOL of unreliable ones, one per session generation (`SESSION_CHANNELS`) —
+  see the rejoin section for why a pool. Host = lowest sorted PeerId (identical
+  on all peers). Everyone introduces themselves with `hi:<player id>:<gen>:<roster>`;
+  the host taps START (or the room hits the `?players=` cap, default
+  `MAX_PLAYERS = 8`) → broadcasts `go:0:<roster>|` on channel 0; every peer
+  builds the session from that roster (Local for self; roster order = handle
+  order), waiting until every member is reachable. Late joiners after start
+  idle in warmup. Offline (no room)
   defaults to 1 player; explicit `?players=N` offline forces an N-handle
   synctest. UI on top: upper-left MENU → NEW ROOM (generated 5-char code,
   web navigates to `?room=`), COPY LINK beside the lobby roster (clipboard;
@@ -214,6 +236,76 @@ synctest mode. Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_BOTS`,
     one and say so; `sim/tests/combat.rs` asserts `lane_is_clear` up front, so a
     reseeded field fails saying what actually changed. Everything else in that
     file closes to point-blank instead, which works from anywhere.
+- **Coming back** (`sim/src/save.rs`, `client/src/persist.rs`, the rejoin half of
+  `client/src/net.rs`) — refresh the page and you are back in the match you were
+  in, in the same round, where you left off; while you are gone your pawn stands
+  where you left it and can still be shot.
+  **A rejoin is not a join.** GGRS fixes its player list when the session is
+  built and has no join-in-progress, and a reloaded browser tab is a NEW
+  matchbox peer with a new `PeerId` — there is no seat to slide back into. So
+  every peer in the match REBUILDS ITS SESSION, at frame 0, from one agreed
+  world: exactly the manoeuvre the warmup→p2p swap already performs, handed a
+  world instead of a fresh one. That world is a `save::Save` blob, and the same
+  bytes serve both paths the feature has:
+  * **From storage.** `persist::autosave` writes the blob to `localStorage`
+    three times a second. Offline this IS the feature — there is nobody to ask —
+    and a refresh restores bots, health, stances, the round clock and the series
+    score. In a room it is a first paint while the mesh forms, nothing more.
+  * **From the other peers.** In a room the stored copy is stale by however long
+    the reload took, so it is worth nothing next to the world the people still
+    playing are in. One peer captures live and broadcasts it.
+  Things that are load-bearing:
+  * **The blob is a determinism boundary.** Every peer restores the same bytes
+    and must land on byte-identical worlds or the first tick of the resumed
+    session is a desync. Hence integers and ASCII only, pawns written in HANDLE
+    order (capturing the same world twice must give the same string), a version
+    tag that rejects a blob from an older build outright, and a parser that
+    returns `None` rather than a half-built world — it is fed from
+    `localStorage`, which the user can edit, and from the network, where any
+    peer can. `two_peers_restoring_one_blob_stay_in_lockstep` is the test that
+    matters: decode one blob twice into two independent apps, play 600 ticks off
+    identical inputs, compare EVERY tick.
+  * **A handle is a position in the roster and must never move.** A player who
+    has gone leaves a VACANT seat rather than being removed, because removing
+    one would slide every later handle down and hand a returning player somebody
+    else's pawn. A vacant seat is registered `PlayerType::Local` by EVERY peer
+    and fed a blank input by all of them — which is the only way GGRS will run a
+    session with nobody in a seat, and which works only because a blank input
+    now asks for nothing.
+  * **A GGRS session eats its channel.** `take_channel` moves it out of the
+    socket and the session drops it when replaced; there is no giving it back.
+    So the socket is built with a pool and the generation number in the `go:`
+    message names which one (`GGRS_CHANNEL_BASE + generation`) — a peer that has
+    used none lands on the same index as a peer that has been through three
+    rebuilds. `SESSION_CHANNELS` is therefore a hard cap on rebuilds per socket.
+  * **The room state rides in the INTRODUCTION, not in a reply to it.** `hi:`
+    carries `<player id>:<generation>:<roster>` in one message. As two messages
+    (hello, then a "busy" answer) there is a race a returning player loses: it
+    learns your NAME from the hello, a name is all it needs to build a roster,
+    and if the answer has not arrived it elects itself host and starts a SECOND
+    match in a room that already has one. Measured in two browser tabs, not
+    theorised. Folding them together makes it unrepresentable.
+  * **Exactly one peer answers a rejoin** — the lowest-numbered seat that is
+    actually present — or two rosters race and the room splits between them.
+  * **What is deliberately NOT in the blob**: the rock and bush fields (pure
+    functions of fixed seeds), rounds in the air (dropped, as a round boundary
+    drops them), and a bot's mind (seed and 24 ticks of sightings, rebuilt from
+    the handle by `Bot::seeded` — costs the bots their memory, buys one less
+    thing that could disagree).
+  * **The dials go in the blob**, and that is not bookkeeping: restore five bots
+    into a client whose bot dial reads zero and `reconcile_bots` will correctly
+    delete all five. The dial is where the count lives; the pawns are its
+    consequence.
+  * **The bot dials moved off handle 0** (`dialled` in the sim,
+    `MatchRoom::dial_holder` in the client): they are read from the lowest handle
+    that is actually ASKING, because handle 0 can now be an empty seat, and
+    "handle 0's copy" then means "nobody's copy" — the dials froze for the whole
+    room until that one person came back.
+  * Identity is `persist::Identity`: an opaque token in `localStorage`, minted
+    once. Not a name or a login — it says "same browser as before" and nothing
+    else, and clearing site data is quitting. `AG_PLAYER_ID` overrides it
+    natively, which is how a test makes a second process claim to be the first
+    one coming back.
 - **Teams and rounds** (`sim/src/round.rs` + `Team`/`spawn_post` in `lib.rs`) —
   the Ghost War shape, and the thing every other rule now hangs off. Two sides
   muster on opposite ends of the field, fight for `ROUND_SECONDS` (120), and
@@ -998,6 +1090,40 @@ synctest mode. Native equivalents: `AG_ROOM`, `AG_PLAYERS`, `AG_BOTS`,
   rooms — new pairings then stall even at the signaling stage. When p2p
   "mysteriously stops working": `pkill matchbox_server` and restart it, and
   always use FRESH room codes per test (rooms remember dead peers).
+- **`RollbackOrdered` MUST be reset when a GGRS session is rebuilt**, and this
+  one is a landmine. bevy_ggrs mixes `RollbackOrdered::order(rollback)` — a
+  global, monotonically increasing registration index — into the PER-COMPONENT
+  checksum (`snapshot/component_checksum.rs`, "Hashing the rollback index
+  ensures this hash is unique and stable"), and the resource's own doc says it
+  keeps entries "even if they have since been deleted". So the checksum of a
+  pawn depends not on the pawn but on **how many rollback entities this peer has
+  ever spawned**, over the whole life of the process. Two peers rebuilding a
+  session from one agreed world therefore desync unless they happen to have
+  spawned the same number of entities getting there. The original warmup→p2p
+  swap survives only by that coincidence — every peer's warmup is the same one
+  pawn and the same cover. Restoring a stored match into the warmup breaks the
+  coincidence, and the symptom is maddening: byte-identical worlds, both peers
+  logging the same round and the same pawn count, and `DESYNC at frame 50`.
+  `finalize_p2p_session` now inserts a fresh `RollbackOrdered` between the
+  teardown and the respawn, which is safe precisely because it is between
+  sessions.
+- **matchbox's `connected_peers()` is NOT the test for "can I reach this peer"**
+  once a match is running. Measured: a browser tab that reloaded into a room
+  with a match already in progress sat for 150 seconds with `connected_peers()`
+  reporting NOBODY, while reading lobby messages — the whole rejoin handshake —
+  from the very peer it was waiting for. matchbox raises `PeerState::Connected`
+  only once EVERY channel of the socket has opened (`wait_for_ready` awaits them
+  in turn), which is the likeliest reason a mid-match arrival never trips it.
+  `net.rs`'s `reachable()` uses "we have received a packet from them" instead,
+  which is direct evidence rather than an aggregate flag.
+- **`?ice=none` does not work in a browser** and never has. It produces an ICE
+  server entry with an empty `urls` list, and Chrome rejects the whole
+  `RTCPeerConnection` construction with `SyntaxError: ICE server parsing failed:
+  Empty uri` — which then cascades into a `RefCell already borrowed` panic from
+  the wasm-bindgen executor, so the real error is several screens up. Native
+  (webrtc-rs) tolerates it, which is why the flag reads as working. Fixing it
+  means patching the vendored matchbox (`wasm.rs` wraps the config in a
+  one-element list unconditionally); browser tests use default STUN instead.
 - **Warmup → p2p session swap** (`client/src/net.rs`): with a `room`, the
   client starts a 1-player synctest immediately (playable while waiting).
   When the match starts, `run_lobby` despawns all `Rollback` entities,
@@ -1188,6 +1314,39 @@ need a TURN server eventually.
   byte-identical for tens of seconds. The kills-and-rounds tests passed through
   all three, happily reporting a decided match. Without the friendly-fire fix it
   reports **50 seconds frozen and 3 rounds**; with it, 6 seconds and 7 rounds.
+- **`sim/tests/persist.rs`** — the save/restore half of "coming back", in a real
+  synctest session at `check_distance(2)` like `combat.rs`. Two promises, and
+  they fail completely differently: that a restored world is the world that was
+  saved (compared as BLOBS, so a new field has to survive this the day it is
+  added rather than the day somebody remembers to assert on it), and that a
+  restored world is a legal starting point for a LOCKSTEP session — one blob
+  decoded twice into two independent apps, played 600 ticks off identical
+  inputs, compared EVERY tick, because two worlds that diverge and re-converge
+  would pass an end-state check while being exactly the bug. Also covers the
+  disconnected-player rules directly: a blank input holds your ground and your
+  stance, an absent player is still killable, and the bots survive whoever holds
+  the dial dropping out.
+- **`tools/persist-web.sh [all|refresh|rejoin|control]`** — the same feature in a
+  real browser, which is the only place it actually lives (a native build does
+  not have a window to refresh). `refresh` is offline and reliable: walk off the
+  post, go prone, reload, prove the world that comes back is the stored one.
+  `rejoin` is two tabs in a room with one refreshing mid-match. `control` is the
+  BASELINE and not a test of this feature at all — read it first.
+  **Browser-to-browser p2p in this repo desyncs at frame 10 with nobody
+  refreshing, no bots, on `main`** (verified by stashing this branch entirely
+  and rebuilding). That is a real pre-existing bug and a separate
+  investigation; until it is fixed, "did the resume desync" is not a question
+  this environment can answer, so `rejoin` REPORTS desyncs rather than asserting
+  on them, and asserts instead what it can prove: the returning player is
+  recognised by its stored id, exactly one peer answers, both move to the next
+  generation, and both restore the same round from the same blob.
+  Needs a current `_site` (`tools/build-web.sh`) and `AG_NODE_PATH`, same as
+  `grass-shots.sh`.
+- **`tools/rejoin-test.sh`** — the native two-process equivalent, and **it has
+  never been run**: a native build launched from a shell with no window-server
+  session never runs a frame at all (winit gets no event loop, so Startup never
+  fires), and a binary from `main` behaves identically. It needs a terminal that
+  can open windows.
 - Native smoke: run without a room (synctest re-simulates every frame — it
   catches nondeterminism AND rollback-unsafe state immediately).
 - Web smoke: `tools/build-web.sh` + local http.server + headless chromium

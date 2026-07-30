@@ -27,6 +27,9 @@ web-sys = { version = "0.3", optional = true, features = [
     "Location",
     "Navigator",
     "Clipboard",
+    # Who this browser is between page loads, and the match it was in the
+    # middle of — see `persist.rs`.
+    "Storage",
     # The loader's <body data-game-ready> handshake.
     "Document",
     "Element",

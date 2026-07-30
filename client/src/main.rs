@@ -9,6 +9,7 @@ mod input;
 mod menu;
 mod nameplate;
 mod net;
+mod persist;
 mod render;
 mod spectate;
 mod stance;
@@ -41,6 +42,12 @@ pub enum AppState {
 fn main() {
     let launch = net::launch_config();
     info!("launch config: {launch:?}");
+    // Read (or mint) this browser's stable id before anything else: it is what
+    // the lobby introduces us as on its very first frame, and it is the only
+    // thing about us that survives a refresh — matchbox hands out a fresh
+    // PeerId per connection.
+    let identity = persist::Identity::load(&launch);
+    info!("player id: {}", identity.player);
 
     let mut app = App::new();
     app.add_plugins(
@@ -81,6 +88,7 @@ fn main() {
             .unwrap_or_default(),
     )
     .insert_resource(launch)
+    .insert_resource(identity)
     // Which side this player is asking for. Nothing seeds it from the URL: it
     // is a mid-match choice, not a launch setting, and `round::balance` may well
     // overrule it anyway.
@@ -113,12 +121,33 @@ fn main() {
     .add_systems(
         Update,
         (
-            // finalize BEFORE the lobby: the two run a frame apart so
-            // bevy_ggrs gets its no-session reset tick between warmup and p2p.
-            (hud::read_start_input, net::finalize_p2p_session, net::run_lobby)
-                .chain()
-                .run_if(in_state(AppState::Connecting)),
+            // Session bring-up, and the same machinery again for every rejoin.
+            //
+            // `finalize` goes FIRST, ahead of everything that can tear a world
+            // down, so the two always land a frame apart — bevy_ggrs needs a
+            // tick with no session at all to reset its frame counter and
+            // snapshot state, and that gap is what it is for.
+            //
+            // Only `run_lobby` is still lobby-shaped. The rest run in a match
+            // too, because a rejoin is a session bring-up in the middle of one:
+            // `run_room` works the reliable channel throughout, `serve_rejoin`
+            // answers a returning player by capturing the world, and
+            // `adopt_pending_go` is where any peer — including the one that
+            // issued it — acts on a `go:`.
+            (
+                hud::read_start_input.run_if(in_state(AppState::Connecting)),
+                net::finalize_p2p_session,
+                net::run_room,
+                net::run_lobby.run_if(in_state(AppState::Connecting)),
+                net::serve_rejoin,
+                net::adopt_pending_go,
+            )
+                .chain(),
             net::log_ggrs_events.run_if(in_state(AppState::InGame)),
+            // Write the match down a few times a second. Ordered after the
+            // bring-up chain so it never photographs the half-frame between a
+            // teardown and the session that replaces it.
+            persist::autosave.after(net::adopt_pending_go),
             (
                 hud::update_player_list,
                 hud::update_status_text,

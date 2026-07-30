@@ -11,11 +11,12 @@ use bevy_ggrs::{LocalInputs, LocalPlayers};
 use army_ghosts_sim::{PlayerInput, Scenario, BTN_ADS, BTN_FIRE};
 
 use crate::ads::Ads;
+use crate::net::MatchRoom;
 use crate::stance::StanceControl;
 use crate::touch::TouchControls;
 use crate::SessionConfig;
 
-// A bevy system takes one parameter per thing it reads; nine is what this one
+// A bevy system takes one parameter per thing it reads; ten is what this one
 // legitimately reads.
 #[allow(clippy::too_many_arguments)]
 pub fn read_local_inputs(
@@ -26,21 +27,43 @@ pub fn read_local_inputs(
     stance: Res<StanceControl>,
     local_players: Res<LocalPlayers>,
     scenario: Res<Scenario>,
+    room: Option<Res<MatchRoom>>,
     bots: Res<crate::menu::BotCount>,
     aggro: Res<crate::menu::Aggression>,
     side: Res<crate::menu::SidePick>,
 ) {
+    let room = room.as_deref();
+    // Which of our local handles is US. In a p2p match every VACANT seat is
+    // also local (see `net::Seat`), and `LocalPlayers` is in no order worth
+    // relying on — so picking "the first one" would hand the joystick to the
+    // pawn of somebody who has left. Offline, every handle is local and the
+    // first is the player.
+    let mine = room.map(|room| room.me);
+    // Exactly one client sends the match-wide dials, and it cannot simply be
+    // handle 0 any more: that seat may be empty. See `MatchRoom::dial_holder`.
+    let dial_holder = room.and_then(MatchRoom::dial_holder).unwrap_or(0);
+
     let mut local_inputs = HashMap::new();
     // Inputs drive the *first* local handle; any additional local handles
     // (synctest mode simulates every player locally) stay idle.
     let mut first = true;
     for handle in &local_players.0 {
         let mut input = PlayerInput::default();
-        // The bot count rides on handle 0's input and only handle 0's — that
-        // is the copy `reconcile_bots` honours. Sent every tick as an absolute
+        // A seat whose player has gone. Every peer holds it Local and every
+        // peer must therefore produce the IDENTICAL input for it, or the same
+        // handle diverges between peers with nothing on the wire to catch it
+        // but a checksum. Blank is that input — and blank now means "asking for
+        // nothing", so the pawn stands exactly where it was left, still solid
+        // and still shootable, until its player comes back.
+        if room.is_some_and(|room| room.vacant(*handle)) {
+            local_inputs.insert(*handle, input);
+            continue;
+        }
+        // The bot count rides on one player's input and only theirs — that is
+        // the copy `reconcile_bots` honours. Sent every tick as an absolute
         // number, not a "+1" edge, so replaying a tick reconciles to the same
         // world however many times rollback runs it.
-        if *handle == 0 {
+        if *handle == dial_holder {
             input.set_bots(bots.0 as u8);
             // Same channel, same reasoning: an absolute level every tick, so a
             // replayed frame dials the bots to the same place. Unlike the bot
@@ -48,7 +71,7 @@ pub fn read_local_inputs(
             // what makes turning it mid-match do anything.
             input.set_aggression(aggro.0);
         }
-        if first {
+        if mine.map_or(first, |me| *handle == me) {
             // Which side this player wants. Unlike the two dials above it goes
             // on the FIRST LOCAL handle rather than on handle 0, because it is a
             // statement about whoever is holding the phone — and every player's

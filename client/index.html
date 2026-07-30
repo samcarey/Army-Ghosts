@@ -163,6 +163,9 @@
       const bots = p.get('bots') || '';
       const aggro = p.get('aggro') || '';
       const ice = p.get('ice') || '';
+      // ?resume=0 turns off picking up the match this browser was in the
+      // middle of (persist.rs). Anything else, including absent, leaves it on.
+      const resume = p.get('resume') || '';
       // Dev measuring rig, offline only (net.rs ignores it with a room set):
       // ?scenario=strip[:depth[:east stance]] — see sim's `Scenario`.
       const scenario = p.get('scenario') || '';
@@ -182,7 +185,7 @@
          : isTailnet ? 'wss://' + location.hostname + ':9451'
          : isCaddy ? 'wss://' + location.host + '/ws'
                    : 'wss://army-ghosts.dev.whoeverwants.com:7443/ws');
-      window.__AG_NET__ = { room, players, bots, aggro, signaling, ice, scenario };
+      window.__AG_NET__ = { room, players, bots, aggro, signaling, ice, scenario, resume };
       if (room) {
         document.getElementById('room').textContent =
           'multiplayer · room ' + room + (players ? ' · ' + players + ' players' : '');

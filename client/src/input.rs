@@ -1,14 +1,15 @@
 //! Local input collection → the `PlayerInput` structs GGRS sends each tick.
-//! Touch (joystick + fire button + the bevy_ui buttons) is the real control
-//! scheme; the keyboard equivalents keep the desktop dev loop and the headless
-//! tests usable: WASD/arrows move, Space fires, Shift toggles sights, C goes
-//! down a stance and V gets back up.
+//! Touch (two sticks + the bevy_ui buttons) is the real control scheme; the
+//! keyboard equivalents keep the desktop dev loop and the headless tests
+//! usable: WASD/arrows move, Space fires, Shift toggles sights, C goes down a
+//! stance and V gets back up. The keyboard has no second stick, so it steers
+//! the barrel by walking — see `PlayerInput::aim`.
 
 use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
 use bevy_ggrs::{LocalInputs, LocalPlayers};
 
-use army_ghosts_sim::{PlayerInput, Scenario, BTN_ADS, BTN_FIRE};
+use army_ghosts_sim::{Facing, Player, PlayerInput, Scenario, BTN_ADS, BTN_FIRE};
 
 use crate::ads::Ads;
 use crate::net::MatchRoom;
@@ -31,6 +32,7 @@ pub fn read_local_inputs(
     bots: Res<crate::menu::BotCount>,
     aggro: Res<crate::menu::Aggression>,
     side: Res<crate::menu::SidePick>,
+    facings: Query<(&Player, &Facing)>,
 ) {
     let room = room.as_deref();
     // Which of our local handles is US. In a p2p match every VACANT seat is
@@ -99,6 +101,25 @@ pub fn read_local_inputs(
             }
             input.move_x = x.clamp(-127, 127) as i8;
             input.move_y = y.clamp(-127, 127) as i8;
+            // Where the barrel points. **A player with an aim stick must state
+            // an aim on EVERY tick, including the ticks their right thumb is
+            // off the glass**, or the sim's fallback quietly hands the barrel
+            // back to the move stick and the left thumb starts steering — which
+            // is exactly what it did, and exactly what a twin-stick player does
+            // not expect. The fallback is for producers that genuinely have no
+            // second stick: the keyboard, the bots, the harness.
+            //
+            // With the thumb off, the aim asked for is the pawn's OWN current
+            // facing, which is a deliberate no-op — "go on pointing where you
+            // are". Reading it back out of the world rather than remembering it
+            // here means there is no second copy to drift, and no question about
+            // what to send on the first tick of a match.
+            let facing = facings.iter().find(|(p, _)| p.handle == *handle).map(|(_, f)| *f);
+            if let Some(aim) = aim_request(&touch, facing) {
+                // Length is never read, so the clamp is just a safe cast.
+                input.aim_x = (aim.x * 127.0).clamp(-127.0, 127.0) as i8;
+                input.aim_y = (aim.y * 127.0).clamp(-127.0, 127.0) as i8;
+            }
             if keys.pressed(KeyCode::Space) || touch.firing {
                 input.buttons |= BTN_FIRE;
             }
@@ -122,4 +143,63 @@ pub fn read_local_inputs(
         local_inputs.insert(*handle, input);
     }
     commands.insert_resource(LocalInputs::<SessionConfig>(local_inputs));
+}
+
+/// What this player is asking their barrel to do, or `None` for "not asking" —
+/// which the sim reads as *steer by walking* (`PlayerInput::aim`).
+///
+/// **A player with an aim stick must state an aim on EVERY tick, including the
+/// ones their right thumb is off the glass.** Leaving it blank hands the barrel
+/// back to the move stick through that fallback, and the left thumb starts
+/// steering — which it did, and which is not what a twin-stick player expects
+/// from a walk. The fallback exists for producers that genuinely have no second
+/// stick: the keyboard, the bots, the self-play harness.
+///
+/// With the thumb off, what a touch player asks for is their pawn's OWN current
+/// facing — a deliberate no-op meaning "go on pointing where I am". Reading it
+/// back out of the world beats remembering it here: there is no second copy to
+/// drift, and no question about what to send on the first tick of a match. It is
+/// idempotent for the same reason, so re-sending it every tick lands the pawn on
+/// the same bearing however often rollback replays the frame.
+fn aim_request(touch: &TouchControls, facing: Option<Facing>) -> Option<Vec2> {
+    if !touch.touch_seen {
+        return None;
+    }
+    if touch.aim_vec != Vec2::ZERO {
+        return Some(touch.aim_vec);
+    }
+    Vec2::new(facing?.x as f32, facing?.y as f32).try_normalize()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The left stick must never steer. It did, because a blank aim is the
+    /// sim's "aim where I'm walking" and a lifted right thumb sent exactly that.
+    #[test]
+    fn a_player_with_an_aim_stick_always_states_an_aim() {
+        let facing = Some(Facing { x: 127, y: 0 });
+
+        // No touch has ever happened: this is a keyboard, and it steers by
+        // walking on purpose. Saying anything here would break the dev loop and
+        // every headless test with it.
+        let keyboard = TouchControls::default();
+        assert_eq!(aim_request(&keyboard, facing), None);
+
+        // A thumb has been on the glass, but not on the aim stick this tick. The
+        // pawn's own facing is what gets asked for — a no-op, and crucially NOT
+        // nothing, because nothing is what let the walk take over.
+        let walking = TouchControls { touch_seen: true, ..default() };
+        assert_eq!(aim_request(&walking, facing), Some(Vec2::new(1.0, 0.0)));
+
+        // Right thumb down: that wins, whatever the pawn is currently doing.
+        let aiming =
+            TouchControls { touch_seen: true, aim_vec: Vec2::new(0.0, 1.0), ..default() };
+        assert_eq!(aim_request(&aiming, facing), Some(Vec2::new(0.0, 1.0)));
+
+        // Before the pawn exists there is nothing to hold onto, and asking for a
+        // guess would snap a fresh pawn off its spawn bearing.
+        assert_eq!(aim_request(&walking, None), None);
+    }
 }

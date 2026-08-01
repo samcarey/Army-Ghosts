@@ -1,10 +1,18 @@
-//! Aim down sights: a bottom-center toggle button (crosshair ring) that roots
-//! the player in place, pushes the camera forward along their facing so they
-//! can see what they're shooting at, and draws the line the shot would take.
+//! Aim down sights: a right-edge toggle button (crosshair ring) that steadies
+//! the weapon and slows the player to `ADS_SPEED` of their pace, pushes the
+//! camera forward along their facing so they can see what they're shooting at,
+//! and draws the line the shot would take.
+//!
+//! It used to stop the player dead. It doesn't any more — the sway model
+//! already prices moving while aiming, and `Aim::stir` already gives a mover
+//! away in the grass, so rooting the pawn on top of those was charging for one
+//! decision three times and removing the choice rather than pricing it. You can
+//! now walk your weapon onto a target; you just do it at a pace anyone watching
+//! has time to react to.
 //!
 //! The state is purely local UI state ([`Ads`]); it reaches the deterministic
 //! sim only as the `BTN_ADS` bit that `input.rs` puts in the outgoing
-//! `PlayerInput`, so every peer applies the movement lock from the same input
+//! `PlayerInput`, so every peer applies the slow from the same input
 //! stream. The camera shift and the aim line are render-only.
 
 use bevy::prelude::*;
@@ -26,10 +34,18 @@ const ADS_EASE_SECS: f32 = 0.5;
 /// snap with it.
 const AIM_TURN_TAU: f32 = 0.12;
 
-/// Button diameter / icon size / distance above the bottom edge, logical px.
+/// Button diameter / icon size, logical px, and where it sits: the right edge,
+/// clear above the aim stick's usual thumb arc. It is on the side the trigger is
+/// on because raising the sights is a shooting decision — the left thumb is
+/// walking and should never have to leave the stick to take one.
 const BUTTON_SIZE: f32 = 76.0;
 const ICON_SIZE: f32 = 54.0;
-const BOTTOM_OFFSET: f32 = 22.0;
+/// High enough to clear the arc a planted aim thumb sweeps: a touch that lands
+/// on a button is skipped outright (`touch::on_ui_button`), so a crosshair
+/// sitting where thumbs come down would cost the player their aim stick for the
+/// length of a drag as well as flipping their sights.
+const RIGHT_OFFSET: f32 = 20.0;
+const BOTTOM_OFFSET: f32 = 190.0;
 
 /// The aim line: thin, white, and drawn above everything standing in the field
 /// but below bullets and their trails (see the `Z_*` ladder in `render.rs`).
@@ -112,10 +128,8 @@ pub fn setup_ads(mut commands: Commands, assets: Res<AssetServer>) {
     commands
         .spawn(Node {
             position_type: PositionType::Absolute,
-            left: Val::Px(0.0),
-            right: Val::Px(0.0),
+            right: Val::Px(RIGHT_OFFSET),
             bottom: Val::Px(BOTTOM_OFFSET),
-            justify_content: JustifyContent::Center,
             ..default()
         })
         .with_children(|row| {

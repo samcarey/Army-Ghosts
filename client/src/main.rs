@@ -162,7 +162,7 @@ fn main() {
             (hud::copy_link_pressed, hud::tick_copied_flash).chain(),
             menu::menu_interactions,
             menu::update_dial_labels,
-            (touch::read_touches, touch::update_overlay).chain(),
+            (touch::read_touches, touch::update_overlay, touch::update_trigger_bar).chain(),
             // advance_ads owns the aim transition; the aim line and the camera
             // shift both read it, so they follow it in the same frame.
             (

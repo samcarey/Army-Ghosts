@@ -102,14 +102,19 @@ nothing.
 
 ### Netcode model
 
-- **bevy_ggrs rollback**: peers exchange only `PlayerInput` (4 bytes:
-  quantized i8 move x/y, a `buttons` bitflag byte, and a `dials` byte carrying
+- **bevy_ggrs rollback**: peers exchange only `PlayerInput` (6 bytes:
+  quantized i8 move x/y, quantized i8 **aim** x/y, a `buttons` bitflag byte, and
+  a `dials` byte carrying
   bot aggression in bits 0-3 and this player's team request in bits 4-5, with 6-7
   spare), each peer simulates everything. Everything in both flag bytes is an
   ABSOLUTE value re-sent every tick, never an edge — see the stance and bot
   notes below for why rollback makes that the only workable choice.
   **Every multi-bit field encodes `1 + value`, so ZERO MEANS "NOT ASKING"** —
-  stance, bot count, aggression and the team request alike. That is not
+  stance, bot count, aggression and the team request alike, and the aim vector
+  for the same reason by a different route (`PlayerInput::aim` falls back to the
+  move vector, which is what `Facing` used to be outright, so every producer of
+  an input that predates the second stick — bots, keyboard, harness, every test
+  in the repo — keeps pointing exactly where it did). That is not
   tidiness. `PlayerInput::default()` is exactly what GGRS substitutes for a
   DISCONNECTED player (`sync_layer::synchronized_inputs` returns
   `T::Input::default()` from the disconnect frame on), so the all-zero encoding
@@ -136,14 +141,84 @@ nothing.
   both are bevy_ui `Button`+`Interaction`, which handles touch natively).
   `touch.rs` skips any touch that starts on a visible bevy_ui `Button`
   (`ComputedNode::contains_point`, in PHYSICAL px — multiply by
-  `window.scale_factor()`), because the joystick and fire zones are generous
+  `window.scale_factor()`), because the two stick zones are generous
   enough to swallow the sights/stance buttons otherwise; ask the UI where its
   buttons are rather than keeping a second copy of the layout. Same reason
   `read_start_input` ignores a tap while any button reads `Pressed`.
-- **Aim down sights** (`client/src/ads.rs`): bottom-center crosshair toggle
+  **`START_BAND_Y` is logical pixels UP FROM THE BOTTOM EDGE, not a fraction of
+  the height**, and it hugs the START pill's own row. As a fraction ("everything
+  below 0.62") it was fine while the right thumb's home was a fire button off to
+  one side of it, and stopped being fine the moment that thumb got a floating
+  stick: a stick anchors wherever it lands, its natural home is the bottom
+  centre-right, and the host walking around during warmup would have started the
+  match by planting it. Laying the band out in the same units as the pill is
+  what stops the two drifting apart on a screen of a different shape.
+- **Controls: two sticks, and the trigger is the far end of one of them**
+  (`client/src/touch.rs`). Left thumb walks, right thumb turns the barrel, and
+  dragging the right one out to its rim (`AIM_RADIUS`) fires. Everything else is
+  a bevy_ui button: the sights on the right edge above the aim thumb's arc, and
+  the stance chevrons at the bottom CENTRE, the way down pinned to the bottom
+  edge of the screen where a thumb finds it without looking.
+  * **Firing is a stick position, not a button**, and the reason is the accuracy
+    model. A thumb that has to leave the stick to shoot cannot turn while
+    shooting — which is the one thing `Aim::swing` exists to charge for, so a
+    scheme that made traverse-and-fire physically impossible would have quietly
+    refunded the whole mechanic. It also takes pixel-precise thumb work out of a
+    firefight: the whole right half of the screen is the control.
+  * **Only the aim vector's DIRECTION reaches the sim; its length is spent on
+    the trigger.** So aim is honoured at any deflection past `AIM_DEAD` and the
+    remaining travel is free to mean something else. Inside the dead zone the
+    barrel HOLDS where it was; only a lifted thumb releases it. Falling back at
+    the centre would whip the aim to the movement heading every time a player let
+    off the trigger by pulling in, and `Aim::swing` would charge them for the
+    whip — an accuracy tax for stopping shooting.
+  * **A player with an aim stick states an aim on EVERY tick, including the ticks
+    their right thumb is off the glass** (`input::aim_request`). This is not
+    tidiness, it is the fix for a real bug: leave `aim_*` blank and the sim's
+    fallback hands the barrel back to the move stick, so **the left thumb starts
+    steering** — which is exactly what a twin-stick player does not expect from a
+    walk. With the thumb off, what gets asked for is the pawn's OWN current
+    facing: a deliberate no-op, read back out of the world rather than remembered
+    on the client, so there is no second copy to drift and no question about what
+    to send on the first tick of a match.
+    `TouchControls::touch_seen` exists solely to tell the two kinds of producer
+    apart, because "does this player have a second stick" is a fact about the
+    hardware and not about the world.
+  * **The trigger bar rides the stick rather than sitting in a corner.** The
+    stick has no fixed home — it is anchored wherever the thumb landed — and a
+    progress bar that is not beside the thing making progress is a readout the
+    player has to go looking for mid-firefight. It is bevy_ui rather than a
+    camera-child sprite because it carries a word, and the word is the whole
+    reason a player knows what the loading bar is for. It fills right-to-left,
+    from the thumb's own side of the stick toward the far one, and both it and
+    the knob light up on the shot.
+  * It is the one piece of HUD that is not a `Button`, so it has to name itself
+    in `nameplate.rs`'s `HudBoxFilter` or an edge plate will sit on it.
+- **Aim down sights** (`client/src/ads.rs`): right-edge crosshair toggle
   (also Shift on a keyboard). The toggle is local UI state; it reaches the sim
-  only as the `BTN_ADS` input bit, which roots the pawn in place (the stick
-  still turns it) so every peer applies the lock from the same input stream.
+  only as the `BTN_ADS` input bit, which SLOWS the pawn to `ADS_SPEED` (45%) of
+  its stance's pace, so every peer applies the slow from the same input stream.
+  * **It used to stop the pawn dead, and that was one price too many.** The sway
+    model already charges for moving while aiming (the movement term in
+    `Aim::settled`), and `Aim::stir` already gives a mover away in the grass — so
+    rooting the shooter on top of those was charging for one decision three times
+    and removing the choice rather than pricing it. You can now walk a weapon
+    onto a target; you do it at a pace anyone watching has time to react to.
+  * **`ADS_SWAY` multiplies the WHOLE settled hold, movement term included**, and
+    that is what makes the change safe. `Aim::settled` used to RETURN EARLY on
+    `ads`, skipping the movement term — exactly right while the sights rooted you
+    and `speed` was therefore always zero, and a free perfect shot on the move
+    the instant they didn't. Measured now (of 256): planted with sights 59,
+    walking with sights 73, walking hip-fired 163, standing still hip-fired 133.
+    Read the last two together — walking aimed beats standing unaimed, which is
+    why anyone raises the sights while closing at all.
+    `walking_with_the_sights_up_is_steadier_than_walking_without_them` pins the
+    ordering rather than the numbers, so it survives tuning.
+  * **The bots stopped needing the bit to mean "rooted".** `engage` used to set
+    `BTN_ADS` purely to plant a bot, because the move vector doubled as the aim
+    and zeroing it would have pointed the rifle at the ground. With aim on its own
+    axis a bot says "walk nowhere, point there" directly — which is what freed
+    the sights to mean only what they say.
   Everything else is render-only: the camera slides `ADS_SHIFT` (200 world
   units — half a "normal" mobile screen, deliberately fixed rather than
   window-relative) along the facing, smoothstepped over 500 ms, and a thin
@@ -295,8 +370,42 @@ nothing.
     trigger policy for a VISIBLE bot that beats "fire whenever anything might
     land". What a hidden bot loses by firing is its concealment, which is why
     the discipline gate binds exactly while hidden and never after (see Bots).
+- **Which way you are walking costs speed** (`sim/src/lib.rs` `heading_scale`,
+  `STRAFE_SPEED` 75%, `BACKPEDAL_SPEED` 56%): full pace straight ahead, linear in
+  the cosine between, so a forward diagonal keeps 93% and a backward one 62%.
+  Measured out of 256: ahead 256, fore-diagonal 237, square 192, back-diagonal
+  159, back 144.
+  * **This only became a question when aiming split off movement.** While
+    `Facing` WAS the move vector there was no such thing as walking sideways —
+    you pointed wherever you walked, by construction, and every step was a
+    forward step. A second stick makes strafing and backpedalling expressible,
+    and a game about creeping through grass should not let a player retreat from
+    a firefight as fast as they advanced into it with their sights on it the
+    whole way. It stacks multiplicatively with the stance and with `ADS_SPEED`:
+    all three are fractions of a pace.
+  * **It is measured against the INPUT's own aim, not the `Facing` component**,
+    which keeps `step`/`step_speed` a pure function of `(input, stance)` — the
+    property that stops the movement and the aim model disagreeing about how fast
+    a pawn is going. Reaching for a component would have put `settle_aim` in the
+    position of needing a `Facing` it does not query, and made the answer depend
+    on system order.
+  * **Anything that steers by walking pays exactly nothing**, and *exactly* is
+    load-bearing: for a bot, the keyboard or a test, `aim()` falls back to the
+    move vector, so the cosine is a vector with itself and comes out at precisely
+    `FP` with no rounding slack. A whole-game slowdown of a percent or two would
+    be invisible in review and would move every number the harness has ever
+    printed.
+  * **The first version DID reach the bots, and `a_match_never_stops_moving_
+    around_an_idle_player` caught it — its seventh distinct cause** (a 62-second
+    freeze). `Act::Push` walked at the target's TRUE position while aiming at its
+    led, jittered estimate, so the leftover angle between the two became a
+    movement tax that grew with the bot's own aim error: **one dial secretly
+    steering two things**, the same mistake `ADVANCE` was carved out of
+    `aggression` to undo. The fix is in the Bots section — a bot walks where it
+    looks — and what survives is a real strafe: a bot sidestepping a boulder
+    (`veer`) while holding its rifle on the enemy genuinely moves at 75%.
 - **Stance** (`sim/src/lib.rs` `Stance` + `client/src/stance.rs`): standing /
-  crouching / prone, driven by the two chevron buttons on the right edge (or
+  crouching / prone, driven by the two chevron buttons at the bottom centre (or
   C to go down, V to get up). What crosses the wire is the *level* the player
   is asking for, in bits 2-3 of the input byte, re-sent every tick — NOT a "go
   down one" edge. Rollback replays a tick as often as it likes, so an edge
@@ -353,8 +462,8 @@ nothing.
     scoreboard line and a diagnostic.
   * **PAWNS ARE SOLID** (`separate_players`), and the reason is worth keeping.
     Nothing used to stop two pawns occupying the same subunit, and that turned
-    out to be a *stable trap*: `Act::Fight` roots a bot with the same bit the
-    sights button sets, so two that closed to nothing could never walk apart —
+    out to be a *stable trap*: `Act::Fight` roots a bot (with the same bit the
+    sights button set, in those days), so two that closed to nothing could never walk apart —
     and could never shoot each other either, because a round is born
     `PLAYER_R + BULLET_R + 2` (16) units down the barrel and a target 1.6 units
     away spans only to 15.6, so every shot was born past it and flew away.
@@ -758,6 +867,30 @@ nothing.
     still for **38 seconds** and got through 4 rounds in 90 instead of 7.
     Scoring the *shot* closes the loop: a bot that cannot hit from where it
     stands scores `not(worth)` on `Push` and walks in until it can.
+  * **A BOT WALKS WHERE IT LOOKS**, and the override that used to break that had
+    to go for two independent reasons. `Act::Push` re-pointed the FEET at the
+    target's true position after `engage` had aimed both feet and barrel at its
+    led, jittered estimate. While the move vector doubled as the aim, that
+    overwrote `engage`'s entire model with a dead-on bearing — so a closing bot
+    shot straighter than its own profile allowed, and **`accuracy` was partly
+    inert exactly while the range was still long enough for it to matter**. Then,
+    once the axes were split and walking off your own facing started costing
+    speed (`STRAFE_SPEED`), the leftover angle between feet and barrel turned
+    into a movement tax that grew with the bot's own aim error — one dial
+    steering two things again, and a 62-second freeze in the idle-player test.
+    Deleting the override settles both: one direction, one meaning. Measured over
+    40 matches: 2230 kills → 2192, mean round 24.5 s → 25.3, draws 44 of 360 →
+    36. A bot now walks toward where it THINKS the enemy is, which is the more
+    honest model anyway — and with leading on, walking at the lead point is
+    walking to intercept.
+    **It does NOT visibly move the dial landscape, which was worth checking
+    rather than assuming** — the obvious prediction is that `accuracy` should
+    bite harder once a closing bot actually pays for it, and 60-pair runs either
+    side of the fix cannot see it: `accuracy=0.4` reads -350 elo before and -152
+    after, and those are 2-of-17 and 10-of-34 decisive pairs whose confidence
+    intervals (3.3-34.3% and 16.8-46.2%) overlap; `skill=0.2` goes +20 to +44,
+    undecided both times. Read that as "unchanged within what the instrument can
+    see", not as either number being real.
   * **`worth` is computed from the SETTLED cone, not the live one.** Using the
     live one reads as sound and is a feedback loop: moving widens the cone, a
     wide cone raises `Push`, and `Push` moves — so once a bot started closing it
@@ -793,7 +926,9 @@ nothing.
       on a different SUBUNIT, so exact inequality is true every tick while it
       goes nowhere.
     - **It must ask `step_speed`, not whether the move vector is non-zero** —
-      the move vector doubles as the AIM direction, so an aiming bot (rooted by
+      a bot leaves `aim_x/aim_y` at zero and therefore still steers its barrel
+      by walking (the fallback in `PlayerInput::aim`; humans have a second stick
+      and bots do not), so an aiming bot (rooted by
       `BTN_ADS`) trivially "never moves". Getting this wrong rotated every
       aiming bot's aim a quarter turn: two bots at point-blank firing at right
       angles to each other, forever.
@@ -829,7 +964,7 @@ nothing.
     none moving — `Act::Fight` roots the shooter, a free property of the
     behaviour list). The ambush gate deliberately reintroduced a minority of
     walking fire: an EXPOSED closer squeezing off taxed rounds is correct play
-    now, measured at ~12%. `bots_stop_before_they_shoot` pins a 25% ceiling —
+    now, measured at ~9%. `bots_stop_before_they_shoot` pins a 25% ceiling —
     walking spray as the rule rather than the taxed exception is the regression
     it guards.
   **The dial landscape after the full accuracy model is FLAT, and that is the
@@ -1541,6 +1676,14 @@ need a TURN server eventually.
   * `bots_stop_before_they_shoot` pins that walking fire stays a taxed MINORITY
     (≤25%; ~12% measured) — the ambush gate made some of it correct play, so
     the bound is a ceiling, not the zero it once was (see Bots).
+  * `the_aim_stick_turns_a_pawn_that_is_walking_the_other_way` pins the two
+    thumbs staying apart end to end — turning on the spot without walking,
+    walking without the barrel following, and a released aim stick going back to
+    steering by walk (which is the fallback everything else in the repo relies
+    on). It is in a session rather than a unit test because the turn is also
+    where `Aim::swing` is charged, and a traverse charge that didn't roll back
+    would be two peers disagreeing about how wide somebody's cone was — which
+    only ever surfaces later, as a death.
   * `running_in_grass_gives_you_away` and
     `swinging_the_aim_costs_accuracy_until_it_is_honed_back_in` (lib tests) pin
     the stir and swing mechanics with printed measurements: still 34/256 seen
@@ -1607,8 +1750,14 @@ need a TURN server eventually.
   grass tile. Notes for whoever edits it: it needs a CURRENT `_site` build
   (`tools/build-web.sh`) — it photographs the built wasm, not the source tree;
   playwright is not a repo dependency, so pass `AG_NODE_PATH=/path/to/node_modules`;
-  and `SHOT`'s crop is sized to clear the HUD (health bar and troop count above, the
-  sights button below, stance buttons right), so a HUD move needs it re-checked.
+  and `SHOT`'s crop is sized to clear the HUD (health bar and troop count above,
+  the STANCE COLUMN below), so a HUD move needs it re-checked — and one has
+  happened: the stance chevrons moved from the right edge, which the crop misses
+  by width, to the bottom centre, which it does not, so the rig's window had to
+  grow from 620 px tall to 760 to keep them out of frame. The crop is now
+  written as a half-size either side of the window's middle (where the rig parks
+  the camera), so it follows the window instead of being two more numbers to
+  keep in step.
 - **`tools/selfplay.sh [options]`** — the bot measuring rig: does profile A
   actually beat profile B? Eight bots in the real arena, four a side, playing
   **Ghost War rounds** — muster at opposite ends, two minutes or until one side

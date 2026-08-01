@@ -1,4 +1,4 @@
-//! Stance control: two round buttons on the right edge (get up / get down)
+//! Stance control: two round buttons at the bottom centre (get up / get down)
 //! that walk the local player between standing, crouching and prone, plus the
 //! label that says which one you are in.
 //!
@@ -15,12 +15,14 @@ use bevy_ggrs::LocalPlayers;
 
 use army_ghosts_sim::{Player, Stance, STANCE_CROUCH, STANCE_PRONE, STANCE_STAND};
 
-/// Button diameter / icon size, logical px, and where the column sits: right
-/// edge, clear above the fire button's reach.
+/// Button diameter / icon size, logical px, and where the column sits: bottom
+/// centre, between the two thumbs rather than under either of them. Getting down
+/// is the one control both hands are free to reach for, and it is the one worth
+/// reaching for in a hurry — so the way DOWN is the bottommost button on the
+/// screen, where a thumb finds it without looking.
 const BUTTON_SIZE: f32 = 62.0;
 const ICON_SIZE: f32 = 34.0;
-const RIGHT_OFFSET: f32 = 22.0;
-const BOTTOM_OFFSET: f32 = 172.0;
+const BOTTOM_OFFSET: f32 = 20.0;
 
 const IDLE_BG: Color = Color::srgba(0.10, 0.13, 0.07, 0.55);
 const IDLE_ICON: Color = Color::srgba(0.85, 0.92, 0.75, 0.65);
@@ -57,7 +59,8 @@ pub fn setup_stance(mut commands: Commands, assets: Res<AssetServer>) {
     commands
         .spawn(Node {
             position_type: PositionType::Absolute,
-            right: Val::Px(RIGHT_OFFSET),
+            left: Val::Px(0.0),
+            right: Val::Px(0.0),
             bottom: Val::Px(BOTTOM_OFFSET),
             flex_direction: FlexDirection::Column,
             align_items: AlignItems::Center,
@@ -65,6 +68,14 @@ pub fn setup_stance(mut commands: Commands, assets: Res<AssetServer>) {
             ..default()
         })
         .with_children(|column| {
+            // The label leads, because the buttons below it have nowhere to put
+            // it: the way down is pinned to the bottom edge of the screen.
+            column.spawn((
+                StanceLabel,
+                Text::new(""),
+                TextFont { font_size: 11.0, ..default() },
+                TextColor(Color::srgba(0.85, 0.92, 0.75, 0.75)),
+            ));
             // Up on top, down below — the pair reads as the ladder it is.
             for down in [false, true] {
                 column
@@ -99,12 +110,6 @@ pub fn setup_stance(mut commands: Commands, assets: Res<AssetServer>) {
                         ));
                     });
             }
-            column.spawn((
-                StanceLabel,
-                Text::new(""),
-                TextFont { font_size: 11.0, ..default() },
-                TextColor(Color::srgba(0.85, 0.92, 0.75, 0.75)),
-            ));
         });
 }
 

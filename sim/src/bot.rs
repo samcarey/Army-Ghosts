@@ -754,15 +754,16 @@ pub fn bot_think(
         // question is exactly "did I ask to walk, and did I get anywhere?",
         // with no extra bookkeeping.
         //
-        // It asks `step_speed`, NOT whether the move vector is non-zero, and
-        // the difference is the whole thing: **the move vector doubles as the
-        // AIM direction**, so a bot standing still and aiming (`engage` sets
-        // both the vector and `BTN_ADS`, which roots the pawn) has a non-zero
-        // vector and by definition never moves. Counting that as stuck made
-        // every aiming bot "stuck" within a third of a second and then rotated
-        // its aim a quarter turn — two bots at point-blank range firing at
-        // right angles to each other, forever. `step_speed` is the one place
-        // that knows rooted from walking.
+        // It asks `step_speed` rather than reading the move vector raw, and it
+        // is worth knowing what that used to be defending against: the move
+        // vector doubled as the AIM direction, so a bot standing still and
+        // aiming had a non-zero vector and by definition never moved. Counting
+        // that as stuck made every aiming bot "stuck" within a third of a second
+        // and then rotated its aim a quarter turn — two bots at point-blank
+        // range firing at right angles to each other, forever. `engage` now
+        // roots itself by asking for no walk at all, so the raw vector would
+        // answer correctly today; `step_speed` still knows about the stance
+        // change that also roots a pawn, which the raw vector never did.
         let tried_to_walk = crate::step_speed(&intent.0, stance) > 0;
         if !tried_to_walk {
             bot.stuck = 0;
@@ -1042,13 +1043,26 @@ fn decide(
             let inside = target
                 .map(|t| units(dist(pos, t.pos)) <= PUSH_STANDOFF)
                 .unwrap_or(true);
-            let mut intent = engage(bot, pos, target, stance, gun, friends, inside);
-            if let (false, Some(t)) = (inside, target) {
-                let (dx, dy) = toward(pos, t.pos);
-                intent.0.move_x = dx;
-                intent.0.move_y = dy;
-            }
-            intent
+            // **A bot walks where it looks.** `engage` has already pointed both
+            // the feet and the barrel at its led, jittered estimate of where the
+            // target is, and nothing here second-guesses it.
+            //
+            // There used to be an override that re-pointed the FEET at the
+            // target's true position, and it was quietly doing two harmful
+            // things. While the move vector doubled as the aim it threw
+            // `engage`'s whole model away — lead, `accuracy` jitter and all —
+            // replacing it with a dead-on bearing, so a closing bot shot
+            // straighter than its own profile allowed and `accuracy` was partly
+            // inert exactly while the range was long enough to matter. And once
+            // the axes were split and walking off your own facing started
+            // costing speed ([`crate::STRAFE_SPEED`]), the leftover angle
+            // between the two turned into a movement tax that grew with the
+            // bot's aim error — one dial secretly steering two things, which is
+            // the mistake `ADVANCE` was carved out of `aggression` to undo.
+            // Deleting it settles both: one direction, one meaning. Measured
+            // over 40 matches: 2230 kills → 2174, mean round 24.5 s → 25.0,
+            // draws 44 of 360 → 42.
+            engage(bot, pos, target, stance, gun, friends, inside)
         }
         Act::Break => {
             let mut intent = Intent::default();
@@ -1093,10 +1107,11 @@ fn decide(
     // step ALONG the obstacle survives in full and the bot slides round instead
     // of bouncing off and coming straight back. Reversing would do exactly that
     // bouncing, and picking a fresh side each tick would jitter on the spot.
-    // Never while aiming, for the reason spelled out at the stuck counter: the
-    // move vector is also the aim, and a rotated aim is a bot shooting at
-    // nothing. `bot.stuck` cannot climb while rooted anyway; this is the belt
-    // to that braces.
+    // It used to have to skip this whenever the bot was aiming, because the move
+    // vector was ALSO the aim and rotating it was a bot shooting at nothing.
+    // `Intent` carries the two separately now, so a quarter turn applied here
+    // moves only the feet — and a bot that has planted them asks to walk
+    // nowhere, which the next line skips on its own.
     if bot.blocked && !intent.0.ads() {
         let (mx, my) = (intent.0.move_x as i32, intent.0.move_y as i32);
         if mx != 0 || my != 0 {
@@ -1173,12 +1188,25 @@ fn engage(
     }
 
     let (dx, dy) = toward(pos, aim);
-    intent.0.move_x = dx;
-    intent.0.move_y = dy;
+    // The barrel goes on the AIM axis and the feet on the move one, which is
+    // the whole point of there being two. A bot that wants to stand and shoot
+    // now says exactly that — "walk nowhere, point there" — where it used to
+    // have to borrow the sights bit to root itself, because the move vector WAS
+    // the aim and zeroing it would have pointed the rifle at the ground.
+    //
+    // That borrowing is also why `BTN_ADS` could stop a pawn dead for as long
+    // as it did: the one caller who needed the root was the one caller who
+    // could not express it any other way. With the aim on its own axis the
+    // sights are free to mean only what they say, and they now merely slow you
+    // (see [`crate::ADS_SPEED`]).
+    intent.0.aim_x = dx;
+    intent.0.aim_y = dy;
     if hold {
-        // Rooted: the stick still turns the pawn, it just doesn't carry it
-        // anywhere. Same bit a player's sights button sets.
+        // Feet planted, weapon braced, waiting out its own sway.
         intent.0.buttons |= crate::BTN_ADS;
+    } else {
+        intent.0.move_x = dx;
+        intent.0.move_y = dy;
     }
     // Face them regardless. Three separate things have to be true before the
     // trigger goes, and they fail for different reasons:

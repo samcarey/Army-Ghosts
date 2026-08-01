@@ -23,13 +23,27 @@ const { chromium } = require('playwright');
 
 const [tableFile, outDir, baseUrl] = process.argv.slice(2);
 
-/// Tall enough that the crop below clears the HUD at top and bottom.
-const VIEW = { width: 900, height: 620 };
+/// Tall enough that the crop below clears the HUD at top and bottom. The height
+/// is set by the BOTTOM of the HUD, which is the taller end: the stance column
+/// stands 153 px off the bottom edge and the crop reaches 180 below the camera,
+/// so anything under ~706 puts a chevron in every frame. It was 620 while the
+/// stance buttons lived on the right edge, out of the crop's width entirely —
+/// see the note in CLAUDE.md's Testing section about re-checking this whenever
+/// the HUD moves, which is exactly what happened.
+const VIEW = { width: 900, height: 760 };
 /// The crop: centred on the camera, which the rig parks on the middle of the
-/// wall. Wide enough for both pawns (96 units apart at STRIP_ZOOM = 0.33, so
-/// ~291 px) with ground either side; clear of MENU/health bar/roster above and
-/// the sights button below.
-const SHOT = { x: 130, y: 130, width: 640, height: 360 };
+/// wall — so it is written as a half-size off the middle of the window rather
+/// than as corners, and stays centred whatever the window does. Wide enough for
+/// both pawns (96 units apart at STRIP_ZOOM = 0.33, so ~291 px) with ground
+/// either side; clear of MENU/health bar/roster above and the stance column
+/// below.
+const HALF = { x: 320, y: 180 };
+const SHOT = {
+  x: VIEW.width / 2 - HALF.x,
+  y: VIEW.height / 2 - HALF.y,
+  width: HALF.x * 2,
+  height: HALF.y * 2,
+};
 /// Camera lerp, TILE_EASE and the fog's move threshold.
 const SETTLE = 1200;
 
@@ -52,9 +66,14 @@ function readTable(text) {
   return { depths, alpha };
 }
 
+/// Playwright's own default is 30 s, which a 900x760 window of software-rendered
+/// grass does not reliably make — it started timing out partway through the
+/// sheet when the window grew to clear the relocated stance buttons.
+const SHOT_TIMEOUT = 120000;
+
 async function shoot(page, file) {
   await page.waitForTimeout(SETTLE);
-  await page.screenshot({ path: `${outDir}/${file}`, clip: SHOT });
+  await page.screenshot({ path: `${outDir}/${file}`, clip: SHOT, timeout: SHOT_TIMEOUT });
 }
 
 // One page per (depth, east stance): the east pawn's stance is baked into the

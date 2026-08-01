@@ -83,6 +83,9 @@ type HudBoxFilter = Or<(
     With<crate::hud::HealthBar>,
     With<crate::hud::PlayerListText>,
     With<crate::hud::BannerPill>,
+    // The trigger bar is not a `Button` — it is chrome that follows the aim
+    // thumb — so it has to name itself here or an edge plate will sit on it.
+    With<crate::touch::TriggerBar>,
 )>;
 
 /// Friendly green. Bright and slightly desaturated so it reads over both the

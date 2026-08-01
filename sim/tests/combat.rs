@@ -245,6 +245,151 @@ fn pawn(app: &mut App, handle: usize) -> (Pos, Health, Deaths) {
         .expect("pawn should exist")
 }
 
+/// Where a pawn is pointing, and how much traverse it is being charged for.
+fn barrel(app: &mut App, handle: usize) -> (Facing, i32) {
+    app.world_mut()
+        .query::<(&Player, &Facing, &Aim)>()
+        .iter(app.world())
+        .find(|(player, ..)| player.handle == handle)
+        .map(|(_, facing, aim)| (*facing, aim.swing))
+        .expect("pawn should exist")
+}
+
+/// **Walking and aiming are two different sticks**, and the sim has to keep them
+/// apart end to end rather than only in `PlayerInput::aim`.
+///
+/// Before the second stick, `Facing` simply WAS the move vector, and
+/// `move_players` returned early the moment the move vector was zero — so a
+/// pawn that wasn't walking couldn't turn, and one that was couldn't point
+/// anywhere but forwards. Both of those are now things a player does constantly:
+/// backing out of a firefight still shooting into it, or holding a corner and
+/// traversing onto whoever comes round it without taking a step.
+///
+/// It runs in a session at `check_distance(2)` like everything else here,
+/// because the turn is also where `Aim::swing` is charged — and a traverse
+/// charge that didn't roll back would be a peer disagreeing about how wide
+/// somebody's cone was, which only surfaces later, as a death.
+#[test]
+fn the_aim_stick_turns_a_pawn_that_is_walking_the_other_way() {
+    let mut app = arena_with(SHOOTING_PLAYERS, 0);
+    let start = post(&mut app, SHOOTER);
+
+    // Stand perfectly still and traverse the barrel a quarter turn — off the
+    // east this side musters facing, round to due north. Nothing in the old
+    // model could produce this input at all.
+    drive(&mut app, SHOOTER, PlayerInput { aim_x: 0, aim_y: 127, ..default() });
+    run(&mut app, 2);
+    let (facing, swing) = barrel(&mut app, SHOOTER);
+    assert_eq!((facing.x, facing.y), (0, 127), "a standing pawn could not turn");
+    assert!(swing > 0, "traversing on the spot was never charged to `Aim::swing`");
+    run(&mut app, 30);
+    assert_eq!(pawn(&mut app, SHOOTER).0, start, "turning walked the pawn off its post");
+
+    // Now walk north while keeping the barrel east — the thing a second stick
+    // exists for. The pawn has to do both, and the aim must win the argument
+    // about `Facing` even though the walk is at full deflection and the aim is
+    // not.
+    drive(&mut app, SHOOTER, PlayerInput { move_y: 127, aim_x: 60, aim_y: 0, ..default() });
+    run(&mut app, 30);
+    let (facing, _) = barrel(&mut app, SHOOTER);
+    let moved = pawn(&mut app, SHOOTER).0;
+    assert_eq!((facing.x, facing.y), (60, 0), "walking dragged the barrel round with it");
+    assert!(
+        moved.y > start.y && moved.x == start.x,
+        "the pawn should have walked due north off {start:?}, and it went to {moved:?}"
+    );
+
+    // Let go of the aim stick and the barrel goes back to following the walk,
+    // which is what keeps every keyboard, bot and harness input in the repo
+    // pointing where it always did.
+    drive(&mut app, SHOOTER, PlayerInput { move_y: 127, ..default() });
+    run(&mut app, 5);
+    let (facing, _) = barrel(&mut app, SHOOTER);
+    assert_eq!((facing.x, facing.y), (0, 127), "a blank aim stick did not fall back to the walk");
+}
+
+/// **The sights slow a shooter; they no longer stop one.**
+///
+/// `BTN_ADS` used to cancel the step outright, which made aiming and moving
+/// mutually exclusive — a harsher rule than the accuracy model needs, since that
+/// model already prices moving while aiming twice over (the movement term in
+/// `Aim::settled`, and `Aim::stir` giving you away in the grass). Rooting the
+/// pawn on top of those was charging for one decision three times and taking the
+/// choice away rather than pricing it.
+///
+/// The measurement is a RATIO rather than a distance, so it keeps meaning the
+/// same thing if `PLAYER_SPEED` or the stance table ever move.
+#[test]
+fn the_sights_slow_a_walk_instead_of_stopping_it() {
+    /// Long enough for the difference to be unmistakable, short enough that
+    /// nobody walks into the pawn parked at the far end of the lane.
+    const TICKS: usize = 60;
+
+    let walked = |ads: bool| {
+        let mut app = arena_with(SHOOTING_PLAYERS, 0);
+        let buttons = if ads { BTN_ADS } else { 0 };
+        drive(&mut app, SHOOTER, PlayerInput { move_x: 127, buttons, ..default() });
+        // A couple of ticks of settling first, so the sample is a steady walk
+        // and not whatever the very top of the round is doing.
+        run(&mut app, 2);
+        let from = pawn(&mut app, SHOOTER).0;
+        run(&mut app, TICKS);
+        (pawn(&mut app, SHOOTER).0.x - from.x) as i64
+    };
+
+    let (free, aimed) = (walked(false), walked(true));
+    println!("walked {free} subunits hip-fired, {aimed} with the sights up");
+    assert!(free > 0, "the shooter did not walk at all with the sights DOWN");
+    assert!(aimed > 0, "the sights still stop a shooter dead — that is the whole fix");
+    // Within a subunit a tick of the fraction the constant promises.
+    let want = free * ADS_SPEED as i64 / FP as i64;
+    assert!(
+        (aimed - want).abs() <= TICKS as i64,
+        "aiming should cost `ADS_SPEED` of the pace ({want} subunits), and it cost {aimed}"
+    );
+}
+
+/// **Strafing and backpedalling are slower than advancing**, all the way through
+/// to the position a pawn actually reaches.
+///
+/// `heading_scale` is unit-tested on its own; this is the other half — that it
+/// is wired into `step` and therefore into `move_players`, and that the pawn is
+/// walking on the SAME bearing in all three cases so the only thing being
+/// measured is where it happens to be pointing.
+#[test]
+fn walking_off_your_own_facing_is_slower_in_the_arena() {
+    const TICKS: usize = 60;
+
+    let walked = |ax: i8, ay: i8| {
+        let mut app = arena_with(SHOOTING_PLAYERS, 0);
+        // Due east every time; only the barrel moves.
+        drive(&mut app, SHOOTER, PlayerInput { move_x: 127, aim_x: ax, aim_y: ay, ..default() });
+        run(&mut app, 2);
+        let from = pawn(&mut app, SHOOTER).0;
+        run(&mut app, TICKS);
+        (pawn(&mut app, SHOOTER).0.x - from.x) as i64
+    };
+
+    let ahead = walked(127, 0);
+    let sideways = walked(0, 127);
+    let backwards = walked(-127, 0);
+    println!("walked {ahead} advancing, {sideways} sideways, {backwards} backpedalling");
+
+    assert!(ahead > 0, "the shooter did not walk at all");
+    assert!(sideways < ahead, "walking square on to the barrel cost nothing");
+    assert!(backwards < sideways, "backpedalling was no dearer than strafing");
+    // Against the constants, within a subunit a tick either way.
+    for (got, want, what) in [
+        (sideways, ahead * STRAFE_SPEED as i64 / FP as i64, "strafing"),
+        (backwards, ahead * BACKPEDAL_SPEED as i64 / FP as i64, "backpedalling"),
+    ] {
+        assert!(
+            (got - want).abs() <= TICKS as i64,
+            "{what} should have covered {want} subunits and covered {got}"
+        );
+    }
+}
+
 /// Rounds land, damage accumulates, the pawn dies — and it STAYS dead.
 ///
 /// The last part is the new rule and the one worth a test of its own: there is

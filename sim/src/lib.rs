@@ -57,6 +57,26 @@ pub const STANCE_SPEED: [i32; STANCE_COUNT] = [
     PLAYER_SPEED * 9 / 16,
     PLAYER_SPEED * 5 / 16,
 ];
+
+/// What a pawn keeps of its pace walking SQUARE ON to where it is pointing, and
+/// walking STRAIGHT BACKWARDS. Straight ahead is the full `FP`, and everything
+/// between is linear in the cosine ([`heading_scale`]) — so a forward diagonal
+/// keeps ~93% and a backward one ~62%.
+///
+/// **This became a question the moment aiming split off movement.** While
+/// `Facing` was the move vector there was no such thing as walking sideways: you
+/// pointed wherever you walked, by construction, and every step was a forward
+/// step. A second stick makes strafing and backpedalling expressible, and a game
+/// about creeping through grass should not let a player retreat from a firefight
+/// as fast as they advanced into it while keeping their sights on it the whole
+/// way.
+///
+/// It stacks multiplicatively with the stance and with [`ADS_SPEED`], which is
+/// the natural reading: all three are fractions of a pace, and a soldier
+/// backpedalling in a crouch with the sights up is doing three slow things at
+/// once.
+pub const STRAFE_SPEED: i32 = FP * 3 / 4;
+pub const BACKPEDAL_SPEED: i32 = FP * 9 / 16;
 /// Ticks to drop one stance level, and to climb back up one. You are rooted
 /// for the whole transition (the stick still turns you) — that dead time is
 /// what makes going prone in the open a commitment rather than a free hide.
@@ -169,10 +189,30 @@ pub const STANCE_SWAY: [i32; STANCE_COUNT] = [FP * 52 / 100, FP * 30 / 100, FP *
 /// subtraction, so bringing them up is worth most in the stance that is already
 /// steadiest. Feet planted and the weapon braced.
 ///
-/// It multiplies rather than subtracts for a second reason: [`BTN_ADS`] already
-/// roots the pawn, so a shooter with the sights up has no movement term at all,
-/// and the two effects would otherwise double-count into a free perfect shot.
+/// It multiplies rather than subtracts for a second reason, and that reason is
+/// what makes it survive [`BTN_ADS`] no longer rooting the pawn: the multiplier
+/// is applied to the WHOLE settled hold, movement term included, so a shooter
+/// walking with the sights up is steadier than one walking without them and
+/// still unsteadier than one standing still with them. Applied as a subtraction
+/// — or, as it was first written, as an early return that skipped the movement
+/// term entirely — the moment a shooter could walk while aiming they would walk
+/// as accurately as they stood.
 pub const ADS_SWAY: i32 = FP * 45 / 100;
+
+/// What the sights cost in SPEED: the fraction of the stance's pace a shooter
+/// keeps while aiming down them.
+///
+/// It used to be zero — the sights stopped you dead — and that is a harsher rule
+/// than the accuracy model needs. The sway model already prices moving while
+/// aiming, twice over (the movement term above, and [`Aim::stir`] giving you
+/// away in the grass), so rooting the pawn on top of it was charging for the
+/// same decision three times and taking the choice away rather than pricing it.
+/// Walking pace with the weapon up is a real thing a soldier does, and now the
+/// player can: they just do it at a pace anyone watching has time to react to.
+///
+/// It stacks with the stance, so a crawl with the sights up is very slow indeed
+/// — which is exactly the sniper's hold, and it should cost what it costs.
+pub const ADS_SPEED: i32 = FP * 45 / 100;
 
 /// What travelling at full standing speed ADDS to the settled sway, on top of
 /// the stance's own. Scaled by the square of the fraction of [`PLAYER_SPEED`]
@@ -409,6 +449,15 @@ pub const RECOIL_DECAY: i32 = FP / 128;
 pub struct PlayerInput {
     pub move_x: i8,
     pub move_y: i8,
+    /// Where the barrel is pointed, as a direction only — its LENGTH is never
+    /// read, so a peer may send whatever the stick gave it.
+    ///
+    /// Zero means "not aiming separately", and [`PlayerInput::aim`] then falls
+    /// back to the move vector. That fallback is what keeps every caller that
+    /// steers by walking — the bots, the keyboard, every test in the repo —
+    /// working exactly as it did when the two were the same number.
+    pub aim_x: i8,
+    pub aim_y: i8,
     pub buttons: u8,
     /// Bits 0-3: bot aggression ([`DIAL_AGGRO_MASK`]), which only the first
     /// player's copy is read for. Bits 4-5: which side THIS player is asking to
@@ -418,7 +467,8 @@ pub struct PlayerInput {
 }
 
 pub const BTN_FIRE: u8 = 1 << 0;
-/// Aiming down sights: the shooter plants their feet (stick only turns them).
+/// Aiming down sights: the weapon comes up, the hold steadies ([`ADS_SWAY`]) and
+/// the pace drops to [`ADS_SPEED`]. It used to plant the feet outright.
 pub const BTN_ADS: u8 = 1 << 1;
 /// Bits 2-3 carry the stance the player *wants*, as `1 + level` — an absolute
 /// level, not a "go down" edge. Edge-triggered inputs would need the sim to
@@ -483,6 +533,21 @@ pub const DIAL_TEAM_SHIFT: u8 = 4;
 pub const DIAL_TEAM_MASK: u8 = 0b11 << DIAL_TEAM_SHIFT;
 
 impl PlayerInput {
+    /// Which way this pawn is pointing its weapon: the aim stick if it is being
+    /// asked for, else wherever the pawn is walking.
+    ///
+    /// The fallback is the whole reason aiming could be split off movement
+    /// without touching anything else. `Facing` used to BE the move vector, so
+    /// every producer of an input in this repo — the bots, the keyboard, the
+    /// harness, the tests — aims by walking; leaving `aim_*` at zero keeps all
+    /// of them pointing exactly where they used to, and only the twin-stick
+    /// touch controls fill it in.
+    pub fn aim(&self) -> (i32, i32) {
+        match (self.aim_x as i32, self.aim_y as i32) {
+            (0, 0) => (self.move_x as i32, self.move_y as i32),
+            aim => aim,
+        }
+    }
     pub fn fire(&self) -> bool {
         self.buttons & BTN_FIRE != 0
     }
@@ -636,8 +701,12 @@ pub struct Intent(pub PlayerInput);
 
 // `Bot` — the component, its profile and its brain — lives in `bot.rs`.
 
-/// Last non-zero move direction, raw joystick range (-127..=127 per axis).
-/// Bullets fire along this. Defaults to "up".
+/// Where the barrel points: the last non-zero [`PlayerInput::aim`], raw joystick
+/// range (-127..=127 per axis). Bullets fire along this. Defaults to "up".
+///
+/// It used to be the last non-zero MOVE direction, which is still what it works
+/// out to for anything steering by walking — a bot, a keyboard, the harness. A
+/// player with two thumbs on the glass can point it somewhere else.
 #[derive(Component, Copy, Clone, Debug, Hash)]
 pub struct Facing {
     pub x: i32,
@@ -759,15 +828,18 @@ impl Aim {
     pub fn settled(stance: &Stance, speed: i32, ads: bool) -> i32 {
         let level = (stance.level as usize).min(STANCE_COUNT - 1);
         let mut sway = STANCE_SWAY[level];
-        if ads {
-            // Sights up implies rooted (`BTN_ADS` stops the pawn dead), so
-            // there is no movement term to add and no double count.
-            return sway * ADS_SWAY / FP;
-        }
         // Square of the fraction of a full run being covered.
         let frac = (speed.clamp(0, PLAYER_SPEED) as i64 * FP as i64 / PLAYER_SPEED as i64) as i32;
         sway += (frac as i64 * frac as i64 / FP as i64 * MOVE_SWAY as i64 / FP as i64) as i32;
-        sway.min(FP)
+        sway = sway.min(FP);
+        // The sights steady the whole hold, movement included — see [`ADS_SWAY`]
+        // for why the multiply has to come AFTER the movement term rather than
+        // instead of it. This used to return early here, which was harmless only
+        // while the sights rooted the pawn and `speed` was therefore always 0.
+        if ads {
+            sway = sway * ADS_SWAY / FP;
+        }
+        sway
     }
 
     /// One tick of settling toward `target`. Rises in [`SWAY_RISE_TICKS`] and
@@ -2339,23 +2411,67 @@ fn read_human_intent<C: Config<Input = PlayerInput>>(
 /// crossing the field. There is nothing to keep them honest but this being the
 /// only copy.
 ///
-/// Rooted cases come out `(0, 0)`: aiming down sights plants the feet (the
-/// stick still turns you — that is the aim — it just doesn't carry you), and a
-/// stance change roots you for as long as it takes. Both ride in the input
-/// stream, so every peer agrees.
+/// A stance change roots you for as long as it takes — that one still comes out
+/// `(0, 0)`, and it rides in the input stream so every peer agrees. The SIGHTS
+/// no longer do: they scale the stance's pace by [`ADS_SPEED`] instead of
+/// cancelling it, so a shooter can walk their weapon onto a target rather than
+/// having to choose between moving and aiming.
 ///
-/// Otherwise the joystick vector is scaled to at most the stance's speed,
-/// preserving direction: `v = m * SPEED / max(len, 127)`. Dividing by the
+/// The joystick vector is scaled to at most that speed, preserving direction:
+/// `v = m * SPEED / max(len, 127)`. Dividing by the
 /// *longer* of `len`/127 keeps sub-max deflections proportional while capping
 /// diagonals at full speed.
 pub fn step(input: &PlayerInput, stance: &Stance) -> (i32, i32) {
     let (mx, my) = (input.move_x as i32, input.move_y as i32);
-    if (mx == 0 && my == 0) || input.ads() || stance.change > 0 {
+    if (mx == 0 && my == 0) || stance.change > 0 {
         return (0, 0);
     }
-    let speed = stance.speed();
+    let mut speed = stance.speed();
+    if input.ads() {
+        speed = speed * ADS_SPEED / FP;
+    }
+    speed = speed * heading_scale(input) / FP;
     let len = isqrt((mx * mx + my * my) as i64).max(127) as i32;
     (mx * speed / len, my * speed / len)
+}
+
+/// How much of its pace a pawn keeps, given the angle between where it is
+/// WALKING and where it is POINTING: `FP` straight ahead, [`STRAFE_SPEED`]
+/// square on, [`BACKPEDAL_SPEED`] straight back, linear in the cosine between.
+///
+/// **It is measured against the input's own aim, not against the [`Facing`]
+/// component**, and that is worth a sentence. `step` and `step_speed` are
+/// deliberately a pure function of `(input, stance)` so that the movement and
+/// the aim model cannot disagree about how fast a pawn is going (see `step`);
+/// reaching for a component here would have put a third caller — `settle_aim` —
+/// in the position of needing a `Facing` it does not query, and would have made
+/// the answer depend on system order. `PlayerInput::aim` is the same direction
+/// `move_players` is about to write into `Facing` anyway.
+///
+/// **Anything that steers by walking is charged nothing**, exactly: for a bot,
+/// the keyboard or a test, `aim()` falls back to the move vector, so the cosine
+/// is the vector with itself and comes out at precisely `FP` with no rounding
+/// slack. Only a player with a second stick can ever be walking one way and
+/// pointing another, and only they pay.
+pub fn heading_scale(input: &PlayerInput) -> i32 {
+    let (mx, my) = (input.move_x as i64, input.move_y as i64);
+    let (ax, ay) = input.aim();
+    let (ax, ay) = (ax as i64, ay as i64);
+    let (walk, point) = (isqrt(mx * mx + my * my), isqrt(ax * ax + ay * ay));
+    if walk == 0 || point == 0 {
+        return FP;
+    }
+    let fp = FP as i64;
+    let cos = ((mx * ax + my * ay) * fp / (walk * point)).clamp(-fp, fp);
+    let strafe = STRAFE_SPEED as i64;
+    // Two straight segments meeting at square-on, so it inverts and reasons in
+    // closed form and there is no curve to argue about.
+    let scale = if cos >= 0 {
+        strafe + (fp - strafe) * cos / fp
+    } else {
+        strafe + (strafe - BACKPEDAL_SPEED as i64) * cos / fp
+    };
+    scale as i32
 }
 
 /// The magnitude of that step — what [`Aim::settled`] is charged for.
@@ -2402,15 +2518,19 @@ fn move_players(
         // the stance they had rather than climbing to their feet unbidden.
         let wanted = input.stance().unwrap_or(stance.level);
         stance.advance(wanted);
-        let (mx, my) = (input.move_x as i32, input.move_y as i32);
-        if mx == 0 && my == 0 {
-            continue;
+        // Turning is its own question now that the aim stick is its own stick:
+        // a pawn can traverse the barrel standing perfectly still, and one
+        // walking with the aim stick untouched still points where it is going
+        // (`PlayerInput::aim` falls back to the move vector for exactly that).
+        let (ax, ay) = input.aim();
+        if ax != 0 || ay != 0 {
+            // The turn is charged HERE, the one place old and new facing are
+            // both in hand — `settle_aim` never has to reconstruct what the
+            // barrel did.
+            aim.turn((facing.x, facing.y), (ax, ay));
+            facing.x = ax;
+            facing.y = ay;
         }
-        // The turn is charged HERE, the one place old and new facing are both
-        // in hand — `settle_aim` never has to reconstruct what the barrel did.
-        aim.turn((facing.x, facing.y), (mx, my));
-        facing.x = mx;
-        facing.y = my;
         let (sx, sy) = step(&input, &stance);
         if sx == 0 && sy == 0 {
             continue;
@@ -2456,7 +2576,8 @@ fn push_out_of_cover(pos: &mut Pos, cover: &[(i32, i32, i32)]) {
 ///
 /// **This exists because two bots could stand on the same subunit forever.**
 /// Nothing stopped pawns interpenetrating, and `Act::Fight` roots a bot in
-/// place, so two of them that closed to nothing were pinned there permanently —
+/// place (with the sights bit, in those days), so two of them that closed to
+/// nothing were pinned there permanently —
 /// facing each other, firing, and unable to connect, because a round is born
 /// `PLAYER_R + BULLET_R + 2` units down the barrel and that is *past* a target
 /// standing 1.6 units away. Measured before the fix: one pair spent 3100
@@ -2804,7 +2925,7 @@ mod tests {
     #[test]
     fn a_hostile_dial_byte_stays_in_range() {
         for raw in 0..=u8::MAX {
-            let input = PlayerInput { move_x: 0, move_y: 0, buttons: 0, dials: raw };
+            let input = PlayerInput { dials: raw, ..default() };
             if let Some(value) = input.aggression() {
                 assert!((0..=FP).contains(&value), "dials {raw} gave aggression {value}");
             }
@@ -3082,6 +3203,78 @@ mod tests {
         assert_eq!(aim.bloom, 0);
     }
 
+    /// **A shooter walking with the sights up is steadier than one walking
+    /// without them and shakier than one standing still with them.**
+    ///
+    /// Both halves matter and they used to be unrepresentable: [`Aim::settled`]
+    /// returned early on `ads`, skipping the movement term entirely, which was
+    /// exactly right while [`BTN_ADS`] rooted the pawn and speed was therefore
+    /// always zero. The moment the sights merely SLOWED you, that early return
+    /// became a free perfect shot on the move — aim while walking and be as
+    /// steady as a planted shooter. This is the assertion that would have caught
+    /// it, and it is written as an ordering rather than as numbers so it goes on
+    /// meaning the same thing when the constants are tuned.
+    #[test]
+    fn walking_with_the_sights_up_is_steadier_than_walking_without_them() {
+        let stand = Stance::default();
+        let walk = PLAYER_SPEED * ADS_SPEED / FP;
+
+        let planted = Aim::settled(&stand, 0, true);
+        let aimed_walk = Aim::settled(&stand, walk, true);
+        let hip_walk = Aim::settled(&stand, walk, false);
+        println!("planted {planted}, walking aimed {aimed_walk}, walking hip {hip_walk} of {FP}");
+
+        assert!(
+            aimed_walk > planted,
+            "walking with the sights up ({aimed_walk}) cost nothing over standing still \
+             with them ({planted}) — the movement term is being skipped again"
+        );
+        assert!(
+            aimed_walk < hip_walk,
+            "the sights ({aimed_walk}) bought nothing over hip fire ({hip_walk}) at the same pace"
+        );
+        // And the sights are still worth more than the movement costs, or there
+        // would be no reason to raise them while closing.
+        assert!(
+            aimed_walk < Aim::settled(&stand, 0, false),
+            "walking with the sights up ({aimed_walk}) is worse than just standing there \
+             ({}) — nobody would ever advance aiming",
+            Aim::settled(&stand, 0, false)
+        );
+    }
+
+    /// **Walking off your own facing costs speed, and steering by walking costs
+    /// nothing** — the second half being what keeps every bot, keyboard and test
+    /// in the repo moving at exactly the pace it always did.
+    #[test]
+    fn walking_sideways_and_backwards_costs_speed() {
+        let ahead =
+            |ax: i8, ay: i8| PlayerInput { move_y: 127, aim_x: ax, aim_y: ay, ..default() };
+        // Pointing exactly where you walk: full pace, and EXACTLY full pace —
+        // a rounding slack here would quietly slow every bot in the game.
+        assert_eq!(heading_scale(&ahead(0, 127)), FP);
+        assert_eq!(heading_scale(&ahead(0, 40)), FP, "a shorter aim vector is the same bearing");
+        assert_eq!(
+            heading_scale(&PlayerInput { move_x: -90, move_y: 40, ..default() }),
+            FP,
+            "a producer with no aim stick at all steers by walking and must pay nothing"
+        );
+
+        // Square on and straight back are the two anchors the constants name.
+        assert_eq!(heading_scale(&ahead(127, 0)), STRAFE_SPEED);
+        assert_eq!(heading_scale(&ahead(-127, 0)), STRAFE_SPEED);
+        assert_eq!(heading_scale(&ahead(0, -127)), BACKPEDAL_SPEED);
+
+        // And the diagonals land between their neighbours, on both sides.
+        let (fore, back) = (heading_scale(&ahead(90, 90)), heading_scale(&ahead(90, -90)));
+        println!(
+            "ahead {FP}, fore-diagonal {fore}, square {STRAFE_SPEED}, \
+             back-diagonal {back}, back {BACKPEDAL_SPEED}"
+        );
+        assert!(STRAFE_SPEED < fore && fore < FP, "the forward diagonal is not between");
+        assert!(BACKPEDAL_SPEED < back && back < STRAFE_SPEED, "the back diagonal is not between");
+    }
+
     /// Stance changes go one level at a time, root the pawn for the whole
     /// transition, and cost speed for as long as you stay down.
     #[test]
@@ -3144,6 +3337,10 @@ mod tests {
         assert_eq!(blank.aggression(), None);
         assert_eq!(blank.team_request(), None);
         assert!(!blank.fire() && !blank.ads());
+        // A blank aim is not "point at the origin", it is "wherever I'm
+        // walking" — and a blank input isn't walking either, so an absent
+        // player's barrel stays exactly where they left it pointing.
+        assert_eq!(blank.aim(), (0, 0), "an absent player would slew their barrel");
 
         // …and every value a player can actually ask for still survives the
         // round trip, including the zeroes that used to be indistinguishable
@@ -3158,6 +3355,30 @@ mod tests {
             input.set_bots(count);
             assert_eq!(input.bots(), Some(count), "asking for {count} bots did not survive");
         }
+    }
+
+    /// The aim stick is a second axis, and everything that predates it steers
+    /// the barrel by walking.
+    ///
+    /// That fallback is the entire compatibility story for splitting aim off
+    /// movement: the bots, the keyboard, the self-play harness and every test in
+    /// this repo write `move_*` and leave `aim_*` at zero, and all of them have
+    /// to keep pointing exactly where they used to. Break it and nothing fails
+    /// loudly — bots simply stop facing the way they walk.
+    #[test]
+    fn a_pawn_with_no_aim_stick_points_where_it_walks() {
+        let walking = PlayerInput { move_x: -40, move_y: 90, ..default() };
+        assert_eq!(walking.aim(), (-40, 90), "a bot stopped facing the way it walks");
+
+        // With the stick in hand the two come apart, and the walk no longer has
+        // any say in it — including when the walk is the harder-pressed of the
+        // two, which is what a player backing out of a firefight is doing.
+        let twin = PlayerInput { move_x: -127, move_y: 0, aim_x: 0, aim_y: 60, ..default() };
+        assert_eq!(twin.aim(), (0, 60), "the walk overrode the aim stick");
+
+        // Standing still and turning is a thing only the second stick can do.
+        let turning = PlayerInput { aim_x: 127, aim_y: 0, ..default() };
+        assert_eq!(turning.aim(), (127, 0));
     }
 
     /// Thickets have to actually land: the per-bush rejections (round the

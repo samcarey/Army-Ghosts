@@ -180,13 +180,20 @@ pub struct CopyLinkLabel;
 #[derive(Resource)]
 pub struct CopiedFlash(pub Timer);
 
-/// The tappable START band: bottom-center of the screen, in 0-1 window
-/// fractions (window coords, y-down). The visual button sits inside it; the
-/// hit zone is deliberately larger for thumbs. (Taps that land on the ADS
-/// button — which lives in the same corner of the screen — are excluded in
-/// [`read_start_input`].)
-const START_BAND_X: (f32, f32) = (0.25, 0.75);
-const START_BAND_Y: f32 = 0.62;
+/// The tappable START band: a generous thumb-sized zone around the pill, given
+/// as a fraction of the window's width and a range of logical pixels UP FROM ITS
+/// BOTTOM EDGE — the same units the pill itself is laid out in, so the two
+/// cannot drift apart on a screen of a different shape.
+///
+/// It used to be "everything below 0.62 of the height", which was fine while the
+/// right thumb's home was a fire button off to one side of it. It stopped being
+/// fine when that thumb got a floating stick instead: a stick is anchored
+/// wherever it lands, its natural home is the bottom centre-right, and the host
+/// walking around during warmup would have started the match by planting it.
+/// (Taps that land on a bevy_ui button are excluded separately in
+/// [`read_start_input`], which is what keeps the stance column below here inert.)
+const START_BAND_X: (f32, f32) = (0.2, 0.8);
+const START_BAND_Y: (f32, f32) = (196.0, 306.0);
 
 /// Where the round line sits: above the health bar, which is why the bar itself
 /// starts lower than it used to.
@@ -394,13 +401,15 @@ pub fn setup_hud(mut commands: Commands, assets: Res<AssetServer>) {
             });
         });
 
-    // Bottom-center status line, stacked above the ADS button.
+    // Bottom-center status line, stacked above the stance column (which is
+    // taller than the sights button that used to be under here — see
+    // `stance.rs`, and move these two if that column ever changes height).
     commands
         .spawn(Node {
             position_type: PositionType::Absolute,
             left: Val::Px(0.0),
             right: Val::Px(0.0),
-            bottom: Val::Px(112.0),
+            bottom: Val::Px(186.0),
             justify_content: JustifyContent::Center,
             ..default()
         })
@@ -422,7 +431,7 @@ pub fn setup_hud(mut commands: Commands, assets: Res<AssetServer>) {
                 position_type: PositionType::Absolute,
                 left: Val::Px(0.0),
                 right: Val::Px(0.0),
-                bottom: Val::Px(150.0),
+                bottom: Val::Px(224.0),
                 justify_content: JustifyContent::Center,
                 ..default()
             },
@@ -827,8 +836,8 @@ fn copy_share_url(room: &str) -> String {
     format!("?room={room}")
 }
 
-/// Start-trigger input: Enter anywhere, or a tap/click in the bottom-center
-/// band under the button. `run_lobby` only honors it on the host with ≥2
+/// Start-trigger input: Enter anywhere, or a tap/click in the band around the
+/// button ([`START_BAND_X`]). `run_lobby` only honors it on the host with ≥2
 /// players present, so stray taps are harmless.
 pub fn read_start_input(
     keys: Res<ButtonInput<KeyCode>>,
@@ -851,7 +860,11 @@ pub fn read_start_input(
     let Ok(window) = windows.single() else { return };
     let (w, h) = (window.width(), window.height());
     let in_band = |p: Vec2| {
-        p.x > w * START_BAND_X.0 && p.x < w * START_BAND_X.1 && p.y > h * START_BAND_Y
+        let up = h - p.y;
+        p.x > w * START_BAND_X.0
+            && p.x < w * START_BAND_X.1
+            && up > START_BAND_Y.0
+            && up < START_BAND_Y.1
     };
     if mouse.just_pressed(MouseButton::Left) {
         if let Some(pos) = window.cursor_position() {

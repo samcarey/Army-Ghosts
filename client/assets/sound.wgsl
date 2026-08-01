@@ -19,11 +19,8 @@
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> tint: vec4<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(1) var<uniform> arc: vec4<f32>;
 
-/// The share of the half-angle that is FLAT before the rim starts fading. The
-/// plateau is the point: a sector that peaked in the middle would announce its
-/// own centre line, and the centre line is the one thing this is built to
-/// withhold — the true bearing is somewhere in here, not at the bright part.
-const ARC_PLATEAU: f32 = 0.40;
+/// Half of pi, for the bell below.
+const HALF_PI: f32 = 1.5707964;
 /// How much of the radial band is spent fading in off the inner rim and out at
 /// the outer one. Two soft edges rather than a ring with a hard cut.
 const RIM_FADE: f32 = 0.34;
@@ -87,8 +84,16 @@ fn fragment(in: SoundVertexOutput) -> @location(0) vec4<f32> {
 
     // Local +x IS the bearing being claimed — the quad is rotated to it — so
     // the angle off centre is just the atan2 of the local point.
+    //
+    // **THE BELL. This half-cosine is `sound.rs`'s `bell()` and the two are one
+    // curve written twice** — there is no way to share the code across the
+    // shader boundary. It is not a taste in falloff: the client draws the
+    // bearing error from a distribution shaped exactly like this, so what is
+    // painted here IS the likelihood of every bearing in the wedge. Change one
+    // and the picture starts lying about the odds; `the_arc_is_the_probability_
+    // it_looks_like` in sound.rs is what notices.
     let off = abs(atan2(in.local.y, in.local.x)) / max(arc.x, 0.001);
-    let sector = 1.0 - smoothstep(ARC_PLATEAU, 1.0, off);
+    let sector = select(0.0, max(cos(off * HALF_PI), 0.0), off < 1.0);
 
     // …and a little grain over the top, in LOCAL space so it turns with the
     // sector instead of crawling across it as the arc wanders.

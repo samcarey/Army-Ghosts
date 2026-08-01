@@ -15,29 +15,51 @@
 //! rolled back and re-drawn as a side effect of somebody else's packet arriving.
 //! Nothing here feeds back: the sim is read, never written.
 //!
-//! # The lie is the mechanic
+//! # The arc IS the probability distribution
 //!
-//! The arc does not point at the shooter. It points somewhere *within* an error
-//! it announces, and the error is the whole design:
+//! The wedge does not point at the shooter. It points somewhere within an error
+//! it announces — and **what it is drawn with is the likelihood of every bearing
+//! inside it**. The brightness at an angle is proportional to the chance the shot
+//! really came from that angle, so a player reading the picture the obvious way
+//! (bright means probably, faint means possibly, dark means no) is reading it
+//! correctly. Three parts make that true together:
 //!
-//! * The wedge is drawn as a flat plateau with both rims fading out, so there is
-//!   no bright centre line to read a bearing off. What it says is "in here".
-//! * The centre is displaced from the truth by up to [`OFFSET_SHARE`] of the
-//!   half-angle, uniformly — uniform because any peakier distribution makes the
-//!   middle of the wedge the best guess again, which is the readout this is
-//!   built to withhold. The share is under 1, so the shooter is always genuinely
-//!   inside the arc: it is imprecise, never a lie.
-//! * **That displacement is a function of the OFFSET between the two pawns, not
-//!   of the clock** ([`error_at`]). It is not random and it does not tick: it is
-//!   a smooth field over the relative position, so the error is fixed while
-//!   neither of you moves and slides as soon as either of you does, in any
-//!   direction. Which means a listener who stands still and collects six shots
-//!   from one rifle gets six arcs that agree — the error is a property of where
-//!   the two of you are standing, and the way to change it is to move.
-//!   Independent per-shot draws are what this replaced, and they were worse in
-//!   both directions: they let a stationary listener average the error away,
-//!   and they made a stationary shooter's arcs jitter for no reason a player
-//!   could see.
+//! * **The opacity across the wedge is a bell** — [`bell`], a half-cosine that is
+//!   full at the centre and reaches exactly zero at both rims, so the arc has no
+//!   edge to be startled by and no direction it claims that it does not mean.
+//! * **The error is distributed as that same bell** ([`toward_the_middle`]). This
+//!   is a REVERSAL of what shipped first, and worth understanding rather than
+//!   just reading: the first version drew a flat plateau and displaced it
+//!   uniformly, on the argument that a peak in the middle would hand the player
+//!   back the bearing the cue exists to withhold. That is true of a peak the
+//!   statistics do not support. Make the two agree instead and the display stops
+//!   being a bluff: the centre really is the best guess, the wedge really is how
+//!   wide the doubt is, and nothing is being hidden — the information is simply
+//!   imprecise, which is the honest thing for a noise heard through a field.
+//! * **The wedge's half-angle IS the error's whole budget.** There is no separate
+//!   share of it held back, because the bell already vanishes at the rim: the
+//!   shot is always inside the arc, and the extremes of the arc are exactly the
+//!   bearings it says are barely possible.
+//!
+//! # Where the error comes from
+//!
+//! **It is a function of the OFFSET between the two pawns, not of the clock**
+//! ([`error_at`]). It is not random and it does not tick: a plain triangle wave
+//! over the relative position, so the error is fixed while neither of you moves
+//! and slides as soon as either of you does, in any direction. A listener who
+//! stands still and collects six shots from one rifle gets six arcs that agree —
+//! the error is a property of where the two of you are standing, and the way to
+//! change it is to move. Independent per-shot draws are what this replaced, and
+//! they were worse in both directions: they let a stationary listener average
+//! the error away, and they made a stationary shooter's arcs jitter for no
+//! reason a player could see.
+//!
+//! The triangle sweeps EVENLY, which is what makes the bell above come out
+//! right: even sweep in, [`toward_the_middle`] out, and the density that falls
+//! out the far side is `bell` exactly rather than approximately. Read the other
+//! way round, which is how it was asked for: the drawn bearing moves SLOWLY
+//! through the angles the bell says are likely and hurries through the ones it
+//! says are not, because the rate is one over the density by construction.
 //!
 //! So closing the distance genuinely buys information — the arc narrows and its
 //! error narrows with it, both proportional — and standing off does not.
@@ -59,7 +81,7 @@
 //! standing in the middle of it firing a round a second, so the arcs can be
 //! walked around instead of waited for.
 
-use std::f32::consts::TAU;
+use std::f32::consts::{FRAC_2_PI, FRAC_PI_2, TAU};
 
 use bevy::mesh::MeshVertexBufferLayoutRef;
 use bevy::platform::collections::HashMap;
@@ -92,10 +114,10 @@ const POINT_BLANK: f32 = 100.0;
 /// this game is for.
 ///
 /// It is a THIN band on purpose: a fat one is a blob, and what the eye reads off
-/// a blob is its bulk rather than its bearing. Ten units of arc at a hundred
-/// units out is a stroke, and a stroke has a direction.
-const RING_INNER: f32 = 95.0;
-const RING_OUTER: f32 = 105.0;
+/// a blob is its bulk rather than its bearing. Five units of arc is a stroke, and
+/// a stroke has a direction.
+const RING_INNER: f32 = 47.5;
+const RING_OUTER: f32 = 52.5;
 
 /// Half-angle of the wedge at [`POINT_BLANK`] and at [`HEAR_RANGE`], radians —
 /// so about 20 degrees across when it is next to you and 130 when it is the
@@ -129,11 +151,6 @@ const LOUD_FAR: f32 = 0.12;
 const PING_LIFE: f32 = 0.4;
 const PING_ATTACK: f32 = 0.04;
 
-/// How much of the half-angle the drawn centre may be displaced by. Under 1 on
-/// purpose: the shooter is always inside the arc that gets drawn, so the wedge
-/// is imprecise rather than dishonest, and there is always a sliver of arc on
-/// the far side of the truth to make that visible.
-const OFFSET_SHARE: f32 = 0.72;
 /// How far the two of you have to move RELATIVE TO EACH OTHER, in x and in y,
 /// for the bearing error to run through its whole range — world units. At
 /// walking pace (120 units a second) that is about a second of movement for a
@@ -143,11 +160,6 @@ const OFFSET_SHARE: f32 = 0.72;
 /// The two are deliberately incommensurate: equal pitches would make the error
 /// constant along the diagonal, which is a direction a player could learn.
 const ERROR_PITCH: (f32, f32) = (150.0, 95.0);
-/// A finer wave folded into the phase, radians, so the lines of constant error
-/// are wavy rather than a ruled grid across the map. Kept well under the pitch
-/// term's own gradient: it is there to bend the field, not to make it jitter.
-const ERROR_WARP: f32 = 0.55;
-const ERROR_WARP_PITCH: (f32, f32) = (61.0, 43.0);
 
 /// Muzzle yellow — warm and pale rather than saturated, because it is drawn over
 /// dark olive sward and a deep yellow at low alpha turns muddy green.
@@ -213,31 +225,62 @@ pub fn setup_sound(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
     commands.insert_resource(PingQuad(meshes.add(Rectangle::new(2.0, 2.0))));
 }
 
-/// A triangle wave of `phase`, -1..=1.
+/// **The one curve.** How opaque the wedge is `share` of the way from its centre
+/// to its rim, AND — the whole point — how likely the shot is to have come from
+/// that bearing. Full in the middle, exactly zero at ±1, no edge either way.
 ///
-/// A TRIANGLE and not a sine, and that is the whole reason [`error_at`] can
-/// claim to be uniform: a phase that sweeps evenly comes out of a triangle
-/// evenly, where `sin` of the same phase is arcsine-distributed and piles up at
-/// the extremes — which would park the shooter near the rim of the arc far more
-/// often than inside it. It is continuous, so the error never jumps.
+/// **`sound.wgsl` draws this same curve and there is no way to make it share the
+/// code**, so the two are one constant written twice: a half-cosine. If it
+/// changes here it must change there, and `the_arc_is_the_probability_it_looks_
+/// like` is what catches the day it doesn't — it histograms the error field and
+/// holds the result against this function.
+/// Nothing at runtime calls this — the shader is what paints the curve, and the
+/// client only ever needs its inverse CDF. It exists so the shape has an
+/// executable copy on this side of the boundary for the test to hold the error
+/// field against, which is the only check that the two halves still agree.
+#[allow(dead_code)]
+fn bell(share: f32) -> f32 {
+    // Clamped up off zero because `cos(FRAC_PI_2)` is -4.4e-8 in f32 and a
+    // negative opacity is not a thing; the shader clamps for the same reason.
+    (FRAC_PI_2 * share.clamp(-1.0, 1.0)).cos().max(0.0)
+}
+
+/// A triangle wave of `phase`, -1..=1 and swept EVENLY.
+///
+/// A triangle and not a sine, and everything below depends on it: an even sweep
+/// is a uniform variable, which is the one input [`toward_the_middle`] can turn
+/// into a known distribution. `sin` of the same phase is already arcsine-shaped
+/// and would pile the error up at the rim — the exact opposite of what the bell
+/// wants. It is continuous, so the error never jumps.
 fn triangle(phase: f32) -> f32 {
     4.0 * ((phase / TAU + 0.25).rem_euclid(1.0) - 0.5).abs() - 1.0
 }
 
-/// How far off the truth an arc points, as a signed share of its own error
-/// budget (-1..=1), for a shooter this much [`Pos`] away from the listener.
+/// Bend an evenly swept `-1..=1` into one distributed as [`bell`].
 ///
-/// A smooth field over the RELATIVE position rather than a clock or a die: two
-/// pawns standing still see the same error however many rounds go off, and any
-/// movement by either of them — theirs or yours, along any axis — slides it. The
-/// player-facing consequence is that moving is what resolves a bearing, which is
-/// the same bargain everything else in this game makes.
+/// This is the inverse CDF of the half-cosine, which is exactly `asin` scaled —
+/// the one line that makes the picture honest, since a uniform input through it
+/// comes out with density `cos(pi/2 u)`, the curve the wedge is painted with.
+///
+/// Equivalently, and this is how it was asked for: **the drawn bearing crawls
+/// through the middle of the wedge and hurries through the edges**, because
+/// `d(out)/d(in)` here is one over the bell. It spends its time where the light
+/// is, so the light is where it spends its time.
+fn toward_the_middle(even: f32) -> f32 {
+    even.clamp(-1.0, 1.0).asin() * FRAC_2_PI
+}
+
+/// How far off the truth an arc points, as a signed share of the wedge's own
+/// half-angle (-1..=1), for a shooter this much [`Pos`] away from the listener.
+///
+/// A plain plane wave over the RELATIVE position rather than a clock or a die:
+/// two pawns standing still see the same error however many rounds go off, and
+/// any movement by either of them — theirs or yours, along any axis — slides it.
+/// The player-facing consequence is that moving is what resolves a bearing,
+/// which is the same bargain everything else in this game makes.
 fn error_at(offset: Vec2) -> f32 {
-    let phase = TAU * (offset.x / ERROR_PITCH.0 + offset.y / ERROR_PITCH.1)
-        + ERROR_WARP
-            * ((TAU * offset.x / ERROR_WARP_PITCH.0 + 0.7).sin()
-                + (TAU * offset.y / ERROR_WARP_PITCH.1 + 1.9).sin());
-    triangle(phase)
+    let phase = TAU * (offset.x / ERROR_PITCH.0 + offset.y / ERROR_PITCH.1);
+    toward_the_middle(triangle(phase))
 }
 
 /// What this client remembers about other people's gunfire: which shot of theirs
@@ -257,10 +300,11 @@ pub struct Heard {
 #[derive(Component)]
 pub struct Ping {
     source: Vec2,
-    /// How far off the truth this arc's centre may be dragged — a share of the
-    /// wedge's own half-angle, so it is fixed at the range the bang happened at
-    /// along with everything else distance decides.
-    limit: f32,
+    /// The wedge's half-angle, radians — fixed at the range the bang happened
+    /// at, along with everything else distance decides. It is BOTH how wide the
+    /// arc is drawn and the whole budget the error is allowed to spend, because
+    /// the bell that fades the rim is the same curve the error is drawn from.
+    half: f32,
     loud: f32,
     age: f32,
 }
@@ -357,7 +401,7 @@ pub fn hear_gunfire(
         commands.spawn((
             Ping {
                 source,
-                limit: half * OFFSET_SHARE,
+                half,
                 loud: loudness(dist),
                 age: 0.0,
             },
@@ -407,7 +451,7 @@ pub fn fade_pings(
         let offset = ping.source - here;
         transform.translation = here.extend(Z_SOUND);
         transform.rotation =
-            Quat::from_rotation_z(offset.to_angle() + ping.limit * error_at(offset));
+            Quat::from_rotation_z(offset.to_angle() + ping.half * error_at(offset));
         if let Some(material) = materials.get_mut(material.0.id()) {
             material.arc.z = level;
         }
@@ -433,9 +477,6 @@ mod tests {
         assert!(spread(40.0) < spread(900.0) / 3.0, "point blank is not tight enough to act on");
     }
 
-    /// **The shooter is always inside the arc.** The cue is allowed to be vague
-    /// and is not allowed to be wrong: an arc that could point somewhere the
-    /// shot did not come from would teach players to ignore it.
     /// Every offset a pawn could stand at, a hex apart, out to the whole arena
     /// and past it.
     fn offsets() -> impl Iterator<Item = Vec2> {
@@ -447,8 +488,8 @@ mod tests {
     /// **The shooter is always inside the arc.** The cue is allowed to be vague
     /// and is not allowed to be wrong: an arc that could point somewhere the
     /// shot did not come from would teach players to ignore it. Checked over
-    /// every offset rather than a sample, since the error is now a field and a
-    /// field can be checked exhaustively.
+    /// every offset rather than a sample, since the error is a field and a field
+    /// can be checked exhaustively.
     #[test]
     fn the_shot_is_always_somewhere_inside_the_arc() {
         for offset in offsets() {
@@ -459,10 +500,54 @@ mod tests {
             );
             for dist in [10.0, 100.0, 333.0, HEAR_RANGE] {
                 let half = spread(dist);
-                let off = (half * OFFSET_SHARE * error).abs();
-                assert!(off < half, "at {dist} the arc pointed {off} off a {half} wedge");
+                let off = (half * error).abs();
+                assert!(off <= half, "at {dist} the arc pointed {off} off a {half} wedge");
             }
         }
+        // The budget IS the wedge now, so the rim is reachable — and it has to
+        // be drawn as impossible when it is, which is the bell's job.
+        assert_eq!(bell(1.0), 0.0);
+        assert_eq!(bell(-1.0), 0.0);
+    }
+
+    /// **What is painted is the likelihood.** The wedge's opacity across its own
+    /// width and the distribution of the bearing error have to be the SAME
+    /// curve, or the picture is quietly lying about the odds — and they are
+    /// written twice, once here and once in `sound.wgsl`, with nothing but this
+    /// holding them together.
+    ///
+    /// Histogram the error over every offset on the map, and each bin must hold
+    /// the share of the field that `bell` says it should.
+    #[test]
+    fn the_arc_is_the_probability_it_looks_like() {
+        const BINS: usize = 20;
+        let mut seen = [0usize; BINS];
+        let mut total = 0usize;
+        for offset in offsets() {
+            let bin = ((error_at(offset) + 1.0) / 2.0 * BINS as f32) as usize;
+            seen[bin.min(BINS - 1)] += 1;
+            total += 1;
+        }
+        // What the curve claims, normalised over the same bins.
+        let middle = |bin: usize| (bin as f32 + 0.5) / BINS as f32 * 2.0 - 1.0;
+        let want: Vec<f32> = (0..BINS).map(|bin| bell(middle(bin))).collect();
+        let scale: f32 = want.iter().sum();
+        for bin in 0..BINS {
+            let (got, expected) = (seen[bin] as f32 / total as f32, want[bin] / scale);
+            assert!(
+                (got - expected).abs() < 0.006,
+                "bin {bin} ({:.2}) holds {got:.4} of the field, but the bell it is \
+                 painted with says {expected:.4} — the picture and the odds have come apart",
+                middle(bin)
+            );
+        }
+        // …and the shape really is a bell rather than the flat plateau this
+        // replaced: the middle fifth must outweigh the outer one substantially.
+        let share = |lo: usize, hi: usize| seen[lo..hi].iter().sum::<usize>() as f32;
+        assert!(
+            share(8, 12) > 2.0 * share(0, 4),
+            "the error is not concentrated in the middle: {seen:?}"
+        );
     }
 
     /// The error is a FIELD OVER THE OFFSET, not a clock and not a die: it holds
@@ -508,21 +593,22 @@ mod tests {
             assert!(mean > 0.2, "walking {step} 30 units barely moved the error: mean {mean}");
         }
 
-        // Uniform across the field, which is what the triangle wave buys: a sine
-        // of the same phase is arcsine-distributed and would leave the outer
-        // fifths holding ~29% of the map each against ~13% for the middle,
-        // making the centre of the wedge the best guess again.
+        // The PHASE is what sweeps evenly, and it has to, or the bell the error
+        // is bent into comes out as something else — the shape of the result is
+        // checked by `the_arc_is_the_probability_it_looks_like`, and this is the
+        // input it depends on.
         let mut bins = [0usize; 5];
         let mut total = 0usize;
         for offset in offsets() {
-            bins[(((error_at(offset) + 1.0) / 2.0 * 5.0) as usize).min(4)] += 1;
+            let phase = TAU * (offset.x / ERROR_PITCH.0 + offset.y / ERROR_PITCH.1);
+            bins[(((triangle(phase) + 1.0) / 2.0 * 5.0) as usize).min(4)] += 1;
             total += 1;
         }
         for (bin, count) in bins.iter().enumerate() {
             let share = *count as f32 / total as f32;
             assert!(
                 (0.17..0.23).contains(&share),
-                "fifth {bin} covers {share} of the field, which is not uniform: {bins:?}"
+                "fifth {bin} covers {share} of the field, so the sweep is not even: {bins:?}"
             );
         }
     }

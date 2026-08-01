@@ -1475,15 +1475,27 @@ nothing.
   rather than tense. `Aim::flash` already made firing cost concealment to the
   BOTS' eyes through the ordinary sighting path; this is the human's half of the
   same bargain.
-  * **The vagueness is the mechanic, and every part of it is deliberate.** The
-    wedge is a flat plateau with both rims fading out, so there is no bright
-    centre line to read a bearing off — what it says is "in here". Its centre is
-    then displaced from the truth by a UNIFORM draw across `OFFSET_SHARE` (0.72)
-    of the half-angle: uniform because any peakier distribution makes the middle
-    of the wedge the best guess again, which is the one readout this exists to
-    withhold. The share is under 1, so the shooter is always genuinely inside the
-    arc — imprecise, never wrong, and `the_shot_is_always_somewhere_inside_the_arc`
-    pins that at every range and every point of the walk below.
+  * **THE ARC IS THE PROBABILITY DISTRIBUTION, and that is the whole design.**
+    The opacity across the wedge is a bell (`bell`, a half-cosine, full at the
+    centre and exactly zero at both rims) and the bearing error is drawn from a
+    distribution of *that same shape*, so the brightness at an angle is
+    proportional to the chance the shot really came from it. A player reading the
+    picture the obvious way — bright means probably, faint means possibly, dark
+    means no — is reading it correctly.
+    - **This REVERSED the first version**, which drew a flat plateau and
+      displaced it uniformly on the argument that a peak in the middle hands back
+      the bearing the cue exists to withhold. That is true of a peak the
+      statistics do not support. Make the two agree and the display stops being a
+      bluff: the centre really is the best guess, the wedge really is the width
+      of the doubt, and the information is imprecise rather than hidden.
+    - **The wedge's half-angle IS the error's whole budget** — there is no
+      separate share held back (`OFFSET_SHARE` is gone), because the bell already
+      vanishes at the rim. The shot is always inside the arc and the extremes of
+      the arc are exactly the bearings it says are barely possible.
+    - **The curve is written TWICE**, here and in `sound.wgsl`, with no way to
+      share it across the shader boundary. `the_arc_is_the_probability_it_looks_
+      like` is the only thing holding them together: it histograms the error over
+      every offset on the map and holds each bin against `bell`.
   * **The error is a FIELD OVER THE OFFSET between the two pawns, not a clock and
     not a die** (`error_at`). It holds still while the two of you do — so six
     rounds from one rifle draw six arcs that agree, and there is nothing to
@@ -1491,16 +1503,18 @@ nothing.
     direction, because only the difference of the two positions is ever read.
     Movement is what resolves a bearing, which is the same bargain the rest of
     the game makes. `ERROR_PITCH` (150/95 units) is how far you have to move
-    relative to each other for a full sweep, ~1 s of walking; the two are
-    incommensurate so no heading holds the error still, and `ERROR_WARP` bends
-    the iso-lines off a ruled grid.
-  * **It is a TRIANGLE wave of that phase, not a sine**, and that is the only
-    reason it can claim to be uniform: a phase that sweeps evenly comes out of a
-    triangle evenly, where `sin` is arcsine-distributed and piles up at the
-    extremes — which would park the shooter near the rim of the arc far more
-    often than inside it. `the_error_is_a_function_of_where_the_two_of_you_stand`
-    checks the whole field exhaustively rather than sampling it, since a field
-    can be.
+    relative to each other for a full sweep, ~1 s of walking, and the two are
+    incommensurate so no heading holds the error still.
+  * **A TRIANGLE wave for the sweep, then `asin` to bend it into the bell**
+    (`triangle` → `toward_the_middle`), and both halves are load-bearing. The
+    triangle is what makes the input EVEN — `sin` of the same phase is already
+    arcsine-shaped and would pile the error up at the rim, the exact opposite of
+    what is wanted — and `toward_the_middle` is the inverse CDF of the
+    half-cosine, which is `asin` scaled and nothing more. Read it as motion,
+    which is how it was asked for: **the drawn bearing crawls through the middle
+    of the wedge and hurries through the edges**, because its rate is one over
+    the density by construction. It spends its time where the light is, so the
+    light is where it spends its time.
   * **Distance sets both the width and the strength, and it opens with the SQUARE
     ROOT of it.** The arena is 800x600 and nearly every shot fired in it lands in
     the first third of `HEAR_RANGE`, so a straight line spends most of its travel
@@ -1515,7 +1529,7 @@ nothing.
     frame they spawned on is re-simulated, which in a p2p match is most frames.
     Rollback rewinds the frame counter and the cooldown together, so the same
     shot recovers the same number however often it is replayed.
-  * **A THIN band and a FLASH**: 10 world units of arc at 100 out (`RING_INNER` /
+  * **A THIN band and a FLASH**: 5 world units of arc at 50 out (`RING_INNER` /
     `RING_OUTER`) for `PING_LIFE` 0.4 s. A fat wedge is a blob and what the eye
     reads off a blob is its bulk rather than its bearing; an arc that lingered
     would still be up when the next round landed, so a burst would read as one

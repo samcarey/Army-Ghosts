@@ -1484,15 +1484,23 @@ nothing.
     withhold. The share is under 1, so the shooter is always genuinely inside the
     arc — imprecise, never wrong, and `the_shot_is_always_somewhere_inside_the_arc`
     pins that at every range and every point of the walk below.
-  * **The error WALKS, sinusoidally, and it belongs to the SOURCE rather than to
-    the shot.** Independent per-shot draws are worth nothing against a rifle
-    firing repeatedly: stand still, collect six arcs, average them, and the error
-    is gone. One drifting error per source cannot be averaged out, and it re-draws
-    itself only after that source has been quiet for `QUIET_RESEED` (2.5 s) — so
-    within an engagement the bearing drifts, and a fresh engagement is a fresh
-    guess. Seeding is by `asin` of a uniform draw, NOT by picking a phase: `sin`
-    of a uniform phase piles up at the extremes, which would park the shooter
-    near the rim of the arc far more often than inside it.
+  * **The error is a FIELD OVER THE OFFSET between the two pawns, not a clock and
+    not a die** (`error_at`). It holds still while the two of you do — so six
+    rounds from one rifle draw six arcs that agree, and there is nothing to
+    average away — and it slides the moment either of you moves, in any
+    direction, because only the difference of the two positions is ever read.
+    Movement is what resolves a bearing, which is the same bargain the rest of
+    the game makes. `ERROR_PITCH` (150/95 units) is how far you have to move
+    relative to each other for a full sweep, ~1 s of walking; the two are
+    incommensurate so no heading holds the error still, and `ERROR_WARP` bends
+    the iso-lines off a ruled grid.
+  * **It is a TRIANGLE wave of that phase, not a sine**, and that is the only
+    reason it can claim to be uniform: a phase that sweeps evenly comes out of a
+    triangle evenly, where `sin` is arcsine-distributed and piles up at the
+    extremes — which would park the shooter near the rim of the arc far more
+    often than inside it. `the_error_is_a_function_of_where_the_two_of_you_stand`
+    checks the whole field exhaustively rather than sampling it, since a field
+    can be.
   * **Distance sets both the width and the strength, and it opens with the SQUARE
     ROOT of it.** The arena is 800x600 and nearly every shot fired in it lands in
     the first third of `HEAR_RANGE`, so a straight line spends most of its travel
@@ -1507,6 +1515,13 @@ nothing.
     frame they spawned on is re-simulated, which in a p2p match is most frames.
     Rollback rewinds the frame counter and the cooldown together, so the same
     shot recovers the same number however often it is replayed.
+  * **A THIN band and a FLASH**: 10 world units of arc at 100 out (`RING_INNER` /
+    `RING_OUTER`) for `PING_LIFE` 0.4 s. A fat wedge is a blob and what the eye
+    reads off a blob is its bulk rather than its bearing; an arc that lingered
+    would still be up when the next round landed, so a burst would read as one
+    continuous glow instead of as gunfire. The fall is measured from the END of
+    the attack rather than from the shot, or at a life this short the envelope
+    peaks at 0.81 of full and the flash is a smudge.
   * Drawn at z 6.0 — ABOVE the fog (5.0), deliberately: a sound cue dimmed by the
     fog it exists to see through would be faintest exactly where it is needed.
     One shared unit quad, one `SoundMaterial` per live arc, the shape entirely in

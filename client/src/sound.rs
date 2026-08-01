@@ -22,18 +22,22 @@
 //!
 //! * The wedge is drawn as a flat plateau with both rims fading out, so there is
 //!   no bright centre line to read a bearing off. What it says is "in here".
-//! * The centre is displaced from the truth by a uniform draw across
-//!   [`OFFSET_SHARE`] of the half-angle — uniform because any peakier
-//!   distribution makes the middle of the wedge the best guess again, which is
-//!   the readout this is built to withhold. The share is under 1, so the shooter
-//!   is always genuinely inside the arc: it is imprecise, never a lie.
-//! * That displacement then WALKS, sinusoidally, over a few seconds — so a
-//!   listener who stands still and collects six shots from one rifle cannot
-//!   average the error away, which is exactly what independent per-shot draws
-//!   would have let them do. The walk is per SOURCE rather than per shot for the
-//!   same reason, and it re-draws itself only after that source has been quiet
-//!   for [`QUIET_RESEED`]: within a burst the error drifts, between engagements
-//!   it is a fresh guess.
+//! * The centre is displaced from the truth by up to [`OFFSET_SHARE`] of the
+//!   half-angle, uniformly — uniform because any peakier distribution makes the
+//!   middle of the wedge the best guess again, which is the readout this is
+//!   built to withhold. The share is under 1, so the shooter is always genuinely
+//!   inside the arc: it is imprecise, never a lie.
+//! * **That displacement is a function of the OFFSET between the two pawns, not
+//!   of the clock** ([`error_at`]). It is not random and it does not tick: it is
+//!   a smooth field over the relative position, so the error is fixed while
+//!   neither of you moves and slides as soon as either of you does, in any
+//!   direction. Which means a listener who stands still and collects six shots
+//!   from one rifle gets six arcs that agree — the error is a property of where
+//!   the two of you are standing, and the way to change it is to move.
+//!   Independent per-shot draws are what this replaced, and they were worse in
+//!   both directions: they let a stationary listener average the error away,
+//!   and they made a stationary shooter's arcs jitter for no reason a player
+//!   could see.
 //!
 //! So closing the distance genuinely buys information — the arc narrows and its
 //! error narrows with it, both proportional — and standing off does not.
@@ -55,7 +59,7 @@
 //! standing in the middle of it firing a round a second, so the arcs can be
 //! walked around instead of waited for.
 
-use std::f32::consts::{PI, TAU};
+use std::f32::consts::TAU;
 
 use bevy::mesh::MeshVertexBufferLayoutRef;
 use bevy::platform::collections::HashMap;
@@ -81,13 +85,17 @@ const HEAR_RANGE: f32 = 1000.0;
 const POINT_BLANK: f32 = 100.0;
 
 /// The ring the wedge is drawn in, world units from the listener. The hole is
-/// what the brief asked for and what makes the effect readable — a wedge that
-/// touched the soldier would be read as something happening TO him, and it
-/// would sit under the one sprite the player is actually watching. The outer
-/// rim stays inside half the short side of a portrait phone, so an arc is never
-/// clipped by the screen edge on the platform this game is for.
-const RING_INNER: f32 = 74.0;
-const RING_OUTER: f32 = 126.0;
+/// what makes the effect readable — a wedge that touched the soldier would be
+/// read as something happening TO him, and it would sit under the one sprite the
+/// player is actually watching. The rim stays inside half the short side of a
+/// portrait phone, so an arc is never clipped by the screen edge on the platform
+/// this game is for.
+///
+/// It is a THIN band on purpose: a fat one is a blob, and what the eye reads off
+/// a blob is its bulk rather than its bearing. Ten units of arc at a hundred
+/// units out is a stroke, and a stroke has a direction.
+const RING_INNER: f32 = 95.0;
+const RING_OUTER: f32 = 105.0;
 
 /// Half-angle of the wedge at [`POINT_BLANK`] and at [`HEAR_RANGE`], radians —
 /// so about 20 degrees across when it is next to you and 130 when it is the
@@ -111,26 +119,35 @@ const SPREAD_FAR: f32 = 1.14;
 const LOUD_NEAR: f32 = 0.78;
 const LOUD_FAR: f32 = 0.12;
 
-/// How long one shot stays on screen, seconds, and how much of that is the
-/// snap up to full. The rise is nearly instant and the fall is slow — the same
-/// asymmetry `Aim::sway` is built on, for the same reason: a bang arrives all
-/// at once and its memory does not.
-const PING_LIFE: f32 = 1.4;
-const PING_ATTACK: f32 = 0.05;
+/// How long one shot stays on screen, seconds, and how much of that is the snap
+/// up to full. It is a FLASH — a bang and a muzzle flare are momentary, and an
+/// arc that lingered would still be sitting there when the next round arrived,
+/// so a burst would read as one continuous glow instead of as gunfire. The rise
+/// is nearly instant and the fall takes the rest, which is the asymmetry
+/// `Aim::sway` is built on for the same reason: a bang arrives all at once and
+/// its memory does not.
+const PING_LIFE: f32 = 0.4;
+const PING_ATTACK: f32 = 0.04;
 
 /// How much of the half-angle the drawn centre may be displaced by. Under 1 on
 /// purpose: the shooter is always inside the arc that gets drawn, so the wedge
 /// is imprecise rather than dishonest, and there is always a sliver of arc on
 /// the far side of the truth to make that visible.
 const OFFSET_SHARE: f32 = 0.72;
-/// Seconds for the displacement to walk one full circuit of its sine, picked
-/// per source. "A few seconds" — long enough that it reads as drift rather than
-/// as a wobble, short enough to have moved noticeably by the second shot.
-const WALK_PERIOD: (f32, f32) = (3.5, 6.5);
-/// How long a source has to have been silent before its error is re-drawn from
-/// scratch rather than carrying on walking. Inside this, successive shots are
-/// one engagement and share one drifting error.
-const QUIET_RESEED: f32 = 2.5;
+/// How far the two of you have to move RELATIVE TO EACH OTHER, in x and in y,
+/// for the bearing error to run through its whole range — world units. At
+/// walking pace (120 units a second) that is about a second of movement for a
+/// full sweep, so a couple of paces visibly shifts the arc and standing still
+/// does not shift it at all.
+///
+/// The two are deliberately incommensurate: equal pitches would make the error
+/// constant along the diagonal, which is a direction a player could learn.
+const ERROR_PITCH: (f32, f32) = (150.0, 95.0);
+/// A finer wave folded into the phase, radians, so the lines of constant error
+/// are wavy rather than a ruled grid across the map. Kept well under the pitch
+/// term's own gradient: it is there to bend the field, not to make it jitter.
+const ERROR_WARP: f32 = 0.55;
+const ERROR_WARP_PITCH: (f32, f32) = (61.0, 43.0);
 
 /// Muzzle yellow — warm and pale rather than saturated, because it is drawn over
 /// dark olive sward and a deep yellow at low alpha turns muddy green.
@@ -196,77 +213,41 @@ pub fn setup_sound(mut commands: Commands, mut meshes: ResMut<Assets<Mesh>>) {
     commands.insert_resource(PingQuad(meshes.add(Rectangle::new(2.0, 2.0))));
 }
 
-/// Where one source's bearing error currently sits, and how fast it is walking.
+/// A triangle wave of `phase`, -1..=1.
 ///
-/// `phase` is an angle on a sine whose amplitude is the whole error budget, so
-/// `offset()` is a signed share of it. Seeding by `asin` rather than by picking
-/// a phase directly is what makes the FIRST reading of a fresh error uniform —
-/// `sin` of a uniform phase is not uniform, it piles up at the extremes, which
-/// would put the shooter near the rim of the arc far more often than in it.
-#[derive(Copy, Clone, Debug)]
-struct Wander {
-    phase: f32,
-    rate: f32,
-    /// Seconds since this source was last heard from.
-    quiet: f32,
+/// A TRIANGLE and not a sine, and that is the whole reason [`error_at`] can
+/// claim to be uniform: a phase that sweeps evenly comes out of a triangle
+/// evenly, where `sin` of the same phase is arcsine-distributed and piles up at
+/// the extremes — which would park the shooter near the rim of the arc far more
+/// often than inside it. It is continuous, so the error never jumps.
+fn triangle(phase: f32) -> f32 {
+    4.0 * ((phase / TAU + 0.25).rem_euclid(1.0) - 0.5).abs() - 1.0
 }
 
-impl Wander {
-    /// A fresh error of `start` (a share in -1..=1), walking at one circuit per
-    /// `period` seconds. `backward` reflects the phase so the walk can set off
-    /// either way from the same starting error.
-    fn seeded(start: f32, period: f32, backward: bool) -> Self {
-        let phase = start.clamp(-1.0, 1.0).asin();
-        Self {
-            phase: if backward { PI - phase } else { phase },
-            rate: TAU / period,
-            quiet: 0.0,
-        }
-    }
-
-    fn advance(&mut self, dt: f32) {
-        // Wrapped rather than left to grow: `sin` of a big f32 loses precision,
-        // and this ticks for as long as the tab is open.
-        self.phase = (self.phase + self.rate * dt).rem_euclid(TAU);
-        self.quiet += dt;
-    }
-
-    fn offset(&self) -> f32 {
-        self.phase.sin()
-    }
+/// How far off the truth an arc points, as a signed share of its own error
+/// budget (-1..=1), for a shooter this much [`Pos`] away from the listener.
+///
+/// A smooth field over the RELATIVE position rather than a clock or a die: two
+/// pawns standing still see the same error however many rounds go off, and any
+/// movement by either of them — theirs or yours, along any axis — slides it. The
+/// player-facing consequence is that moving is what resolves a bearing, which is
+/// the same bargain everything else in this game makes.
+fn error_at(offset: Vec2) -> f32 {
+    let phase = TAU * (offset.x / ERROR_PITCH.0 + offset.y / ERROR_PITCH.1)
+        + ERROR_WARP
+            * ((TAU * offset.x / ERROR_WARP_PITCH.0 + 0.7).sin()
+                + (TAU * offset.y / ERROR_WARP_PITCH.1 + 1.9).sin());
+    triangle(phase)
 }
 
-/// What this client remembers about other people's gunfire. Render-only state:
-/// nothing in here is rolled back, checksummed or sent anywhere.
-#[derive(Resource)]
+/// What this client remembers about other people's gunfire: which shot of theirs
+/// it has already thrown an arc for, and nothing else — the error itself is a
+/// function of where the two of you are standing and is not stored anywhere.
+/// Render-only state: nothing in here is rolled back, checksummed or sent.
+#[derive(Resource, Default)]
 pub struct Heard {
     /// Per source: the frame its most recently noticed shot was fired on.
     shots: HashMap<usize, i32>,
-    /// Per source: the bearing error every arc of theirs is currently drawn with.
-    wander: HashMap<usize, Wander>,
-    /// Client-side dice. Deliberately NOT the sim's — this is a fact about one
-    /// screen, and two peers seeing different arcs is not a desync, it is two
-    /// people standing in different places.
-    rng: u32,
-}
-
-impl Default for Heard {
-    fn default() -> Self {
-        Self { shots: HashMap::new(), wander: HashMap::new(), rng: 0x5EED_1234 }
-    }
-}
-
-impl Heard {
-    /// Uniform in 0..1.
-    fn unit(&mut self) -> f32 {
-        self.rng = self.rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-        (self.rng >> 8) as f32 / (1u32 << 24) as f32
-    }
-
-    /// Uniform in -1..1.
-    fn signed(&mut self) -> f32 {
-        self.unit() * 2.0 - 1.0
-    }
 }
 
 /// One shot, on screen. `source` is where it was fired from rather than a
@@ -276,7 +257,6 @@ impl Heard {
 #[derive(Component)]
 pub struct Ping {
     source: Vec2,
-    from: usize,
     /// How far off the truth this arc's centre may be dragged — a share of the
     /// wedge's own half-angle, so it is fixed at the range the bang happened at
     /// along with everything else distance decides.
@@ -304,7 +284,11 @@ fn envelope(age: f32) -> f32 {
         return 0.0;
     }
     let attack = (age / PING_ATTACK).clamp(0.0, 1.0);
-    let left = 1.0 - age / PING_LIFE;
+    // The fall is measured from the END of the rise, not from the shot, so the
+    // arc reaches its full strength rather than whatever is left of it after the
+    // attack has been spent. At a life this short that is the difference between
+    // a flash and a smudge — 0.81 of full, in the version this replaced.
+    let left = ((PING_LIFE - age) / (PING_LIFE - PING_ATTACK)).clamp(0.0, 1.0);
     attack * left * left
 }
 
@@ -365,26 +349,14 @@ pub fn hear_gunfire(
             continue;
         }
 
-        // Carry on walking the error this source already had, unless they have
-        // been quiet long enough for this to be a new engagement.
-        let fresh = heard.wander.get(&player.handle).is_none_or(|w| w.quiet > QUIET_RESEED);
-        if fresh {
-            let start = heard.signed();
-            let period = WALK_PERIOD.0 + heard.unit() * (WALK_PERIOD.1 - WALK_PERIOD.0);
-            let backward = heard.unit() < 0.5;
-            heard
-                .wander
-                .insert(player.handle, Wander::seeded(start, period, backward));
-        } else if let Some(walk) = heard.wander.get_mut(&player.handle) {
-            walk.quiet = 0.0;
-        }
-
         let half = spread(dist);
-        let grain = heard.unit() * 64.0;
+        // The grain is the only thing left that wants to differ between one arc
+        // and the next, and the frame it was fired on is a perfectly good
+        // arbitrary number — so there are no dice anywhere in this module.
+        let grain = fired_on.rem_euclid(97) as f32 * 0.37;
         commands.spawn((
             Ping {
                 source,
-                from: player.handle,
                 limit: half * OFFSET_SHARE,
                 loud: loudness(dist),
                 age: 0.0,
@@ -400,13 +372,11 @@ pub fn hear_gunfire(
     }
 }
 
-/// Age every arc, keep it centred on the listener and pointed down its
-/// (wandering) bearing, and take it away when it has faded out.
-#[allow(clippy::too_many_arguments)]
+/// Age every arc, keep it centred on the listener and pointed down the bearing
+/// its offset says to draw, and take it away when it has faded out.
 pub fn fade_pings(
     mut commands: Commands,
     time: Res<Time>,
-    mut heard: ResMut<Heard>,
     mut materials: ResMut<Assets<SoundMaterial>>,
     mut pings: Query<(Entity, &mut Ping, &mut Transform, &MeshMaterial2d<SoundMaterial>)>,
     pawns: Query<(&Player, &Pos)>,
@@ -414,9 +384,6 @@ pub fn fade_pings(
     spectating: Res<Spectating>,
 ) {
     let dt = time.delta_secs();
-    for walk in heard.wander.values_mut() {
-        walk.advance(dt);
-    }
     let here = listening(local.as_deref(), &spectating)
         .and_then(|me| pawns.iter().find(|(p, _)| p.handle == me))
         .map(|(_, pos)| at(pos));
@@ -432,10 +399,15 @@ pub fn fade_pings(
             continue;
         }
         let Some(here) = here else { continue };
-        let drift = heard.wander.get(&ping.from).map_or(0.0, Wander::offset);
+        // Both halves of the bearing are recomputed from where the two of you
+        // are RIGHT NOW: the direction to the place the shot came from, and the
+        // error the offset between you happens to carry. So walking two paces
+        // swings the arc twice over — once because the place moved round you,
+        // and once because you are somewhere else in the error field.
+        let offset = ping.source - here;
         transform.translation = here.extend(Z_SOUND);
         transform.rotation =
-            Quat::from_rotation_z((ping.source - here).to_angle() + ping.limit * drift);
+            Quat::from_rotation_z(offset.to_angle() + ping.limit * error_at(offset));
         if let Some(material) = materials.get_mut(material.0.id()) {
             material.arc.z = level;
         }
@@ -464,61 +436,95 @@ mod tests {
     /// **The shooter is always inside the arc.** The cue is allowed to be vague
     /// and is not allowed to be wrong: an arc that could point somewhere the
     /// shot did not come from would teach players to ignore it.
+    /// Every offset a pawn could stand at, a hex apart, out to the whole arena
+    /// and past it.
+    fn offsets() -> impl Iterator<Item = Vec2> {
+        (-60..=60).flat_map(|ix| {
+            (-60..=60).map(move |iy| Vec2::new(ix as f32 * 16.0, iy as f32 * 16.0))
+        })
+    }
+
+    /// **The shooter is always inside the arc.** The cue is allowed to be vague
+    /// and is not allowed to be wrong: an arc that could point somewhere the
+    /// shot did not come from would teach players to ignore it. Checked over
+    /// every offset rather than a sample, since the error is now a field and a
+    /// field can be checked exhaustively.
     #[test]
     fn the_shot_is_always_somewhere_inside_the_arc() {
-        let mut heard = Heard::default();
-        for dist in [10.0, 100.0, 333.0, HEAR_RANGE] {
-            let half = spread(dist);
-            for _ in 0..500 {
-                let walk = Wander::seeded(heard.signed(), 4.0, false);
-                // The worst the walk can ever do, not just where it starts.
-                for step in 0..200 {
-                    let mut walk = walk;
-                    walk.advance(step as f32 * 0.05);
-                    let error = (half * OFFSET_SHARE * walk.offset()).abs();
-                    assert!(error < half, "at {dist} the arc pointed {error} off a {half} wedge");
-                }
+        for offset in offsets() {
+            let error = error_at(offset);
+            assert!(
+                error.abs() <= 1.0,
+                "the error field left its own range at {offset}: {error}"
+            );
+            for dist in [10.0, 100.0, 333.0, HEAR_RANGE] {
+                let half = spread(dist);
+                let off = (half * OFFSET_SHARE * error).abs();
+                assert!(off < half, "at {dist} the arc pointed {off} off a {half} wedge");
             }
         }
     }
 
-    /// A fresh error is uniform — anything peakier and the middle of the wedge
-    /// becomes the best guess again, which is the one reading this withholds —
-    /// and it then walks, so standing still and collecting a burst does not
-    /// average it away.
+    /// The error is a FIELD OVER THE OFFSET, not a clock and not a die: it holds
+    /// still while the two of you do, and slides as soon as either of you moves
+    /// in any direction.
     #[test]
-    fn the_error_starts_uniform_and_then_walks() {
-        for start in [-0.99, -0.5, 0.0, 0.37, 0.99] {
-            for backward in [false, true] {
-                let walk = Wander::seeded(start, 4.0, backward);
-                assert!(
-                    (walk.offset() - start).abs() < 1e-5,
-                    "seeded at {start} and started at {}",
-                    walk.offset()
-                );
+    fn the_error_is_a_function_of_where_the_two_of_you_stand() {
+        // Standing still: the tenth round from one rifle is drawn exactly where
+        // the first was. This is what makes the arc a reading of the ground
+        // rather than a flicker to be averaged out.
+        let offset = Vec2::new(-137.0, 61.0);
+        assert_eq!(error_at(offset), error_at(offset));
+
+        // …and it does not matter WHICH of you moved, since only the offset is
+        // read: a step by the shooter and the opposite step by the listener are
+        // the same event as far as this is concerned.
+        let (source, here, step) =
+            (Vec2::new(120.0, -40.0), Vec2::new(-30.0, 55.0), Vec2::new(23.0, -14.0));
+        assert_eq!(error_at((source + step) - here), error_at(source - (here - step)));
+
+        // A pace in ANY direction moves it, diagonals included — the two pitches
+        // are incommensurate precisely so there is no heading a player could
+        // walk to keep the error where it is. Averaged over the field rather
+        // than sampled at one point: this is a smooth field, so it has
+        // stationary points, and hitting one is not a bug — a whole direction
+        // being flat would be.
+        for step in [
+            Vec2::X,
+            Vec2::NEG_X,
+            Vec2::Y,
+            Vec2::NEG_Y,
+            Vec2::new(1.0, 1.0).normalize(),
+            Vec2::new(1.0, -1.0).normalize(),
+        ] {
+            let moved = 30.0 * step;
+            let mut sum = 0.0;
+            let mut n = 0.0;
+            for offset in offsets() {
+                sum += (error_at(offset + moved) - error_at(offset)).abs();
+                n += 1.0;
             }
+            let mean = sum / n;
+            assert!(mean > 0.2, "walking {step} 30 units barely moved the error: mean {mean}");
         }
 
-        // Uniform in the aggregate, not just at the ends: with a sine seeded by
-        // phase instead of by `asin`, the outer fifths hold ~29% of the draws
-        // each and the middle fifth ~13%.
-        let mut heard = Heard::default();
+        // Uniform across the field, which is what the triangle wave buys: a sine
+        // of the same phase is arcsine-distributed and would leave the outer
+        // fifths holding ~29% of the map each against ~13% for the middle,
+        // making the centre of the wedge the best guess again.
         let mut bins = [0usize; 5];
-        for _ in 0..20_000 {
-            let start = Wander::seeded(heard.signed(), 4.0, false).offset();
-            bins[(((start + 1.0) / 2.0 * 5.0) as usize).min(4)] += 1;
+        let mut total = 0usize;
+        for offset in offsets() {
+            bins[(((error_at(offset) + 1.0) / 2.0 * 5.0) as usize).min(4)] += 1;
+            total += 1;
         }
         for (bin, count) in bins.iter().enumerate() {
+            let share = *count as f32 / total as f32;
             assert!(
-                (3400..4600).contains(count),
-                "bin {bin} took {count} of 20000 draws, which is not uniform: {bins:?}"
+                (0.17..0.23).contains(&share),
+                "fifth {bin} covers {share} of the field, which is not uniform: {bins:?}"
             );
         }
-
-        // …and a second and a half later it is somewhere else.
-        let mut walk = Wander::seeded(0.0, 4.0, false);
-        walk.advance(1.5);
-        assert!(walk.offset().abs() > 0.5, "the error barely moved: {}", walk.offset());
     }
 
     /// The fade: instant on the shot, gone by the end of its life, and never
@@ -526,7 +532,7 @@ mod tests {
     #[test]
     fn a_shot_arrives_at_once_and_fades_out() {
         assert_eq!(envelope(0.0), 0.0);
-        assert!(envelope(PING_ATTACK) > 0.9);
+        assert!((envelope(PING_ATTACK) - 1.0).abs() < 1e-6, "the arc never reaches full");
         assert_eq!(envelope(PING_LIFE), 0.0);
         let mut last = f32::MAX;
         for step in 1..=60 {

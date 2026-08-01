@@ -302,7 +302,9 @@ pub fn setup_scene(
 ) {
     match *scenario {
         // The game: unzoomed, one world unit per pixel, following the pawn.
-        Scenario::Arena => {
+        // The gunfire demo is the game — walking around the noise at the scale
+        // you would actually hear it at is the whole exercise.
+        Scenario::Arena | Scenario::Gunfire => {
             commands.spawn(Camera2d);
         }
         // The rig is a scene to be looked AT, not played: frame both pawns and

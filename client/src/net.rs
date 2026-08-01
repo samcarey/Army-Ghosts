@@ -90,8 +90,10 @@ const DEFAULT_SIGNALING: &str = "ws://127.0.0.1:3536";
 /// second pawn in solo practice reads as "someone else is here"); an explicit
 /// `players` still forces a multi-handle local synctest for testing.
 fn resolve_players(explicit: Option<usize>, has_room: bool, scenario: Scenario) -> usize {
-    if matches!(scenario, Scenario::GrassStrip { .. }) {
-        return 2; // the rig is a fixed two-hander; whatever `players` said is noise
+    if matches!(scenario, Scenario::GrassStrip { .. } | Scenario::Gunfire) {
+        // Both rigs are fixed two-handers — you, and the pawn the scene is
+        // about; whatever `players` said is noise.
+        return 2;
     }
     explicit
         .unwrap_or(if has_room { MAX_PLAYERS } else { 1 })
@@ -102,7 +104,10 @@ fn resolve_players(explicit: Option<usize>, has_room: bool, scenario: Scenario) 
 /// exceed [`MAX_PLAYERS`] — there are only that many spawn points. The rig is a
 /// fixed two-hander and takes none.
 fn resolve_bots(explicit: Option<usize>, players: usize, scenario: Scenario) -> usize {
-    if matches!(scenario, Scenario::GrassStrip { .. }) {
+    if matches!(scenario, Scenario::GrassStrip { .. } | Scenario::Gunfire) {
+        // The gunfire demo takes none for a reason of its own: a bot would go
+        // hunting, and the whole point of the scene is ONE source of noise that
+        // stays where you left it.
         return 0;
     }
     explicit.unwrap_or(0).min(MAX_PLAYERS.saturating_sub(players))
@@ -113,6 +118,8 @@ fn resolve_bots(explicit: Option<usize>, players: usize, scenario: Scenario) -> 
 /// * `strip` — the concealment rig at the deepest grass the field can hold
 /// * `strip:<depth>` — that wall, `depth` units deep
 /// * `strip:<depth>:<level>` — and the east pawn crouching (1) or prone (2)
+/// * `gunfire` — the arena with one pawn firing a round a second, for looking
+///   at what gunfire sounds like (`client/src/sound.rs`)
 ///
 /// Ignored outright when a room is set: peers that disagree about which world
 /// they are in desync on the first tick, and nothing about this is worth that
@@ -123,8 +130,10 @@ fn parse_scenario(raw: Option<String>, has_room: bool) -> Scenario {
     }
     let Some(raw) = raw else { return Scenario::Arena };
     let mut parts = raw.split(':');
-    if parts.next() != Some("strip") {
-        return Scenario::Arena;
+    match parts.next() {
+        Some("strip") => {}
+        Some("gunfire") => return Scenario::Gunfire,
+        _ => return Scenario::Arena,
     }
     Scenario::GrassStrip {
         depth: parts

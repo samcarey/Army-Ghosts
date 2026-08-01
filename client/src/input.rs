@@ -33,7 +33,14 @@ pub fn read_local_inputs(
     aggro: Res<crate::menu::Aggression>,
     side: Res<crate::menu::SidePick>,
     facings: Query<(&Player, &Facing)>,
+    // Frames this has been asked for inputs, which in a synctest is ticks: the
+    // gunfire demo's metronome, and nothing else, reads it. It is a `Local`
+    // rather than the round clock because that clock does not run in a scenario
+    // (`run_round` returns), and rollback never re-runs `ReadInputs` — a frame
+    // is polled for its input exactly once, however many times it is simulated.
+    mut frames: Local<u32>,
 ) {
+    *frames = frames.wrapping_add(1);
     let room = room.as_deref();
     // Which of our local handles is US. In a p2p match every VACANT seat is
     // also local (see `net::Seat`), and `LocalPlayers` is in no order worth
@@ -139,6 +146,12 @@ pub fn read_local_inputs(
             // not a change. Normally that's just "stand"; the grass rig uses it
             // to pose the pawn nobody is driving.
             input.set_stance(scenario.idle_stance());
+            // …and the gunfire demo uses the same seat to pull a trigger on a
+            // metronome, which is the only way to look at a sound cue for long
+            // enough to judge it.
+            if scenario.idle_fire(*frames) {
+                input.buttons |= BTN_FIRE;
+            }
         }
         local_inputs.insert(*handle, input);
     }

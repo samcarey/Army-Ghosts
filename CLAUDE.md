@@ -1464,6 +1464,60 @@ nothing.
   a converging cone and nothing ever reaches full strength.
   `NoFrustumCulling` is required: the Aabb is computed once when `Mesh2d` is
   added, and the stale box blinks the fog out as the camera moves.
+- **Gunfire you can hear but not see** (`client/src/sound.rs` +
+  `client/assets/sound.wgsl`) — every round somebody ELSE fires throws a wedge
+  of yellow light on the ground around your soldier, in a ring that never
+  touches him, pointing roughly where the shot came from. Render-only, on the
+  same line as `vision.rs` and `nameplate.rs`: what one pawn can hear is a fact
+  about who is holding the phone, and the sim has no point of view. It is the
+  counterweight to the concealment model — an enemy in deep grass 50 units away
+  is genuinely invisible, and a firefight you cannot locate at all is arbitrary
+  rather than tense. `Aim::flash` already made firing cost concealment to the
+  BOTS' eyes through the ordinary sighting path; this is the human's half of the
+  same bargain.
+  * **The vagueness is the mechanic, and every part of it is deliberate.** The
+    wedge is a flat plateau with both rims fading out, so there is no bright
+    centre line to read a bearing off — what it says is "in here". Its centre is
+    then displaced from the truth by a UNIFORM draw across `OFFSET_SHARE` (0.72)
+    of the half-angle: uniform because any peakier distribution makes the middle
+    of the wedge the best guess again, which is the one readout this exists to
+    withhold. The share is under 1, so the shooter is always genuinely inside the
+    arc — imprecise, never wrong, and `the_shot_is_always_somewhere_inside_the_arc`
+    pins that at every range and every point of the walk below.
+  * **The error WALKS, sinusoidally, and it belongs to the SOURCE rather than to
+    the shot.** Independent per-shot draws are worth nothing against a rifle
+    firing repeatedly: stand still, collect six arcs, average them, and the error
+    is gone. One drifting error per source cannot be averaged out, and it re-draws
+    itself only after that source has been quiet for `QUIET_RESEED` (2.5 s) — so
+    within an engagement the bearing drifts, and a fresh engagement is a fresh
+    guess. Seeding is by `asin` of a uniform draw, NOT by picking a phase: `sin`
+    of a uniform phase piles up at the extremes, which would park the shooter
+    near the rim of the arc far more often than inside it.
+  * **Distance sets both the width and the strength, and it opens with the SQUARE
+    ROOT of it.** The arena is 800x600 and nearly every shot fired in it lands in
+    the first third of `HEAR_RANGE`, so a straight line spends most of its travel
+    on distances that never happen and leaves every real engagement reading as
+    "about here"; under a root, 300 units — a long shot in this game — is already
+    a 70-degree wedge. So closing genuinely buys information (the arc and its
+    error narrow together, both proportional) and standing off does not.
+  * **A shot is identified by the FRAME IT WAS FIRED ON**, recovered from the
+    shooter's `Cooldown` (`frame - (FIRE_COOLDOWN - left)`), with the last one
+    per source remembered. There is no event to subscribe to and `Added<Bullet>`
+    is a trap: bullets are rollback entities, so it fires again every time the
+    frame they spawned on is re-simulated, which in a p2p match is most frames.
+    Rollback rewinds the frame counter and the cooldown together, so the same
+    shot recovers the same number however often it is replayed.
+  * Drawn at z 6.0 — ABOVE the fog (5.0), deliberately: a sound cue dimmed by the
+    fog it exists to see through would be faintest exactly where it is needed.
+    One shared unit quad, one `SoundMaterial` per live arc, the shape entirely in
+    the fragment shader (a fan of triangles fine enough to hide its own facets
+    would still band across the gradient).
+  * **Whose ears these are is `render::camera_follow`'s choice, not
+    `MatchRoom::me`** — the arcs are drawn around the pawn on screen, and hearing
+    for one soldier while looking through another's eyes reads as the effect
+    being broken.
+  * See it: **`?scenario=gunfire`** (`AG_SCENARIO=gunfire`) — the arena with one
+    pawn standing in the middle of it firing a round a second.
 
 ## Gotchas already hit (don't rediscover)
 
@@ -1738,6 +1792,19 @@ need a TURN server eventually.
   wire carries the level a pawn is ASKING for every tick, and `input.rs` would
   otherwise send "stand" for it and quietly stand it back up. Hence
   `Scenario::idle_stance`, which every non-first local handle sends.
+  * **`Scenario::Gunfire` is the second rig, and it is the arena rather than a
+    substitute for it**: real terrain, real cover, one pawn to walk around with
+    and one standing dead centre firing a round a second (`DEMO_FIRE_TICKS`), so
+    the sound arcs above can be looked at instead of waited for. Same
+    offline-only rule, `players` forced to 2, and no bots — a bot would go
+    hunting, and the point of the scene is ONE source of noise that stays where
+    you left it. It fires NORTH rather than at you, because a demo that shoots
+    the person looking at it is a demo that ends. The trigger rides in on
+    `Scenario::idle_fire`, sent from the same idle branch of `input.rs` that
+    poses the strip's east pawn: the sim is driven by inputs, and a pawn that
+    fired because of a rule of its own would be a second source of truth for the
+    trigger. Its frame counter is a `Local` in `read_local_inputs` rather than
+    the round clock, which does not run in a scenario at all.
 - **`tools/grass-shots.sh [outdir]`** — that scene, photographed. Numbers can
   stay put while the picture rots, so this is the companion to the table above:
   it runs `grass-table.sh` first and takes both the depths AND each frame's

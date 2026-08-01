@@ -11,6 +11,7 @@ mod nameplate;
 mod net;
 mod persist;
 mod render;
+mod sound;
 mod spectate;
 mod stance;
 mod touch;
@@ -68,6 +69,7 @@ fn main() {
     )
     .add_plugins(vision::VisionPlugin)
     .add_plugins(grass::GrassPlugin)
+    .add_plugins(sound::SoundPlugin)
     .add_plugins(GgrsPlugin::<SessionConfig>::default())
     .add_plugins(SimPlugin::<SessionConfig>::default())
     .add_systems(ReadInputs, input::read_local_inputs)
@@ -115,6 +117,7 @@ fn main() {
             spectate::setup_spectate,
             nameplate::setup_nameplates,
             vision::setup_fog,
+            sound::setup_sound,
         )
             .chain(),
     )
@@ -187,6 +190,10 @@ fn main() {
                 ads::update_aim_line,
                 vision::update_fog,
                 vision::fade_hidden,
+                // Gunfire you can hear but not see. After `fade_hidden` on
+                // purpose: they answer the same question from opposite ends —
+                // one hides the shooter, the other says roughly where he was.
+                (sound::hear_gunfire, sound::fade_pings).chain(),
                 render::camera_follow,
                 // AFTER the camera: nameplates are screen positions, and one
                 // computed against last frame's camera slides about as you walk.

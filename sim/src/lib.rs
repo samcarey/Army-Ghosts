@@ -1544,8 +1544,15 @@ pub fn grass_cover(x: i32, y: i32, stance: u8) -> i32 {
 /// `tools/grass-shots.sh` are the same scene rather than two descriptions of
 /// one, and so the wall can be set to depths the procedural field never reaches.
 ///
-/// It is a dev scenario and OFFLINE ONLY — `net.rs` ignores it whenever a room
-/// is set, because two peers building different worlds is a desync by
+/// [`Scenario::Gunfire`] is the second rig and it is the arena, not a
+/// substitute for it: the real terrain, one pawn to walk around with and one
+/// standing in the middle of it firing a round a second. It exists because the
+/// client's sound arcs (`client/src/sound.rs`) can only be judged by walking
+/// around a source that keeps making noise, and gunfire in a real match is
+/// exactly what you cannot arrange to happen on cue.
+///
+/// Both are dev scenarios and OFFLINE ONLY — `net.rs` ignores them whenever a
+/// room is set, because two peers building different worlds is a desync by
 /// construction. Nothing in a real match ever sees anything but `Arena`.
 #[derive(Resource, Copy, Clone, PartialEq, Eq, Debug, Default)]
 pub enum Scenario {
@@ -1555,6 +1562,10 @@ pub enum Scenario {
     /// (it has no player: only the first local handle takes input, so its
     /// stance has to be told to it — see `client/src/input.rs`).
     GrassStrip { depth: i32, east_stance: u8 },
+    /// The arena, with one pawn firing on a metronome. Same terrain as the
+    /// game; only who is standing where, and what the pawn nobody is driving
+    /// does with its trigger, are different.
+    Gunfire,
 }
 
 /// Half the width of the wall in [`Scenario::GrassStrip`], world units — one
@@ -1566,11 +1577,20 @@ pub const STRIP_HALF_W: i32 = 16;
 /// pawn and the grass.
 pub const STRIP_STANDOFF: i32 = 48;
 
+/// How far the player starts from the noise in [`Scenario::Gunfire`], world
+/// units — far enough that the first arc you see is a wide, faint one, so
+/// walking in is what shows you the mechanic.
+pub const DEMO_STANDOFF: i32 = 300;
+/// How often the demo pawn pulls its trigger, in ticks. A round a second: often
+/// enough to walk a few paces between arcs and watch the next one answer
+/// differently, slow enough that they do not pile into one continuous glow.
+pub const DEMO_FIRE_TICKS: u32 = TICK_HZ as u32;
+
 impl Scenario {
     /// How deep the grass is at a point in this world, world units.
     pub fn depth(&self, x: i32, y: i32) -> i32 {
         match *self {
-            Scenario::Arena => grass_height(x, y),
+            Scenario::Arena | Scenario::Gunfire => grass_height(x, y),
             Scenario::GrassStrip { depth, .. } => {
                 if x.abs() <= STRIP_HALF_W {
                     depth
@@ -1593,7 +1613,7 @@ impl Scenario {
     /// rock that exists, nor be kept off one that doesn't.
     pub fn rocks(&self) -> Vec<(i32, i32, Rock)> {
         match *self {
-            Scenario::Arena => rock_layout(),
+            Scenario::Arena | Scenario::Gunfire => rock_layout(),
             Scenario::GrassStrip { .. } => Vec::new(),
         }
     }
@@ -1603,8 +1623,24 @@ impl Scenario {
     /// posed, since nothing else can pose it.
     pub fn idle_stance(&self) -> u8 {
         match *self {
-            Scenario::Arena => STANCE_STAND,
+            Scenario::Arena | Scenario::Gunfire => STANCE_STAND,
             Scenario::GrassStrip { east_stance, .. } => east_stance.min(STANCE_PRONE),
+        }
+    }
+
+    /// Whether the handles nobody is driving are holding the trigger this
+    /// frame. In the game they never are; in the gunfire demo that metronome is
+    /// the entire scene.
+    ///
+    /// It rides in on the input stream rather than being a system in here for
+    /// the reason everything else does: the sim is driven by inputs, and a pawn
+    /// that fired because of a rule of its own would be a second source of
+    /// truth for the trigger. `client/src/input.rs` sends it, the same place
+    /// [`Scenario::idle_stance`] is sent from.
+    pub fn idle_fire(&self, frame: u32) -> bool {
+        match *self {
+            Scenario::Gunfire => frame.is_multiple_of(DEMO_FIRE_TICKS),
+            _ => false,
         }
     }
 }
@@ -1971,11 +2007,16 @@ pub fn spawn_world(commands: &mut Commands, num_players: usize, scenario: Scenar
     // (`save::restore`) does not call this and installs the round it was given,
     // which is the whole point of a resume.
     commands.insert_resource(Round::default());
-    for handle in 0..num_players.min(MAX_PLAYERS) {
-        // Alternating, so two players are 1v1 rather than 2v0 — see
-        // [`default_side`]. The slot follows from it, so the first pair take the
-        // southernmost post at each end and the sides fill northward together.
-        spawn_pawn(commands, handle, Team(default_side(handle)), handle / TEAM_COUNT);
+    if matches!(scenario, Scenario::Gunfire) {
+        spawn_gunfire_demo(commands);
+    } else {
+        for handle in 0..num_players.min(MAX_PLAYERS) {
+            // Alternating, so two players are 1v1 rather than 2v0 — see
+            // [`default_side`]. The slot follows from it, so the first pair take
+            // the southernmost post at each end and the sides fill northward
+            // together.
+            spawn_pawn(commands, handle, Team(default_side(handle)), handle / TEAM_COUNT);
+        }
     }
     for (x, y, rock) in rock_layout() {
         commands
@@ -2010,6 +2051,32 @@ fn spawn_grass_strip(commands: &mut Commands, east_stance: u8) {
             Facing { x: toward, y: 0 },
             Stance { level, change: 0 },
         ));
+    }
+}
+
+/// The gunfire demo ([`Scenario::Gunfire`]): a pawn to walk around with, and one
+/// standing in the middle of the arena pulling its trigger once a second.
+///
+/// Two things about the second pawn. It stands in the CENTRE, so there is a
+/// full field of terrain in every direction to walk it from — the muster lines
+/// would have put it against a wall with half the approaches off the map. And
+/// it points NORTH rather than at you, because a demo that shoots the person
+/// looking at it is a demo that ends: nothing drives this pawn but the idle
+/// branch of `client/src/input.rs`, and a blank aim leaves [`Facing`] exactly
+/// where it was, so the bearing it spawns on is the one it keeps.
+///
+/// The round clock does not run here (`run_round` returns on any scenario but
+/// the arena), which is what stops the pair being re-posted to the muster lines
+/// two minutes in.
+fn spawn_gunfire_demo(commands: &mut Commands) {
+    for (handle, x, y, toward) in [
+        (0, -DEMO_STANDOFF, 0, (127, 0)),
+        (1, 0, 0, (0, 127)),
+    ] {
+        let pawn = spawn_pawn(commands, handle, Team(default_side(handle)), 0);
+        commands
+            .entity(pawn)
+            .insert((Pos::from_units(x, y), Facing { x: toward.0, y: toward.1 }));
     }
 }
 

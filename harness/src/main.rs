@@ -96,7 +96,8 @@ usage: selfplay [options]
   -q, --quiet            verdict only, no per-pair lines
 
 SPEC is comma separated `key=value`, filling in from the default profile:
-  skill, accuracy, aggression, caution   0.0 .. 1.0
+  skill, accuracy, aggression, caution,
+  discipline                             0.0 .. 1.0
   reaction                               ticks, 0 .. 23
 
 A pair is the same dice played twice, with the candidate on the west line and
@@ -179,6 +180,7 @@ fn parse_profile(spec: &str) -> Result<BotProfile, String> {
             "accuracy" => profile.accuracy = fixed,
             "aggression" => profile.aggression = fixed,
             "caution" => profile.caution = fixed,
+            "discipline" => profile.discipline = fixed,
             other => return Err(format!("no dial called `{other}`")),
         }
     }
@@ -200,12 +202,14 @@ fn show_elo(rate: f64) -> String {
 fn show(profile: &BotProfile) -> String {
     let unit = |v: i32| v as f64 / FP as f64;
     format!(
-        "skill {:.2}  accuracy {:.2}  reaction {:<2}  aggression {:.2}  caution {:.2}",
+        "skill {:.2}  accuracy {:.2}  reaction {:<2}  aggression {:.2}  \
+         caution {:.2}  discipline {:.2}",
         unit(profile.skill),
         unit(profile.accuracy),
         profile.reaction,
         unit(profile.aggression),
-        unit(profile.caution)
+        unit(profile.caution),
+        unit(profile.discipline)
     )
 }
 

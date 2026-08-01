@@ -57,14 +57,14 @@ use bevy::prelude::*;
 use bevy_ggrs::AddRollbackCommandExtension;
 
 use crate::{
-    bush_layout, rock_layout, Bot, BotRoster, Cooldown, Deaths, Facing, Health, Intent, Kills,
+    bush_layout, rock_layout, Aim, Bot, BotRoster, Cooldown, Deaths, Facing, Health, Intent, Kills,
     Phase, Player, Pos, Round, Stance, Team, Winner, MAX_PLAYERS, STANCE_PRONE, TEAM_COUNT,
 };
 
 /// Blob format version. Bump on any field change: [`Save::decode`] refuses
 /// anything else, which is what stops a stale `localStorage` entry from a
 /// previous build being read as a world.
-pub const FORMAT: u32 = 1;
+pub const FORMAT: u32 = 2;
 
 const TAG: &str = "army-ghosts-save";
 
@@ -97,6 +97,19 @@ pub struct PawnSave {
     pub facing_x: i32,
     pub facing_y: i32,
     pub cooldown: u16,
+    /// How steady the hold was, how much recoil was owed, and the gun's own
+    /// dice — see [`crate::Aim`]. Carried rather than rebuilt because a player
+    /// who reloads the page mid-burst must not come back with a clean first
+    /// shot: the whole accuracy model is about what you were doing a second
+    /// ago, and a rejoin is exactly a second ago.
+    pub sway: i32,
+    pub bloom: i32,
+    /// Recent movement and recent aim traverse — carried for the same reason as
+    /// the other two: what you were doing a second ago is exactly what a rejoin
+    /// resumes into, and a runner must not come back as still as a statue.
+    pub stir: i32,
+    pub swing: i32,
+    pub aim_seed: u32,
     pub stance_level: u8,
     pub stance_change: u16,
     pub hp: i32,
@@ -179,7 +192,7 @@ impl Save {
         for p in &self.pawns {
             let _ = writeln!(
                 out,
-                "pawn {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+                "pawn {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
                 p.handle,
                 u8::from(p.bot),
                 p.team,
@@ -188,6 +201,11 @@ impl Save {
                 p.facing_x,
                 p.facing_y,
                 p.cooldown,
+                p.sway,
+                p.bloom,
+                p.stir,
+                p.swing,
+                p.aim_seed,
                 p.stance_level,
                 p.stance_change,
                 p.hp,
@@ -221,6 +239,7 @@ pub fn capture(world: &mut World, dials: Dials) -> Save {
         &Pos,
         &Facing,
         &Cooldown,
+        &Aim,
         &Stance,
         &Health,
         &Deaths,
@@ -230,22 +249,29 @@ pub fn capture(world: &mut World, dials: Dials) -> Save {
     let mut pawns: Vec<PawnSave> = query
         .iter(world)
         .map(
-            |(player, team, pos, facing, cooldown, stance, health, deaths, kills, bot)| PawnSave {
-                handle: player.handle,
-                bot: bot.is_some(),
-                team: team.0,
-                x: pos.x,
-                y: pos.y,
-                facing_x: facing.x,
-                facing_y: facing.y,
-                cooldown: cooldown.0,
-                stance_level: stance.level,
-                stance_change: stance.change,
-                hp: health.hp,
-                down: health.down,
-                hurt: health.hurt,
-                deaths: deaths.0,
-                kills: kills.0,
+            |(player, team, pos, facing, cooldown, aim, stance, health, deaths, kills, bot)| {
+                PawnSave {
+                    handle: player.handle,
+                    bot: bot.is_some(),
+                    team: team.0,
+                    x: pos.x,
+                    y: pos.y,
+                    facing_x: facing.x,
+                    facing_y: facing.y,
+                    cooldown: cooldown.0,
+                    sway: aim.sway,
+                    bloom: aim.bloom,
+                    stir: aim.stir,
+                    swing: aim.swing,
+                    aim_seed: aim.seed(),
+                    stance_level: stance.level,
+                    stance_change: stance.change,
+                    hp: health.hp,
+                    down: health.down,
+                    hurt: health.hurt,
+                    deaths: deaths.0,
+                    kills: kills.0,
+                }
             },
         )
         .collect();
@@ -318,6 +344,11 @@ impl Save {
                 facing_x: t.num()?,
                 facing_y: t.num()?,
                 cooldown: t.num()?,
+                sway: t.num()?,
+                bloom: t.num()?,
+                stir: t.num()?,
+                swing: t.num()?,
+                aim_seed: t.num()?,
                 stance_level: t.num::<u8>()?.min(STANCE_PRONE),
                 stance_change: t.num()?,
                 hp: t.num()?,
@@ -368,6 +399,9 @@ pub fn restore(commands: &mut Commands, save: &Save, roster: &BotRoster) {
             Pos { x: p.x, y: p.y },
             Facing { x: p.facing_x, y: p.facing_y },
             Cooldown(p.cooldown),
+            // Clamped and de-zeroed on the way in by `from_parts`: this is a
+            // parser of hostile input, and a zero seed is an LCG fixed point.
+            Aim::from_parts(p.sway, p.bloom, p.stir, p.swing, p.aim_seed),
             Stance { level: p.stance_level, change: p.stance_change },
             Health { hp: p.hp, down: p.down, hurt: p.hurt },
             Deaths(p.deaths),
@@ -412,6 +446,11 @@ mod tests {
                     facing_x: -127,
                     facing_y: 42,
                     cooldown: 3,
+                    sway: 118,
+                    bloom: 40,
+                    stir: 200,
+                    swing: 31,
+                    aim_seed: 0xDEAD_BEEF,
                     stance_level: STANCE_PRONE,
                     stance_change: 11,
                     hp: 37,
@@ -429,6 +468,11 @@ mod tests {
                     facing_x: 127,
                     facing_y: 0,
                     cooldown: 0,
+                    sway: 0,
+                    bloom: 0,
+                    stir: 0,
+                    swing: 0,
+                    aim_seed: 12_345,
                     stance_level: 1,
                     stance_change: 0,
                     hp: 0,

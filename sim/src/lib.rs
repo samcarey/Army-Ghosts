@@ -112,6 +112,274 @@ pub const STANCE_COUNT: usize = 3;
 /// [`Bush`] is foliage the sim knows about but doesn't act on.
 pub const STANCE_HEIGHT: [i32; STANCE_COUNT] = [64, 52, 15];
 
+// ── How accurate the gun is ─────────────────────────────────────────────────
+//
+// A round no longer leaves the barrel along `Facing`. It leaves along a
+// direction drawn from a cone, and how wide that cone is says everything about
+// what the shooter was doing when they pulled the trigger.
+//
+// **This is the mechanic run-and-gun loses to.** Before it, a sprinting pawn
+// and a pawn who had been lying still in the grass for a minute shot exactly
+// the same round, so every incentive the rest of the game builds — stance,
+// grass, patience, the whole no-respawn premise — was undercut by the one
+// system that decides whether any of it pays. Now the cone is the price list.
+//
+// Three inputs, kept separate because they answer different questions and tune
+// independently:
+//
+// * **[`Aim::sway`]** — how steady the hold is, a consequence of the pawn's
+//   POSTURE: stance, speed, and whether the sights are up. It has a settled
+//   value for any given posture and it EASES toward it, fast in the wrong
+//   direction and slowly in the right one (see [`SWAY_SETTLE_TICKS`]).
+// * **[`Aim::bloom`]** — recoil from rounds already fired, an accumulator that
+//   gains on every shot and bleeds off every tick. This is both of the "when
+//   did you last shoot" questions at once: how long ago falls out of the decay,
+//   and how long you have been holding the trigger falls out of the gain
+//   outrunning it.
+// * **[`SPREAD_MAX`]** — what the sum of those two is worth in angle.
+//
+// Everything here is integer and every step is idempotent given the tick's
+// inputs, so a replayed tick lands on the identical cone. The draw itself comes
+// from an LCG in [`Aim`] that is rolled back with the rest of the pawn, for the
+// same reason [`bot::Bot`]'s is: a shot that deviated differently on a
+// re-simulated frame is a desync, not a glitch.
+
+/// Widest the cone ever gets, as the **tangent of its half-angle** in `FP` —
+/// so the half-width at range `d` is `SPREAD_MAX * spread / FP * d / FP`.
+///
+/// A tangent rather than an angle because the whole point is where the round
+/// lands, and `offset = tan * distance` is one multiply where an angle would be
+/// a trig table. 0.22 is about 12°: at 100 units the cone is 22 wide either
+/// side of a pawn whose own radius is [`PLAYER_R`] (12), so a fully unsteady
+/// shooter misses roughly half its rounds at that range and nearly all of them
+/// at 260. Point blank it still connects, which is the intended shape — spray
+/// is a close-quarters answer, not a substitute for aiming.
+pub const SPREAD_MAX: i32 = FP * 32 / 100;
+
+/// The sway a pawn settles to in each stance, standing still with the sights
+/// down. `0..=FP`, indexed like [`STANCE_SPEED`].
+///
+/// Standing is deliberately mediocre rather than bad: half the cone is still
+/// 11 units at 100, so a standing shooter who has stopped moving can fight, and
+/// wants the sights up. Prone is nearly free, which is what pays for how blind
+/// and how slow it is.
+pub const STANCE_SWAY: [i32; STANCE_COUNT] = [FP * 52 / 100, FP * 30 / 100, FP * 12 / 100];
+
+/// What the sights are worth: a MULTIPLIER on the settled sway, not a
+/// subtraction, so bringing them up is worth most in the stance that is already
+/// steadiest. Feet planted and the weapon braced.
+///
+/// It multiplies rather than subtracts for a second reason: [`BTN_ADS`] already
+/// roots the pawn, so a shooter with the sights up has no movement term at all,
+/// and the two effects would otherwise double-count into a free perfect shot.
+pub const ADS_SWAY: i32 = FP * 45 / 100;
+
+/// What travelling at full standing speed ADDS to the settled sway, on top of
+/// the stance's own. Scaled by the square of the fraction of [`PLAYER_SPEED`]
+/// actually being covered, so a half-deflection walk costs a quarter of a run
+/// and the difference between creeping and charging is most of the dial.
+///
+/// Large enough that standing plus a full sprint saturates the cone: 0.52 +
+/// 0.60 is past `FP`. That is the intended reading — a running shooter is not
+/// inaccurate, they are not aiming.
+pub const MOVE_SWAY: i32 = FP * 60 / 100;
+
+/// Ticks to bleed the sway all the way from saturated down to a settled hold.
+/// 96 is 1.6 s, which is the "second or two" a shooter needs after coming to a
+/// stop before the sights mean anything.
+///
+/// **The asymmetry with [`SWAY_RISE_TICKS`] is the whole mechanic**, not a
+/// polish detail. If steadiness came back as fast as it went, a run-and-gunner
+/// could stop for two ticks and shoot as well as someone who had been holding
+/// the corner for a minute, and every constant above would be decoration.
+/// Unsteadiness is instant; steadiness is earned.
+pub const SWAY_SETTLE_TICKS: i32 = 96;
+/// And back up. Ten ticks — a sixth of a second — so the moment you move, you
+/// have lost it.
+pub const SWAY_RISE_TICKS: i32 = 10;
+
+/// What one round adds to [`Aim::bloom`], before the stance's share of it.
+pub const RECOIL_PER_SHOT: i32 = FP * 20 / 100;
+/// How much of a round's kick the shooter eats in each stance. Braced against
+/// the ground, most of it goes into the ground.
+pub const STANCE_RECOIL: [i32; STANCE_COUNT] = [FP, FP * 72 / 100, FP * 52 / 100];
+// Two more inputs joined the model after the first three shipped, and both are
+// about MOVEMENT — one about the target's, one about the shooter's barrel:
+//
+// * **[`Aim::stir`]** — how much this pawn has been moving lately, and it does
+//   not feed the cone at all: it feeds CONCEALMENT. Grass hides a still body
+//   and betrays a moving one, so a sprinting pawn forfeits most of what the
+//   grass was doing for it ([`MOTION_REVEAL`]) and keeps forfeiting it for the
+//   second it takes the sward to settle ([`STIR_DECAY`]). This is the half of
+//   "careful play should win" that the cone alone could not buy: the first
+//   model taxed a runner's OWN shooting, but a bot (or a person) who charges
+//   and only fires after arriving never paid it. Being SEEN on the way in is
+//   the tax that cannot be opted out of.
+// * **[`Aim::swing`]** — how fast the aim direction has been traversing. A
+//   barrel being swung is not a barrel on target: turning faster than
+//   [`SWING_FREE`] charges the cone open and holding steady hones it back in
+//   over [`SWING_DECAY`]. What this prices is TRACKING, and the price is
+//   naturally steepest up close — a target crossing at walking speed forces
+//   about 3°/tick of traverse at 40 units and less than 1° at 150, because
+//   angular rate is speed over range. So shooting a mover is harder than
+//   shooting a camper, most of all at knife range, with nothing in the code
+//   that mentions the target at all.
+
+/// How much of its grass concealment a pawn moving at full standing speed
+/// forfeits, `0..=FP`. Scaled by the SQUARE of [`Aim::stir`], so creeping is
+/// nearly free and the cost lives at the top of the speed range — and since
+/// stance caps speed, the stances price themselves: a sprint forfeits 75%, a
+/// crouched trot ~23%, a prone crawl ~7%. Crawling is stealth; running is a
+/// flag.
+pub const MOTION_REVEAL: i32 = FP * 75 / 100;
+/// What [`Aim::stir`] loses per tick once the pawn stops: `FP / 64` is exactly
+/// 4, so a full sprint takes 64 ticks — a second — to fade back to still. (A
+/// power-of-two divisor on purpose; see the `FP is 256` gotcha.) The rise has
+/// no constant because it is instant — grass starts moving the moment you do,
+/// and only the settling takes time. That second of lingering visibility is the
+/// mechanic: stopping does not un-ring the bell, so moving is a decision about
+/// the next second, not the next tick.
+pub const STIR_DECAY: i32 = FP / 64;
+
+/// Aim traverse under this many FP-sin-units per tick charges nothing —
+/// honing. 5 subunits is about 1.1°/tick (67°/s): fine corrections and slow
+/// tracking of a distant target stay inside it, whipping to a new target or
+/// tracking someone strafing past your muzzle does not.
+pub const SWING_FREE: i32 = 5;
+/// What each subunit of excess traverse adds to [`Aim::swing`]. At 4, a 30°
+/// flick saturates the cone outright and tracking a walking pawn at 40 units
+/// (~3°/tick) opens it in about a sixth of a second — while the same target at
+/// 150 units tracks for free. Which is the point: angular rate is speed over
+/// range, so this is what makes a close mover hard to hit without one line of
+/// code that asks how far away anything is.
+pub const SWING_GAIN: i32 = 4;
+/// What [`Aim::swing`] loses per tick while the barrel holds still: a plain
+/// integer of subunits (not a fraction of `FP`, which truncates — see the
+/// gotcha), so a fully swung aim hones back in over ~43 ticks, seven tenths of
+/// a second.
+pub const SWING_DECAY: i32 = 6;
+
+/// How hard the draw leans toward the middle of the cone, as a fraction of
+/// `FP`. `FP` is exactly uniform; below it the middle is denser. Concretely the
+/// inner half of all rounds falls inside `SPREAD_CORE / 2` of the half-width —
+/// at 7/8 that is the inner 44% rather than the inner 50%.
+///
+/// The distribution is therefore two flat steps with a hard edge at the rim,
+/// and the density ratio between them is `(2 - c) / c` — at 15/16 that is
+/// **17 : 15**, a slight lean toward the middle that leaves the outer half of
+/// the cone thoroughly live.
+///
+/// # Leaning inward is a SUBSIDY TO THE CARELESS, and it has to be paid for
+///
+/// This is the thing to understand before touching either constant. The lean
+/// raises the odds a round lands by a factor that grows with how bad the cone
+/// already is: a tight cone gets nothing, because it was hitting anyway, while
+/// a saturated one gets the full `1/c`. So a middle-heavy draw quietly refunds
+/// accuracy in proportion to how little the shooter has earned — which is
+/// precisely backwards for a game whose whole accuracy model exists to make
+/// carelessness expensive.
+///
+/// Measured, against the shipping profile, with the full run-and-gun kit
+/// (`aggression=0.95, caution=0.05, discipline=0.0`) as the candidate:
+///
+/// | draw                          | run-and-gun scores |
+/// |-------------------------------|--------------------|
+/// | flat, `SPREAD_MAX` 0.22       |            +14 elo |
+/// | core 7/8, `SPREAD_MAX` 0.25   |           +108 elo |
+/// | core 7/8, `SPREAD_MAX` 0.36   |            +16 elo |
+/// | core 15/16, `SPREAD_MAX` 0.26 |           +137 elo |
+/// | core 15/16, `SPREAD_MAX` 0.32 |            +35 elo |
+///
+/// So the shape was kept gentle (15/16 rather than 7/8) AND [`SPREAD_MAX`] was
+/// widened from 0.22 to 0.32 to pay for what remains. The two moves together
+/// leave a settled shooter feeling much as it did — the lean puts back in the
+/// middle what the width took off — while a saturated cone is genuinely wider
+/// than it was. **Change one of these and you must re-measure the other.**
+///
+/// One caveat on those numbers, because it bit during the tuning: the last two
+/// rows were first measured at **-61** and only became what they are after two
+/// bot stalls were fixed in the same session. Both stalls flattered careful
+/// play, because a side that freezes cannot lose a round it would otherwise
+/// have lost. Any bot-behaviour change invalidates a run-and-gun measurement;
+/// re-run it, and check `a_match_never_stops_moving_around_an_idle_player`
+/// first to be sure the number is about play rather than about paralysis. Both properties are deliberate: a bell
+/// would fade the rim out and quietly refund most of what a wide cone is
+/// supposed to cost, while a flat draw reads as a broken gun rather than an
+/// unsteady soldier.
+///
+/// Piecewise-linear rather than a curve for one reason that is worth the
+/// constraint: it **inverts in closed form**, so [`bot::shot_quality`] — which
+/// is the odds a round lands, and which the bots' trigger discipline and their
+/// whole close-the-distance judgement are built on — stays exact integer
+/// arithmetic instead of an erf approximation. A shape the bots cannot compute
+/// the hit probability of is a shape that silently miscalibrates them.
+pub const SPREAD_CORE: i32 = FP * 15 / 16;
+
+/// Map a uniform quantile in `±FP` onto `±FP`, leaning toward the middle.
+///
+/// The inner half of the range is compressed into [`SPREAD_CORE`] of the
+/// output and the outer half is stretched over the rest, so `|taper(±FP)| ==
+/// FP` exactly — the rim of the cone is exactly where it was, which is what
+/// "sharp cutoff at the current edges" means.
+pub fn taper(u: i64) -> i64 {
+    let fp = FP as i64;
+    let c = SPREAD_CORE as i64;
+    let t = u.abs().min(fp);
+    let mag = if t <= fp / 2 {
+        c * t / fp
+    } else {
+        c / 2 + (2 * fp - c) * (t - fp / 2) / fp
+    };
+    if u < 0 {
+        -mag
+    } else {
+        mag
+    }
+}
+
+/// [`taper`] inverted: what share of draws land within `y` of the middle, where
+/// `y` is a fraction of the cone's half-width in `FP`. Exact, by construction.
+pub fn taper_share(y: i64) -> i64 {
+    let fp = FP as i64;
+    let c = SPREAD_CORE as i64;
+    let y = y.clamp(0, fp);
+    if y <= c / 2 {
+        y * fp / c
+    } else {
+        fp / 2 + (y - c / 2) * fp / (2 * fp - c)
+    }
+}
+
+/// What bleeds off the bloom every tick: a saturated one clears in 128 ticks,
+/// which is 2.1 s of holding fire.
+///
+/// **Check the arithmetic in whole subunits before changing any of these.**
+/// `FP` is 256, so a decay expressed as a fraction of it is a very small integer
+/// and rounds hard: this was first written `FP / 150`, which truncates to **1**
+/// rather than the intended 1.7, and that one lost subunit a tick was enough to
+/// make every stance saturate. A prone shooter meant to hold a steady bipod was
+/// spraying at `SPREAD_MAX` after eight rounds, and the arena test that fires
+/// down the clear lane could not kill anybody from any posture at all.
+/// [`recoil_settles_at_a_different_rate_in_each_stance`] pins the three
+/// relationships so the next truncation is a failing test rather than a mystery.
+///
+/// What it buys, per [`FIRE_COOLDOWN`] (12 ticks, so 24 subunits recovered
+/// between rounds) against each stance's share of a 51-subunit kick:
+///
+/// | stance   | kick | net a round | saturates after |
+/// |----------|------|-------------|-----------------|
+/// | standing |   51 |         +27 |  9 rounds (2 s) |
+/// | crouched |   37 |         +13 | 19 rounds (4 s) |
+/// | prone    |   27 |          +3 | 85 rounds (17s) |
+///
+/// Which is the burst-discipline rule falling out of the arithmetic rather than
+/// being written down separately: the first round after a pause is the accurate
+/// one in every stance, and how many you get after it is what the stance buys.
+/// Prone is nearly a sustained-fire position, and that is deliberate — it is
+/// paid for in the concealment model, where going flat in deep grass costs most
+/// of what you can see.
+pub const RECOIL_DECAY: i32 = FP / 128;
+
 /// The only thing that crosses the network: one player's input for one tick.
 /// Kept tiny (ggrs serializes it with serde every tick). Joystick axes are
 /// quantized to i8 (-127..=127); `buttons` and `dials` are bitfield bytes.
@@ -385,6 +653,277 @@ impl Default for Facing {
 /// Ticks until this player may fire again.
 #[derive(Component, Copy, Clone, Default, Debug, Hash)]
 pub struct Cooldown(pub u16);
+
+/// How well this pawn is holding its weapon — the state behind the cone a round
+/// is drawn from. See the constant block above [`SPREAD_MAX`] for the model;
+/// this is just where it lives.
+///
+/// Rollback-registered and checksummed like [`Stance`], and for the same
+/// reason: two peers disagreeing about how steady a shooter is disagree about
+/// where its rounds went, and waiting for that to show up in [`Pos`] is waiting
+/// for someone to die of it.
+#[derive(Component, Copy, Clone, Debug, Hash)]
+pub struct Aim {
+    /// `0..=FP` — unsteadiness from posture. Eased toward [`Aim::settled`].
+    pub sway: i32,
+    /// `0..=FP` — recoil owed from rounds already fired.
+    pub bloom: i32,
+    /// `0..=FP` — how much this pawn has been MOVING lately: jumps straight to
+    /// the tick's speed fraction and fades by [`STIR_DECAY`]. Feeds the
+    /// concealment model, not the cone — see [`MOTION_REVEAL`].
+    pub stir: i32,
+    /// `0..=FP` — how fast the aim has been TRAVERSING lately: charged by
+    /// [`Aim::turn`] and honed back down by [`SWING_DECAY`]. The third term of
+    /// the cone.
+    pub swing: i32,
+    /// LCG state for the next round's deviation. Advanced ONLY when a round is
+    /// actually fired, so two pawns holding fire never drift apart.
+    seed: u32,
+}
+
+impl Default for Aim {
+    fn default() -> Self {
+        Self::seeded(0, 0)
+    }
+}
+
+/// Salt for aim RNG seeding, so a round's deviation is uncorrelated with the
+/// bots' aim jitter and with the terrain fields.
+const AIM_SEED: u32 = 0x5CA7_7E12;
+
+impl Aim {
+    /// A fresh, perfectly steady hold, with dice of its own.
+    ///
+    /// Hashed from the handle for the reason [`bot::Bot::seeded`] hashes: two
+    /// pawns firing on the same tick from consecutive seeds would pull visibly
+    /// correlated deviations, and a whole squad's rounds veering the same way is
+    /// exactly the tell that gives a fake random away. `salt` comes from
+    /// [`bot::BotRoster`] for bots, so the self-play harness gets a genuinely
+    /// different match out of a different salt.
+    ///
+    /// That last part fixes something the harness used to say about itself: a
+    /// bot with `accuracy = 1.0` never touched its dice, so two such profiles
+    /// left exactly one distinct pair to play. The gun draws on every shot
+    /// whatever the profile is, so the salt is never inert now.
+    pub fn seeded(handle: usize, salt: u32) -> Self {
+        let mut seed = (handle as u32)
+            .wrapping_mul(0x9E37_79B9)
+            .wrapping_add(salt.wrapping_mul(0x85EB_CA6B))
+            ^ AIM_SEED;
+        seed ^= seed >> 15;
+        seed = seed.wrapping_mul(0xC2B2_AE35);
+        seed ^= seed >> 13;
+        Self {
+            // As steady as standing still is — see `rest`, which is the same
+            // statement at the top of every round after this one.
+            sway: STANCE_SWAY[STANCE_STAND as usize],
+            bloom: 0,
+            stir: 0,
+            swing: 0,
+            seed,
+        }
+    }
+
+    /// Rebuild from stored numbers — [`save`] carries all three across a
+    /// rejoin, so a player who reloads mid-burst comes back owing the same
+    /// recoil they left owing.
+    ///
+    /// **The seed is taken exactly as given, and forcing it odd here was a bug.**
+    /// The obvious defensive `seed | 1` — copied from [`bot::Bot::seeded`], where
+    /// it is harmless — flips the low bit of every even seed, so half of all
+    /// restored pawns came back with a gun that was not the gun that was saved.
+    /// `a_restored_world_is_the_world_that_was_saved` caught it as a one-off in a
+    /// single field, which is exactly what that test is for.
+    ///
+    /// There is nothing to defend against in any case: this LCG has an odd
+    /// additive constant and a multiplier congruent to 1 mod 4, so it is
+    /// full-period over every 32-bit value and no seed is a fixed point, zero
+    /// included. Only `sway` and `bloom` need clamping, and they are clamped
+    /// because this is fed from `localStorage` and from the network.
+    pub fn from_parts(sway: i32, bloom: i32, stir: i32, swing: i32, seed: u32) -> Self {
+        Self {
+            sway: sway.clamp(0, FP),
+            bloom: bloom.clamp(0, FP),
+            stir: stir.clamp(0, FP),
+            swing: swing.clamp(0, FP),
+            seed,
+        }
+    }
+
+    pub fn seed(&self) -> u32 {
+        self.seed
+    }
+
+    /// The sway this posture settles to, `0..=FP`. `speed` is the distance the
+    /// pawn will actually cover this tick, in subunits — see [`step`].
+    pub fn settled(stance: &Stance, speed: i32, ads: bool) -> i32 {
+        let level = (stance.level as usize).min(STANCE_COUNT - 1);
+        let mut sway = STANCE_SWAY[level];
+        if ads {
+            // Sights up implies rooted (`BTN_ADS` stops the pawn dead), so
+            // there is no movement term to add and no double count.
+            return sway * ADS_SWAY / FP;
+        }
+        // Square of the fraction of a full run being covered.
+        let frac = (speed.clamp(0, PLAYER_SPEED) as i64 * FP as i64 / PLAYER_SPEED as i64) as i32;
+        sway += (frac as i64 * frac as i64 / FP as i64 * MOVE_SWAY as i64 / FP as i64) as i32;
+        sway.min(FP)
+    }
+
+    /// One tick of settling toward `target`. Rises in [`SWAY_RISE_TICKS`] and
+    /// falls in [`SWAY_SETTLE_TICKS`] — the asymmetry is the mechanic.
+    ///
+    /// Linear rather than exponential on purpose: an integer exponential decay
+    /// stalls short of its target on the rounding, and a linear ramp makes the
+    /// settle time an exact, statable number of ticks instead of an asymptote.
+    pub fn ease(&mut self, target: i32) {
+        let target = target.clamp(0, FP);
+        if target > self.sway {
+            self.sway = (self.sway + (FP / SWAY_RISE_TICKS).max(1)).min(target);
+        } else {
+            self.sway = (self.sway - (FP / SWAY_SETTLE_TICKS).max(1)).max(target);
+        }
+    }
+
+    /// What a round start hands everyone: owing no recoil, and holding a weapon
+    /// exactly as steadily as someone standing still on a muster line holds one.
+    ///
+    /// **Not zero**, which is what it was first and which handed every pawn on
+    /// the field one free unmissable shot at the top of every round. `sway` is
+    /// eased toward the posture's settled value, so starting it below that value
+    /// is starting everybody steadier than the posture they are actually in —
+    /// and since standing is the posture a round starts in, the free shot went
+    /// to whoever pulled the trigger first. Caught by
+    /// `rounds_kill_and_the_dead_stay_down`, which was trying to prove a
+    /// standing shooter CANNOT reach across the arena and found it landing a
+    /// round for 52 damage before it had settled into anything.
+    ///
+    /// The dice are deliberately left where they are; see the call site in
+    /// [`round`].
+    pub fn rest(&mut self) {
+        self.sway = STANCE_SWAY[STANCE_STAND as usize];
+        self.bloom = 0;
+        self.stir = 0;
+        self.swing = 0;
+    }
+
+    /// One tick of recoil bleeding away, grass settling, and the barrel honing
+    /// back in.
+    pub fn cool(&mut self) {
+        self.bloom = (self.bloom - RECOIL_DECAY).max(0);
+        self.stir = (self.stir - STIR_DECAY).max(0);
+        self.swing = (self.swing - SWING_DECAY).max(0);
+    }
+
+    /// A round left this pawn's barrel: light it up.
+    ///
+    /// **This is what makes holding fire worth anything.** Firing in this game
+    /// costs no ammunition and no reload, so before this a withheld shot was
+    /// pure forfeited damage and no trigger discipline could ever beat spray on
+    /// expectation — measured, painfully: `discipline=0.0` beat the default in
+    /// 18 decisive pairs of 18, and widening the cone only made it worse,
+    /// because a sprayer still lands the odd round while a discliner lands
+    /// nothing at all. The missing cost was CONCEALMENT: a muzzle flash in a
+    /// grass field is a flare, so one aimed shot buys a second of being seen
+    /// ([`STIR_DECAY`]) and a held trigger is a held flare. Bots need no code to
+    /// exploit it — the flash rides the same [`Aim::stir`] the concealment
+    /// model already reads, so gunfire pulls every enemy eye toward the shooter
+    /// through the ordinary sighting path.
+    ///
+    /// Full [`FP`] regardless of stance, deliberately: the flash is above the
+    /// grass even when the shooter is under it, so prone sustained fire — which
+    /// recoil makes nearly free — pays for itself here instead.
+    pub fn flash(&mut self) {
+        self.stir = FP;
+    }
+
+    /// Movement this tick: `speed` in subunits, the same number the pawn's
+    /// [`Pos`] actually changed by ([`step_speed`]). Stir has no ease upward —
+    /// see [`STIR_DECAY`].
+    pub fn disturb(&mut self, speed: i32) {
+        let frac =
+            (speed.clamp(0, PLAYER_SPEED) as i64 * FP as i64 / PLAYER_SPEED as i64) as i32;
+        self.stir = self.stir.max(frac);
+    }
+
+    /// The aim direction changed: charge the traverse. `from` and `to` are the
+    /// old and new [`Facing`] vectors, in whatever length the joystick gave
+    /// them — only the angle between them matters.
+    ///
+    /// The angle proxy is `|cross| / (|a||b|)`, the sine — exact enough below
+    /// 45°/tick, and anything past 90° (`dot < 0`) is treated as the whole
+    /// quarter turn, since one tick is 17 ms and nobody hones through a flip.
+    /// Turns inside [`SWING_FREE`] charge nothing: slow tracking and fine
+    /// corrections ARE honing, and a dead zone is also what keeps joystick
+    /// wobble from taxing a player who is merely holding a direction.
+    pub fn turn(&mut self, from: (i32, i32), to: (i32, i32)) {
+        let (ax, ay, bx, by) = (from.0 as i64, from.1 as i64, to.0 as i64, to.1 as i64);
+        let norm = isqrt((ax * ax + ay * ay) * (bx * bx + by * by));
+        if norm == 0 {
+            return;
+        }
+        let dot = ax * bx + ay * by;
+        let sin = if dot < 0 {
+            FP
+        } else {
+            ((ax * by - ay * bx).abs() * FP as i64 / norm) as i32
+        };
+        let excess = sin - SWING_FREE;
+        if excess > 0 {
+            self.swing = (self.swing + excess.saturating_mul(SWING_GAIN)).min(FP);
+        }
+    }
+
+    /// Charge a round's kick, as much of it as this stance fails to absorb.
+    pub fn kick(&mut self, stance: &Stance) {
+        let level = (stance.level as usize).min(STANCE_COUNT - 1);
+        let owed = (RECOIL_PER_SHOT as i64 * STANCE_RECOIL[level] as i64 / FP as i64) as i32;
+        self.bloom = (self.bloom + owed).min(FP);
+    }
+
+    /// How wide the cone is right now, `0..=FP`. The three terms simply add:
+    /// posture, recoil and traverse are independent costs and a shooter paying
+    /// several pays several.
+    pub fn spread(&self) -> i32 {
+        (self.sway + self.bloom + self.swing).clamp(0, FP)
+    }
+
+    /// The half-width of the cone at `range` world units, in world units. What
+    /// a bot asks when deciding whether a round is worth firing, and what the
+    /// client draws.
+    pub fn cone_half_width(spread: i32, range_units: i32) -> i32 {
+        let tan = SPREAD_MAX as i64 * spread.clamp(0, FP) as i64 / FP as i64;
+        (tan * range_units.max(0) as i64 / FP as i64) as i32
+    }
+
+    /// Draw this round's deviation: the tangent of the angle it leaves the
+    /// barrel at, within `±SPREAD_MAX * spread`.
+    ///
+    /// **Slightly denser in the middle, and dead flat to a hard edge** — see
+    /// [`taper`]. Not a bell: a Gaussian (or its cheap cousin, the average of
+    /// two uniforms) tapers the density to nothing at the rim, which makes a
+    /// wide cone far less punishing than it reads on screen, and the cone is a
+    /// price that should be paid close to in full. Not flat either, which is
+    /// what this was first: a shot with no tendency at all toward where it was
+    /// pointed reads as the gun being broken rather than the shooter being
+    /// unsteady.
+    fn deviate(&mut self) -> i32 {
+        let span = SPREAD_MAX as i64 * self.spread() as i64 / FP as i64;
+        if span <= 0 {
+            return 0;
+        }
+        self.seed = self
+            .seed
+            .wrapping_mul(1_664_525)
+            .wrapping_add(1_013_904_223);
+        // A uniform quantile in ±FP, then tapered. Drawing the quantile rather
+        // than the offset keeps the taper independent of how wide the cone
+        // happens to be.
+        let fp = FP as i64;
+        let u = ((self.seed >> 8) as i64 % (2 * fp + 1)) - fp;
+        (span * taper(u) / fp) as i32
+    }
+}
 
 /// How low the pawn is carrying itself: [`STANCE_STAND`] / [`STANCE_CROUCH`] /
 /// [`STANCE_PRONE`]. Sim state (it gates movement speed), so it rolls back with
@@ -1088,6 +1627,29 @@ impl Block {
     pub fn conceal(&self) -> i32 {
         (self.covered as i64 * extinction(self.length) as i64 / FP as i64) as i32
     }
+
+    /// The same, for a target that has been MOVING — grass hides a still body
+    /// and betrays a moving one, so the concealment is scaled down by
+    /// [`MOTION_REVEAL`] times the square of the target's [`Aim::stir`].
+    ///
+    /// The square matters: it is what makes the cost live at the top of the
+    /// speed range, so a crawl is nearly free and a sprint forfeits most of the
+    /// grass — and since stance caps speed, the stances price themselves
+    /// without appearing here.
+    ///
+    /// It scales the PRODUCT rather than either term because motion is not
+    /// geometry: the grass is exactly as deep and the line exactly as blocked,
+    /// but the sward over a moving body is itself moving, and movement is the
+    /// one thing an eye picks out of a field at any range. (Which is also why
+    /// this is deliberately range-independent — you spot the grass rustling
+    /// across the whole map, you just can't tell what is under it. What you CAN
+    /// tell is where to watch, and that is [`Sighting::exposure`] rising.)
+    pub fn conceal_moving(&self, stir: i32) -> i32 {
+        let fp = FP as i64;
+        let stir = stir.clamp(0, FP) as i64;
+        let reveal = MOTION_REVEAL as i64 * stir * stir / (fp * fp);
+        (self.conceal() as i64 * (fp - reveal) / fp) as i32
+    }
 }
 
 /// Subunits to world units, rounded — which sample point a step lands on.
@@ -1180,6 +1742,7 @@ pub fn grass_conceal(
     eye_stance: u8,
     target: Pos,
     target_stance: u8,
+    target_stir: i32,
 ) -> i32 {
     grass_block(
         eye,
@@ -1188,7 +1751,7 @@ pub fn grass_conceal(
         stance_height(target_stance),
         |x, y| scenario.depth(x, y),
     )
-    .conceal()
+    .conceal_moving(target_stir)
 }
 
 /// A circle that blocks sight: a boulder or a bush. Built once per tick and
@@ -1249,6 +1812,7 @@ pub fn visible_fraction(
     eye_stance: u8,
     target: Pos,
     target_stance: u8,
+    target_stir: i32,
     occluders: &[Occluder],
 ) -> i32 {
     let offsets = [
@@ -1272,7 +1836,7 @@ pub fn visible_fraction(
         return 0;
     }
     let seen = clear * FP / offsets.len() as i32;
-    let grass = grass_conceal(scenario, eye, eye_stance, target, target_stance);
+    let grass = grass_conceal(scenario, eye, eye_stance, target, target_stance, target_stir);
     (seen as i64 * (FP - grass) as i64 / FP as i64) as i32
 }
 
@@ -1289,6 +1853,10 @@ fn spawn_pawn(commands: &mut Commands, handle: usize, team: Team, slot: usize) -
             Pos::from_units(x, y),
             spawn_facing(team.0),
             Cooldown::default(),
+            // Salt 0: a human pawn's dice are its handle's. Bots get theirs
+            // re-seeded with the roster's salt in `reconcile_bots`, which is
+            // the only place that knows one.
+            Aim::seeded(handle, 0),
             Stance::default(),
             Health::default(),
             Deaths::default(),
@@ -1540,6 +2108,7 @@ impl<C: Config<Input = PlayerInput>> Plugin for SimPlugin<C> {
             .rollback_component_with_copy::<Bot>()
             .rollback_component_with_copy::<Facing>()
             .rollback_component_with_copy::<Cooldown>()
+            .rollback_component_with_copy::<Aim>()
             .rollback_component_with_copy::<Stance>()
             .rollback_component_with_copy::<Health>()
             .rollback_component_with_copy::<Deaths>()
@@ -1555,6 +2124,11 @@ impl<C: Config<Input = PlayerInput>> Plugin for SimPlugin<C> {
             // anyway (it scales movement), but only once that player moves —
             // checksumming it catches the disagreement on the tick it happens.
             .checksum_component_with_hash::<Stance>()
+            // And the aim, for the same argument one step further on: a
+            // disagreement about how steady a shooter is is a disagreement
+            // about where its rounds went, and that only reaches `Pos` when
+            // somebody dies of it.
+            .checksum_component_with_hash::<Aim>()
             // Health too: a disagreement about who is alive diverges the whole
             // match, and it can happen a long way from anyone's position (two
             // peers resolving the same round against different pawns), so
@@ -1589,6 +2163,10 @@ impl<C: Config<Input = PlayerInput>> Plugin for SimPlugin<C> {
                         // rounds leave the barrel next, and a shot fired from
                         // inside someone else can't hit them.
                         separate_players,
+                        // Between the two: this tick's posture is settled, and
+                        // the round about to leave the barrel is charged for
+                        // it rather than for last tick's.
+                        settle_aim,
                         fire_bullets,
                     )
                         .chain()
@@ -1694,9 +2272,10 @@ fn reconcile_bots<C: Config<Input = PlayerInput>>(
             side = TEAM_COUNT - 1 - side;
         }
         let pawn = spawn_pawn(&mut commands, handle, Team(side as u8), on_side[side]);
-        commands
-            .entity(pawn)
-            .insert(Bot::seeded(handle, roster.profile(handle), roster.salt));
+        commands.entity(pawn).insert((
+            Bot::seeded(handle, roster.profile(handle), roster.salt),
+            Aim::seeded(handle, roster.salt),
+        ));
     } else {
         bots.sort_unstable();
         if let Some(&(_, entity)) = bots.last() {
@@ -1750,8 +2329,55 @@ fn read_human_intent<C: Config<Input = PlayerInput>>(
 
 /// `With<Player>` is load-bearing, not decoration: it is what makes this query
 /// provably disjoint from the `Without<Player>` one below, and both touch `Pos`.
+/// How far this pawn actually travels this tick, per axis in subunits.
+///
+/// **Extracted so the aim model and the movement share one answer.** How fast a
+/// shooter is going is most of what decides its cone ([`MOVE_SWAY`]), and
+/// `settle_aim` runs in the same tick as `move_players` off the same [`Intent`]
+/// — two copies of this arithmetic that drifted apart would charge a pawn for a
+/// sprint it never took, or let it shoot as though it were standing still while
+/// crossing the field. There is nothing to keep them honest but this being the
+/// only copy.
+///
+/// Rooted cases come out `(0, 0)`: aiming down sights plants the feet (the
+/// stick still turns you — that is the aim — it just doesn't carry you), and a
+/// stance change roots you for as long as it takes. Both ride in the input
+/// stream, so every peer agrees.
+///
+/// Otherwise the joystick vector is scaled to at most the stance's speed,
+/// preserving direction: `v = m * SPEED / max(len, 127)`. Dividing by the
+/// *longer* of `len`/127 keeps sub-max deflections proportional while capping
+/// diagonals at full speed.
+pub fn step(input: &PlayerInput, stance: &Stance) -> (i32, i32) {
+    let (mx, my) = (input.move_x as i32, input.move_y as i32);
+    if (mx == 0 && my == 0) || input.ads() || stance.change > 0 {
+        return (0, 0);
+    }
+    let speed = stance.speed();
+    let len = isqrt((mx * mx + my * my) as i64).max(127) as i32;
+    (mx * speed / len, my * speed / len)
+}
+
+/// The magnitude of that step — what [`Aim::settled`] is charged for.
+pub fn step_speed(input: &PlayerInput, stance: &Stance) -> i32 {
+    let (sx, sy) = step(input, stance);
+    isqrt((sx as i64 * sx as i64) + (sy as i64 * sy as i64)) as i32
+}
+
+/// Everything moving a pawn touches: where it is, where it faces (which charges
+/// [`Aim::turn`] — the one place old and new facing are both in hand), and the
+/// stance gating its speed.
+type Mover = (
+    &'static Intent,
+    &'static mut Pos,
+    &'static mut Facing,
+    &'static mut Stance,
+    &'static mut Aim,
+    &'static Health,
+);
+
 fn move_players(
-    mut players: Query<(&Intent, &mut Pos, &mut Facing, &mut Stance, &Health), With<Player>>,
+    mut players: Query<Mover, With<Player>>,
     rocks: Query<(&Rock, &Pos), Without<Player>>,
 ) {
     // Sorted: resolving overlaps in a different order could land a pinched
@@ -1763,7 +2389,7 @@ fn move_players(
         .collect();
     cover.sort_unstable();
 
-    for (intent, mut pos, mut facing, mut stance, health) in &mut players {
+    for (intent, mut pos, mut facing, mut stance, mut aim, health) in &mut players {
         // The dead hold still: no drifting, no turning, no getting up out of
         // prone. Nothing puts them back until the round does.
         if !health.alive() {
@@ -1780,23 +2406,17 @@ fn move_players(
         if mx == 0 && my == 0 {
             continue;
         }
+        // The turn is charged HERE, the one place old and new facing are both
+        // in hand — `settle_aim` never has to reconstruct what the barrel did.
+        aim.turn((facing.x, facing.y), (mx, my));
         facing.x = mx;
         facing.y = my;
-        // Aiming down sights roots the shooter in place — the stick still
-        // turns them (that's the aim), it just doesn't carry them anywhere.
-        // The bit rides in the input stream, so every peer agrees. Changing
-        // stance roots them the same way, for as long as it takes.
-        if input.ads() || stance.change > 0 {
+        let (sx, sy) = step(&input, &stance);
+        if sx == 0 && sy == 0 {
             continue;
         }
-        // Scale the joystick vector to at most the stance's speed, preserving
-        // direction: v = m * SPEED / max(len, 127). Dividing by the *longer*
-        // of len/127 keeps sub-max joystick deflections proportional while
-        // capping diagonals at full speed.
-        let speed = stance.speed();
-        let len = isqrt((mx * mx + my * my) as i64).max(127) as i32;
-        pos.x += mx * speed / len;
-        pos.y += my * speed / len;
+        pos.x += sx;
+        pos.y += sy;
         push_out_of_cover(&mut pos, &cover);
         pos.x = pos.x.clamp(-(ARENA_HALF_W - PLAYER_R) * FP, (ARENA_HALF_W - PLAYER_R) * FP);
         pos.y = pos.y.clamp(-(ARENA_HALF_H - PLAYER_R) * FP, (ARENA_HALF_H - PLAYER_R) * FP);
@@ -1933,11 +2553,44 @@ fn separate_players(
     }
 }
 
-fn fire_bullets(
-    mut commands: Commands,
-    mut players: Query<(&Player, &Intent, &Pos, &Facing, &mut Cooldown, &Health)>,
-) {
-    for (player, intent, pos, facing, mut cooldown, health) in &mut players {
+/// One tick of the aim model: bleed the recoil, and ease the sway toward
+/// whatever this posture settles to.
+///
+/// Runs between the movement and the firing, inside the round gate, so a round
+/// leaving the barrel this tick is charged for what the shooter is doing this
+/// tick rather than last one. Between rounds it does not run at all and the
+/// sway simply holds — there is nothing to shoot at and `run_round` wipes it
+/// clean on the way into the next one.
+///
+/// The dead are left alone rather than reset: a pawn that is out is not holding
+/// a weapon, and zeroing it here would hand whoever restores the round a
+/// steadiness they hadn't earned.
+fn settle_aim(mut pawns: Query<(&Intent, &Stance, &Health, &mut Aim)>) {
+    for (intent, stance, health, mut aim) in &mut pawns {
+        aim.cool();
+        if !health.alive() {
+            continue;
+        }
+        let speed = step_speed(&intent.0, stance);
+        aim.disturb(speed);
+        aim.ease(Aim::settled(stance, speed, intent.0.ads()));
+    }
+}
+
+/// Everything firing a round needs to know about the pawn firing it.
+type Shooter = (
+    &'static Player,
+    &'static Intent,
+    &'static Pos,
+    &'static Facing,
+    &'static Stance,
+    &'static mut Cooldown,
+    &'static mut Aim,
+    &'static Health,
+);
+
+fn fire_bullets(mut commands: Commands, mut players: Query<Shooter>) {
+    for (player, intent, pos, facing, stance, mut cooldown, mut aim, health) in &mut players {
         if cooldown.0 > 0 {
             cooldown.0 -= 1;
         }
@@ -1946,15 +2599,31 @@ fn fire_bullets(
             continue;
         }
         cooldown.0 = FIRE_COOLDOWN;
-        let len = isqrt((facing.x * facing.x + facing.y * facing.y) as i64).max(1) as i32;
-        let vx = facing.x * BULLET_SPEED / len;
-        let vy = facing.y * BULLET_SPEED / len;
+        // Where the round actually goes: the facing, turned by a draw from the
+        // cone. Rotating by a TANGENT rather than an angle is what keeps this in
+        // integers — adding `t` times the perpendicular to a vector turns it by
+        // `atan(t)`, which is exactly the quantity `SPREAD_MAX` is expressed in,
+        // and costs two multiplies instead of a trig table.
+        //
+        // Scaled up by `FP` first so the deviation survives the division:
+        // `Facing` is raw joystick range (±127), and a few percent of that
+        // rounds to nothing.
+        let dev = aim.deviate() as i64;
+        let (fx, fy) = (facing.x as i64 * FP as i64, facing.y as i64 * FP as i64);
+        let (ax, ay) = (fx - fy * dev / FP as i64, fy + fx * dev / FP as i64);
+        let len = isqrt(ax * ax + ay * ay).max(1);
+        let vx = (ax * BULLET_SPEED as i64 / len) as i32;
+        let vy = (ay * BULLET_SPEED as i64 / len) as i32;
+        aim.kick(stance);
+        aim.flash();
         // Spawn just outside the player's own radius so the bullet never
-        // overlaps its shooter.
-        let offset = (PLAYER_R + BULLET_R + 2) * FP;
+        // overlaps its shooter. Down the round's own line, not the facing —
+        // a round that left the barrel sideways would otherwise start beside
+        // the shooter rather than in front of it.
+        let offset = (PLAYER_R + BULLET_R + 2) as i64 * FP as i64;
         let start = Pos {
-            x: pos.x + facing.x * offset / len,
-            y: pos.y + facing.y * offset / len,
+            x: pos.x + (ax * offset / len) as i32,
+            y: pos.y + (ay * offset / len) as i32,
         };
         commands
             .spawn((
@@ -2167,6 +2836,250 @@ mod tests {
         let mut clear = Pos { x: 200 * FP, y: 0 };
         push_out_of_cover(&mut clear, &cover);
         assert_eq!((clear.x, clear.y), (200 * FP, 0));
+    }
+
+    /// Holding the trigger opens the cone, and how fast is what the stance buys.
+    #[test]
+    fn recoil_settles_at_a_different_rate_in_each_stance() {
+        // Hold the trigger and count how many rounds it takes to saturate.
+        let rounds_to_spray = |level: u8| {
+            let stance = Stance { level, change: 0 };
+            let mut aim = Aim::seeded(0, 0);
+            aim.rest();
+            for shot in 1..=400 {
+                aim.kick(&stance);
+                if aim.bloom >= FP {
+                    return Some(shot);
+                }
+                for _ in 0..FIRE_COOLDOWN {
+                    aim.cool();
+                }
+            }
+            None
+        };
+        let counts: Vec<Option<i32>> =
+            (0..STANCE_COUNT as u8).map(rounds_to_spray).collect();
+        println!("rounds of held fire before the cone is wide open: {counts:?}");
+
+        // **The decay must actually be worth something.** `FP` is 256, so a
+        // per-tick decay written as a fraction of it truncates hard — `FP / 150`
+        // rounds to 1 instead of 1.7, and that alone made every stance saturate
+        // at the same rate. This is the assertion that would have caught it.
+        const { assert!(RECOIL_DECAY >= 2, "RECOIL_DECAY truncated; see its doc comment") };
+        let (stand, crouch, prone) = (counts[0], counts[1], counts[2]);
+        assert!(
+            stand.is_some_and(|n| n <= 15),
+            "standing fire must run away quickly, took {stand:?} rounds"
+        );
+        assert!(
+            crouch.unwrap_or(i32::MAX) > stand.unwrap() * 2,
+            "crouching must buy at least twice the burst standing does: {crouch:?} vs {stand:?}"
+        );
+        assert!(
+            prone.unwrap_or(i32::MAX) > crouch.unwrap_or(0) * 2,
+            "prone must buy at least twice the burst crouching does: {prone:?} vs {crouch:?}"
+        );
+        // And every stance must eventually pay: a posture that can hold the
+        // trigger forever with no cost is a posture with no reason to stop.
+        assert!(prone.is_some(), "prone fire never blooms at all");
+    }
+
+    /// **Running through grass gives you away, and stopping does not instantly
+    /// un-give you away.** Same eye, same target, same tile of deep grass — the
+    /// only thing that changes is what the target has been doing.
+    #[test]
+    fn running_in_grass_gives_you_away() {
+        // Deep enough to bury a standing pawn completely if it holds still.
+        let strip = Scenario::GrassStrip { depth: 70, east_stance: STANCE_STAND };
+        let (eye, target) = (Pos::from_units(-STRIP_STANDOFF, 0), Pos::from_units(0, 0));
+        let seen_at = |stir: i32| {
+            FP - grass_conceal(&strip, eye, STANCE_STAND, target, STANCE_STAND, stir)
+        };
+
+        let still = seen_at(0);
+        let crawling = seen_at(FP * STANCE_SPEED[STANCE_PRONE as usize] / PLAYER_SPEED);
+        let sprinting = seen_at(FP);
+        println!(
+            "seen through deep grass: still {still}, crawling {crawling}, sprinting {sprinting} (of {FP})"
+        );
+
+        assert!(
+            sprinting >= still + FP / 2,
+            "a sprint through deep grass must forfeit most of the concealment: \
+             still {still} vs sprinting {sprinting}"
+        );
+        // The ladder: stance caps speed, so the stances price themselves.
+        assert!(
+            crawling < still + FP / 12,
+            "a prone crawl should stay nearly as hidden as holding still: \
+             {still} -> {crawling}"
+        );
+        // And it decays rather than snapping back: a tick after stopping, a
+        // sprinter is still almost as visible as mid-sprint.
+        let mut aim = Aim::seeded(0, 0);
+        aim.disturb(PLAYER_SPEED);
+        aim.cool();
+        assert!(
+            aim.stir > FP * 9 / 10,
+            "one tick after a sprint the grass has barely settled, stir {}",
+            aim.stir
+        );
+        // …and after `FP / STIR_DECAY` ticks (a second and change) it is
+        // genuinely gone.
+        for _ in 0..2 * TICK_HZ {
+            aim.cool();
+        }
+        assert_eq!(aim.stir, 0, "holding still settles the grass");
+    }
+
+    /// **A swung barrel is not on target, and honing back in takes time.** The
+    /// traverse charge is also what makes a CLOSE mover hard to hit: angular
+    /// rate is speed over range, so the same crossing walk that saturates the
+    /// cone at 40 units tracks for free at 150.
+    #[test]
+    fn swinging_the_aim_costs_accuracy_until_it_is_honed_back_in() {
+        // A flick: 30 degrees in one tick. Facing vectors on the i8 joystick
+        // scale, like the real ones.
+        let mut aim = Aim::seeded(0, 0);
+        aim.rest();
+        let settled = aim.spread();
+        aim.turn((127, 0), (110, 63)); // ~30 deg
+        assert_eq!(aim.spread(), FP, "a 30-degree flick opens the cone wide");
+        // Honing: decays while the barrel holds still, back to the posture's
+        // settled spread inside a second.
+        for _ in 0..TICK_HZ {
+            aim.cool();
+        }
+        assert_eq!(aim.spread(), settled, "a second of holding hones it back in");
+
+        // Tracking: the angular rate of one walking target, seen from two
+        // ranges — `sin per tick ≈ speed / range`, so the SAME walk is a fast
+        // traverse up close and a crawl of the barrel at distance. Measured at
+        // the PEAK, because that is the gameplay: the cone is open exactly
+        // while the runner crosses your muzzle, which is exactly when you want
+        // to shoot them, and it closes again once they are past and receding.
+        let track = |range: i32| {
+            let mut aim = Aim::seeded(0, 0);
+            aim.rest();
+            let step = PLAYER_SPEED / FP; // units per tick of a full run
+            let mut peak = 0;
+            for tick in 0..60 {
+                // The facing to a target crossing at `step` per tick.
+                let (x0, x1) = (step * tick, step * (tick + 1));
+                aim.turn((127, x0 * 127 / range), (127, x1 * 127 / range));
+                aim.cool();
+                peak = peak.max(aim.swing);
+            }
+            peak
+        };
+        let (close, far) = (track(40), track(150));
+        println!("peak swing tracking a crossing runner: at 40 units {close}, at 150 {far}");
+        assert!(
+            close >= FP / 2,
+            "tracking a runner crossing at 40 units must cost real accuracy, got {close}"
+        );
+        assert_eq!(far, 0, "the same runner at 150 units tracks inside the dead zone");
+    }
+
+    /// **The shape of the cone: denser in the middle, live to a hard edge.**
+    /// Histogram the actual draw and check both halves of that claim.
+    #[test]
+    fn the_cone_leans_toward_the_middle_and_stops_dead_at_its_edge() {
+        const BINS: usize = 8;
+        let mut aim = Aim::seeded(11, 0);
+        aim.sway = FP; // widest cone
+        let span = SPREAD_MAX;
+        let mut bins = [0usize; BINS];
+        let (mut n, mut worst) = (0usize, 0i32);
+        for _ in 0..200_000 {
+            let d = aim.deviate();
+            worst = worst.max(d.abs());
+            let bin = (d.abs() as i64 * BINS as i64 / (span as i64 + 1)) as usize;
+            bins[bin.min(BINS - 1)] += 1;
+            n += 1;
+        }
+        println!("|deviation| histogram over {n} rounds, {BINS} bins out to the rim:");
+        for (i, count) in bins.iter().enumerate() {
+            println!("  bin {i}: {:5.2}%", *count as f64 * 100.0 / n as f64);
+        }
+
+        // Sharp cutoff: nothing at all past the rim.
+        assert!(worst <= span, "a round left the cone: {worst} > {span}");
+        // Live to the edge: the outermost bin is not a rounding artefact. A
+        // bell-shaped draw would empty this out, which is the failure mode the
+        // flat-topped shape exists to avoid.
+        assert!(
+            bins[BINS - 1] * 40 > n,
+            "the rim of the cone is nearly empty ({} of {n}) — the draw has gone \
+             bell-shaped and a wide cone no longer costs what it says it does",
+            bins[BINS - 1]
+        );
+        // Denser in the middle: the inner half outnumbers the outer half, by
+        // about the 5:3 `SPREAD_CORE` implies, and not by more.
+        let inner: usize = bins[..BINS / 2].iter().sum();
+        let outer: usize = bins[BINS / 2..].iter().sum();
+        println!("inner half {inner}, outer half {outer}, ratio {:.2}", inner as f64 / outer as f64);
+        // Denser in the middle, by about the 17:15 `SPREAD_CORE` implies — and
+        // deliberately not by much more. The lean is a SUBSIDY to whoever has
+        // the widest cone (see `SPREAD_CORE`), so every point of it has to be
+        // paid for in `SPREAD_MAX`.
+        assert!(inner * 100 > outer * 108, "the middle is not denser: {inner} vs {outer}");
+        assert!(inner * 2 < outer * 3, "the middle is TOO dense: {inner} vs {outer}");
+    }
+
+    /// **`shot_quality` must be the exact inverse of the draw**, because the
+    /// bots' trigger discipline and their whole judgement about closing the
+    /// distance are built on it. A mismatch fails silently in a match; this
+    /// fails loudly here.
+    #[test]
+    fn shot_quality_matches_the_rounds_it_predicts() {
+        for &range in &[30, 60, 100, 180, 260] {
+            for &spread in &[FP / 4, FP / 2, FP * 3 / 4, FP] {
+                let predicted = crate::bot::shot_quality(spread, range);
+                // Fire a lot of rounds and see how many would pass within a
+                // pawn's radius at that range.
+                let mut aim = Aim::seeded(range as usize, spread as u32);
+                aim.sway = spread;
+                let (mut hits, mut n) = (0usize, 0usize);
+                for _ in 0..40_000 {
+                    // Lateral offset at `range`, in SUBUNITS: the deviation is a
+                    // tangent in FP, so `dev * range` is already subunits. Whole
+                    // world units would truncate away most of the answer near
+                    // the target's own size — and the hit test the sim actually
+                    // runs (`resolve_hits`) is in subunits too.
+                    let off = aim.deviate() as i64 * range as i64;
+                    if off.abs() <= PLAYER_R as i64 * FP as i64 {
+                        hits += 1;
+                    }
+                    n += 1;
+                }
+                let actual = (hits as i64 * FP as i64 / n as i64) as i32;
+                println!(
+                    "range {range:3} spread {spread:3}: predicted {predicted:3}, actual {actual:3}"
+                );
+                assert!(
+                    (predicted - actual).abs() <= FP / 20,
+                    "shot_quality says {predicted} but {actual} of {n} rounds landed \
+                     (range {range}, spread {spread}) — the predictor and the draw \
+                     have come apart"
+                );
+            }
+        }
+    }
+
+    /// A pawn that has just spawned, or just been picked back up by a round
+    /// start, holds its weapon as steadily as standing still — no better. Zero
+    /// here handed everyone on the field one free unmissable shot a round.
+    #[test]
+    fn nobody_starts_a_round_steadier_than_standing() {
+        let standing = Aim::settled(&Stance::default(), 0, false);
+        assert_eq!(Aim::seeded(3, 0).sway, standing);
+        let mut aim = Aim::seeded(3, 0);
+        aim.sway = 0;
+        aim.bloom = FP;
+        aim.rest();
+        assert_eq!(aim.sway, standing);
+        assert_eq!(aim.bloom, 0);
     }
 
     /// Stance changes go one level at a time, root the pawn for the whole
@@ -2847,11 +3760,11 @@ mod tests {
         let bare = Scenario::GrassStrip { depth: 0, east_stance: STANCE_STAND };
         let (eye, target) = (Pos::from_units(-60, 0), Pos::from_units(60, 0));
 
-        let clear = visible_fraction(&bare, eye, STANCE_STAND, target, STANCE_STAND, &[]);
+        let clear = visible_fraction(&bare, eye, STANCE_STAND, target, STANCE_STAND, 0, &[]);
         assert_eq!(clear, FP, "nothing in the way, yet not fully visible");
 
         let between = [Occluder { pos: Pos::from_units(0, 0), r: 30 }];
-        let blocked = visible_fraction(&bare, eye, STANCE_STAND, target, STANCE_STAND, &between);
+        let blocked = visible_fraction(&bare, eye, STANCE_STAND, target, STANCE_STAND, 0, &between);
         assert_eq!(blocked, 0, "a 30u boulder dead between them did not block");
 
         // The same boulder, with the viewer inside it.
@@ -2861,6 +3774,7 @@ mod tests {
             STANCE_STAND,
             target,
             STANCE_STAND,
+            0,
             &between,
         );
         assert_eq!(inside_it, FP, "cover the eye is inside blinded it");
@@ -2884,6 +3798,7 @@ mod tests {
                     STANCE_STAND,
                     Pos::from_units(60, step * 12),
                     STANCE_STAND,
+                    0,
                     &rock,
                 )
             })
@@ -2926,6 +3841,7 @@ mod tests {
                     STANCE_PRONE,
                     Pos::from_units(tx, ty),
                     STANCE_PRONE,
+                    0,
                     &[],
                 );
                 if prone * 100 / FP < 5 {

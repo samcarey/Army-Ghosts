@@ -11,7 +11,8 @@ use bevy::prelude::*;
 use bevy_ggrs::LocalPlayers;
 
 use army_ghosts_sim::{
-    Facing, Player, Pos, Rock, Stance, ARENA_HALF_H, ARENA_HALF_W, BULLET_R, PLAYER_R,
+    Aim, Facing, Player, Pos, Rock, Stance, ARENA_HALF_H, ARENA_HALF_W, BULLET_R, FP, PLAYER_R,
+    SPREAD_MAX,
 };
 
 /// How far the camera slides toward what you're aiming at, world units (=
@@ -36,6 +37,10 @@ const BOTTOM_OFFSET: f32 = 22.0;
 /// used to sit, grass south of the shooter drew over their own sight line.
 const AIM_LINE_WIDTH: f32 = 0.6;
 const AIM_LINE_ALPHA: f32 = 0.22;
+/// The cone edges, relative to the centre line's. Fainter, because there are two
+/// of them and they are further from where the player is looking — at equal
+/// alpha the pair reads as the aim and the real one as a decoration between them.
+const AIM_EDGE_ALPHA: f32 = 0.6;
 const Z_AIM_LINE: f32 = 1.85;
 
 /// Local aim-down-sights state. Not rollback state — it only ever feeds a
@@ -71,19 +76,38 @@ pub struct AdsButton;
 #[derive(Component)]
 pub struct AdsIcon;
 
-/// The shot-path line (one long-lived sprite, stretched/rotated each frame).
+/// The shot-path lines: the centre of the aim, and the two edges of the cone a
+/// round is actually drawn from.
+///
+/// **The cone is the only thing that tells a player what the accuracy model is
+/// doing to them.** Everything the sim charges for — running, standing up,
+/// holding the trigger down — happens to a number they cannot see, and a
+/// mechanic that silently decides whether your rounds land is a mechanic that
+/// reads as the game cheating. Two lines opening and closing around the aim say
+/// it without a word of UI: come to a stop and they draw together, break into a
+/// run and they fly apart.
+///
+/// It shows only with the sights up, which is a deliberate limit rather than an
+/// omission. Hip fire is the state the cone is widest in and the state the
+/// player is least able to act on it, and three lines swinging around the pawn
+/// at all times would be permanent clutter on a phone screen. Wanting to know
+/// what your spread is is exactly the moment you should be aiming.
+///
+/// `0` is the centre; `-1` and `1` are the edges.
 #[derive(Component)]
-pub struct AimLine;
+pub struct AimLine(pub i8);
 
 /// Bottom-center round button with the crosshair icon, plus the (initially
 /// hidden) aim line sprite.
 pub fn setup_ads(mut commands: Commands, assets: Res<AssetServer>) {
-    commands.spawn((
-        AimLine,
-        Sprite::from_color(Color::srgba(1.0, 1.0, 1.0, 0.0), Vec2::new(1.0, AIM_LINE_WIDTH)),
-        Transform::from_xyz(0.0, 0.0, Z_AIM_LINE),
-        Visibility::Hidden,
-    ));
+    for edge in [0i8, -1, 1] {
+        commands.spawn((
+            AimLine(edge),
+            Sprite::from_color(Color::srgba(1.0, 1.0, 1.0, 0.0), Vec2::new(1.0, AIM_LINE_WIDTH)),
+            Transform::from_xyz(0.0, 0.0, Z_AIM_LINE),
+            Visibility::Hidden,
+        ));
+    }
 
     commands
         .spawn(Node {
@@ -182,49 +206,60 @@ fn local_facing(
 pub fn update_aim_line(
     ads: Res<Ads>,
     local_players: Option<Res<LocalPlayers>>,
-    players: Query<(&Player, &Pos, &Facing, &Stance)>,
+    players: Query<(&Player, &Pos, &Facing, &Stance, &Aim)>,
     rocks: Query<(&Rock, &Pos)>,
-    mut lines: Query<(&mut Transform, &mut Sprite, &mut Visibility), With<AimLine>>,
+    mut lines: Query<(&AimLine, &mut Transform, &mut Sprite, &mut Visibility)>,
 ) {
-    let Ok((mut transform, mut sprite, mut visibility)) = lines.single_mut() else { return };
     let amount = ads.amount();
-    let aim = local_players
-        .as_deref()
-        .and_then(|local| {
-            let handle = *local.0.first()?;
-            let (_, pos, facing, stance) = players.iter().find(|(p, ..)| p.handle == handle)?;
-            let dir = Vec2::new(facing.x as f32, facing.y as f32).try_normalize()?;
-            let (x, y) = pos.to_f32();
-            // Same muzzle offset `fire_bullets` spawns the bullet at, so the
-            // line starts exactly where the tracer will.
-            Some((
-                Vec2::new(x, y) + dir * (PLAYER_R + BULLET_R + 2) as f32,
-                dir,
-                crate::render::muzzle_lift(stance.level),
-            ))
-        });
-    let Some((start, dir, lift)) = aim.filter(|_| amount > 0.001) else {
-        *visibility = Visibility::Hidden;
+    let aim = local_players.as_deref().and_then(|local| {
+        let handle = *local.0.first()?;
+        let (_, pos, facing, stance, aim) = players.iter().find(|(p, ..)| p.handle == handle)?;
+        let dir = Vec2::new(facing.x as f32, facing.y as f32).try_normalize()?;
+        let (x, y) = pos.to_f32();
+        // Same muzzle offset `fire_bullets` spawns the bullet at, so the line
+        // starts exactly where the tracer will.
+        Some((
+            Vec2::new(x, y) + dir * (PLAYER_R + BULLET_R + 2) as f32,
+            dir,
+            crate::render::muzzle_lift(stance.level),
+            // The half-angle of the cone, straight off the sim's own number so
+            // the picture cannot drift from the arithmetic that fires the round.
+            (SPREAD_MAX as f32 * aim.spread() as f32 / (FP * FP) as f32).atan(),
+        ))
+    });
+    let Some((start, dir, lift, half_angle)) = aim.filter(|_| amount > 0.001) else {
+        for (_, _, mut sprite, mut visibility) in &mut lines {
+            sprite.color = Color::srgba(1.0, 1.0, 1.0, 0.0);
+            *visibility = Visibility::Hidden;
+        }
         return;
     };
 
-    let range = rocks
-        .iter()
-        .map(|(rock, pos)| (pos, rock.r))
-        .filter_map(|(pos, radius)| {
-            let (x, y) = pos.to_f32();
-            ray_circle_range(start, dir, Vec2::new(x, y), (radius + BULLET_R) as f32)
-        })
-        .fold(arena_range(start, dir), f32::min);
+    for (line, mut transform, mut sprite, mut visibility) in &mut lines {
+        let angle = dir.y.atan2(dir.x) + line.0 as f32 * half_angle;
+        let along = Vec2::from_angle(angle);
+        // Each line is stopped by whatever IS in its own way — an edge that
+        // clears a boulder the centre runs into is the useful half of the
+        // picture, since that is where the round can still get through.
+        let range = rocks
+            .iter()
+            .map(|(rock, pos)| (pos, rock.r))
+            .filter_map(|(pos, radius)| {
+                let (x, y) = pos.to_f32();
+                ray_circle_range(start, along, Vec2::new(x, y), (radius + BULLET_R) as f32)
+            })
+            .fold(arena_range(start, along), f32::min);
 
-    *visibility = Visibility::Visible;
-    sprite.custom_size = Some(Vec2::new(range.max(0.0), AIM_LINE_WIDTH));
-    sprite.color = Color::srgba(1.0, 1.0, 1.0, AIM_LINE_ALPHA * amount);
-    // Lifted to weapon height like the tracers, so the shot line leaves the
-    // rifle rather than the soldier's boots (see `render::muzzle_lift`).
-    let mid = start + dir * range / 2.0;
-    transform.translation = Vec3::new(mid.x, mid.y + lift, Z_AIM_LINE);
-    transform.rotation = Quat::from_rotation_z(dir.y.atan2(dir.x));
+        let alpha = AIM_LINE_ALPHA * amount * if line.0 == 0 { 1.0 } else { AIM_EDGE_ALPHA };
+        *visibility = Visibility::Visible;
+        sprite.custom_size = Some(Vec2::new(range.max(0.0), AIM_LINE_WIDTH));
+        sprite.color = Color::srgba(1.0, 1.0, 1.0, alpha);
+        // Lifted to weapon height like the tracers, so the shot line leaves the
+        // rifle rather than the soldier's boots (see `render::muzzle_lift`).
+        let mid = start + along * range / 2.0;
+        transform.translation = Vec3::new(mid.x, mid.y + lift, Z_AIM_LINE);
+        transform.rotation = Quat::from_rotation_z(angle);
+    }
 }
 
 /// Distance from `start` along `dir` to the arena wall (where bullets despawn).

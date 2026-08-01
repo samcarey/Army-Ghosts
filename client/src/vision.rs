@@ -54,8 +54,8 @@ use bevy::sprite_render::{AlphaMode2d, Material2d, Material2dKey, Material2dPlug
 use bevy_ggrs::LocalPlayers;
 
 use army_ghosts_sim::{
-    Block as SimBlock, Bush, Player, Pos, Rock, Scenario, Stance, Team, ARENA_HALF_H, ARENA_HALF_W,
-    FP, PLAYER_R, STANCE_HEIGHT,
+    Aim, Block as SimBlock, Bush, Player, Pos, Rock, Scenario, Stance, Team, ARENA_HALF_H,
+    ARENA_HALF_W, FP, PLAYER_R, STANCE_HEIGHT,
 };
 
 /// Unlit ground: dark enough to read as "no information", light enough to tell
@@ -393,7 +393,7 @@ pub fn update_fog(
             // here", which is the question the player asks of a tile — and it
             // keeps open ground bright, instead of drowning it in the grass that
             // hides the dirt but not a soldier.
-            let grass = grass_conceal(&scenario, eye, eye_h, *centre, STANCE_HEIGHT[0] as f32);
+            let grass = grass_conceal(&scenario, eye, eye_h, *centre, STANCE_HEIGHT[0] as f32, 0);
             let mut sum = 0.0;
             for i in 0..HEX_PROBES {
                 let p = match i {
@@ -620,8 +620,19 @@ fn smoothstep(s: f32) -> f32 {
 /// [`Cast`]s use: peeking *around* a field of grass isn't a thing. (That is also
 /// why the [`Cast`] machinery did NOT move — it is a camera model, and it
 /// answers a different question from the one a pawn asks about itself.)
-fn grass_conceal(scenario: &Scenario, eye: Vec2, eye_h: f32, target: Vec2, target_h: f32) -> f32 {
-    grass_conceal_in(eye, eye_h, target, target_h, |x, y| scenario.depth(x, y))
+/// `stir` is the target's [`army_ghosts_sim::Aim::stir`] — a moving body
+/// forfeits concealment (`MOTION_REVEAL`), and the fade has to show the same
+/// number the bots decide on. A hypothetical target (the fog tiles, the strip
+/// table) passes 0: a tile is asking about ground, and ground holds still.
+fn grass_conceal(
+    scenario: &Scenario,
+    eye: Vec2,
+    eye_h: f32,
+    target: Vec2,
+    target_h: f32,
+    stir: i32,
+) -> f32 {
+    grass_conceal_in(eye, eye_h, target, target_h, stir, |x, y| scenario.depth(x, y))
 }
 
 /// [`grass_conceal`] over an arbitrary depth field, rather than whichever one
@@ -632,9 +643,10 @@ fn grass_conceal_in(
     eye_h: f32,
     target: Vec2,
     target_h: f32,
+    stir: i32,
     depth_at: impl Fn(i32, i32) -> i32,
 ) -> f32 {
-    grass_block(eye, eye_h, target, target_h, depth_at).conceal()
+    grass_block(eye, eye_h, target, target_h, depth_at).0.conceal_moving(stir) as f32 / FP as f32
 }
 
 /// World units to the sim's fixed point. Rounded rather than truncated so a
@@ -662,6 +674,10 @@ impl Block {
     fn length(&self) -> f32 {
         self.0.length as f32 / FP as f32
     }
+    /// Still-target concealment. The game itself always goes through
+    /// [`grass_conceal_in`], which takes the target's stir; the strip table
+    /// tabulates the still case.
+    #[cfg(test)]
     fn conceal(&self) -> f32 {
         self.0.conceal() as f32 / FP as f32
     }
@@ -707,11 +723,22 @@ fn eye_height(stance: &Stance) -> f32 {
 /// squad shooter solves it the same way. What it costs is that the fog is no
 /// longer a pure statement about sight lines — a teammate visible through a
 /// boulder is you reading a radio, not your eyes.
+/// A pawn as the fade reads it — and its `Aim`, because the enemy's own recent
+/// movement is part of how visible they are.
+type Faded = (
+    &'static Player,
+    &'static Team,
+    &'static Pos,
+    &'static Stance,
+    &'static Aim,
+    &'static mut Sprite,
+);
+
 pub fn fade_hidden(
     local_players: Option<Res<LocalPlayers>>,
     rocks: Query<(&Rock, &Pos)>,
     bushes: Query<(&Bush, &Pos)>,
-    mut players: Query<(&Player, &Team, &Pos, &Stance, &mut Sprite), With<Player>>,
+    mut players: Query<Faded, With<Player>>,
     scenario: Res<Scenario>,
 ) {
     let Some(local) = local_players else { return };
@@ -719,7 +746,7 @@ pub fn fade_hidden(
     let me = players
         .iter()
         .find(|(p, ..)| p.handle == handle)
-        .map(|(_, team, pos, stance, _)| {
+        .map(|(_, team, pos, stance, _, _)| {
             let (x, y) = pos.to_f32();
             (*team, Vec2::new(x, y), eye_height(stance))
         });
@@ -736,7 +763,7 @@ pub fn fade_hidden(
     }
 
     let reach = PLAYER_R as f32 * 0.7;
-    for (player, team, pos, stance, mut sprite) in &mut players {
+    for (player, team, pos, stance, aim, mut sprite) in &mut players {
         // Never hide yourself, and never hide your own side — see the note above.
         if player.handle == handle || *team == my_team {
             sprite.color.set_alpha(1.0);
@@ -755,7 +782,9 @@ pub fn fade_hidden(
         .map(|offset| coverage_at(&casts, body + *offset))
         .sum::<f32>()
             / 5.0;
-        let grass = grass_conceal(&scenario, viewer, viewer_h, body, eye_height(stance));
+        // The enemy's own stir: a runner is faded back IN, because the grass
+        // over them is moving and yours are the eyes it is moving in front of.
+        let grass = grass_conceal(&scenario, viewer, viewer_h, body, eye_height(stance), aim.stir);
         sprite
             .color
             .set_alpha(((1.0 - hidden) * (1.0 - grass)).clamp(0.0, 1.0));
@@ -779,9 +808,9 @@ mod tests {
         let (west, east) = (Vec2::new(-150.0, 0.0), Vec2::new(150.0, 0.0));
         let near = Vec2::new(-90.0, 0.0); // same bearing, a fifth of the way
 
-        let standing = grass_conceal(&Scenario::Arena, west, h(0), east, h(0));
-        let crouching = grass_conceal(&Scenario::Arena, west, h(0), east, h(1));
-        let prone = grass_conceal(&Scenario::Arena, west, h(0), east, h(2));
+        let standing = grass_conceal(&Scenario::Arena, west, h(0), east, h(0), 0);
+        let crouching = grass_conceal(&Scenario::Arena, west, h(0), east, h(1), 0);
+        let prone = grass_conceal(&Scenario::Arena, west, h(0), east, h(2), 0);
         assert!((0.0..=1.0).contains(&standing));
         assert!(
             prone > crouching && crouching > standing,
@@ -791,14 +820,14 @@ mod tests {
         // Distance has to matter, or grass stops being terrain and becomes a
         // property of standing in it.
         assert!(
-            grass_conceal(&Scenario::Arena, west, h(0), near, h(0)) < standing,
+            grass_conceal(&Scenario::Arena, west, h(0), near, h(0), 0) < standing,
             "a pawn 60 units away must be plainer than one 300 away"
         );
 
         // Lying down buys concealment and costs sight: the same target is harder
         // to make out from down in the blades.
         assert!(
-            grass_conceal(&Scenario::Arena, west, h(2), east, h(0)) > standing,
+            grass_conceal(&Scenario::Arena, west, h(2), east, h(0), 0) > standing,
             "a prone viewer must see less, not more"
         );
 
@@ -808,7 +837,7 @@ mod tests {
         // `GRASS_SEED` moves.
         let bare = Scenario::GrassStrip { depth: 0, east_stance: 0 };
         assert_eq!(
-            grass_conceal(&bare, west, h(0), east, h(0)),
+            grass_conceal(&bare, west, h(0), east, h(0), 0),
             0.0,
             "bare ground must not conceal"
         );
@@ -820,7 +849,7 @@ mod tests {
         // Asked at FIGHTING range, not across the whole arena: a sight line the
         // width of the map crosses ~12 tiles and `covered` takes the deepest, so
         // fading out at 300 units is the model working, not failing.
-        let close = grass_conceal(&Scenario::Arena, west, h(0), west + Vec2::new(80.0, 0.0), h(0));
+        let close = grass_conceal(&Scenario::Arena, west, h(0), west + Vec2::new(80.0, 0.0), h(0), 0);
         assert!(
             close < 0.7,
             "the field must not hide a standing pawn 80 units away: {close}"

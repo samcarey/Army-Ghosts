@@ -148,8 +148,153 @@ nothing.
   units — half a "normal" mobile screen, deliberately fixed rather than
   window-relative) along the facing, smoothstepped over 500 ms, and a thin
   white line traces the shot to the first target it would hit, else the arena
-  wall. The shift rides on `render::CameraFocus` (the follow target) so the
-  camera's own lerp doesn't fight the aim ease.
+  wall — flanked by two fainter lines at the edges of the cone the round is
+  actually drawn from (see Accuracy). The shift rides on `render::CameraFocus`
+  (the follow target) so the camera's own lerp doesn't fight the aim ease.
+  * **The cone is the only thing that tells a player what the accuracy model is
+    doing to them**, and that is why it is here rather than in a HUD readout.
+    Everything the sim charges for happens to a number they cannot see, and a
+    mechanic that silently decides whether your rounds land reads as the game
+    cheating. Two lines opening and closing say it without a word: stop and they
+    draw together, run and they fly apart.
+  * It shows only with the sights up, deliberately. Hip fire is the state the
+    cone is widest in and the one a player can least act on, and three lines
+    swinging around the pawn at all times is permanent clutter on a phone.
+    Wanting to know your spread is exactly the moment you should be aiming.
+  * Each of the three is stopped by whatever is in *its own* way, not the
+    centre's — an edge that clears a boulder the centre runs into is the useful
+    half of the picture, because that is where a round can still get through.
+- **Accuracy** (`sim/src/lib.rs`: the constant block above `SPREAD_MAX`, `Aim`,
+  `settle_aim`, `fire_bullets`) — a round no longer leaves the barrel along
+  `Facing`. It leaves along a direction drawn from a **cone**, and how wide that
+  cone is says everything about what the shooter was doing when they fired.
+  **This is the mechanic run-and-gun loses to.** Before it, a sprinting pawn and
+  one that had lain still in the grass for a minute fired exactly the same round,
+  so every incentive the rest of the game is built on — stance, grass, patience,
+  the whole no-respawn premise — was undercut by the one system that decides
+  whether any of it pays.
+  Five inputs, kept apart because they answer different questions and tune
+  independently. The first three shipped together; the last two were added when
+  measurement showed the first three alone were not enough (see "How the goal
+  was actually reached" below):
+  * **`Aim::sway`** — how steady the hold is, a consequence of POSTURE:
+    `STANCE_SWAY` per stance, plus `MOVE_SWAY` scaled by the *square* of the
+    fraction of a full run being covered, times `ADS_SWAY` (0.45) if the sights
+    are up. It has a settled value for any posture and it EASES toward it —
+    `SWAY_RISE_TICKS` (10) up, `SWAY_SETTLE_TICKS` (96, 1.6 s) down.
+    **The asymmetry is the whole mechanic**, not polish: if steadiness came back
+    as fast as it went, a run-and-gunner could stop for two ticks and shoot as
+    well as someone who had held the corner for a minute. Unsteadiness is
+    instant; steadiness is earned.
+  * **`Aim::bloom`** — recoil owed for rounds already fired, gaining
+    `RECOIL_PER_SHOT` times the stance's `STANCE_RECOIL` share and bleeding
+    `RECOIL_DECAY` a tick. This is BOTH of the "when did you last shoot"
+    questions at once: how long ago falls out of the decay, how long you have
+    held the trigger falls out of the gain outrunning it. Standing fire saturates
+    in about 9 rounds, crouched in 19, prone in 85 — so the first round after a
+    pause is the accurate one in every stance and how many you get after it is
+    what the stance buys.
+  * **`Aim::swing`** — how fast the aim DIRECTION has been traversing, charged
+    by `Aim::turn` (in `move_players`, the one place old and new facing are both
+    in hand) whenever the barrel turns faster than `SWING_FREE` (~1.1°/tick) and
+    honed back down by `SWING_DECAY` (~0.7 s). What this prices is TRACKING, and
+    the price is steepest up close with nothing in the code asking about range:
+    angular rate is speed over range, so the same crossing walk that saturates
+    the cone at 40 units (measured: peak swing 244/256) tracks for free at 150
+    (measured: 0). Shooting a mover is harder than shooting a camper, most of
+    all at knife range, and honing onto a still target is what the dead zone
+    makes free. Two things about it:
+    - The dead zone is also what keeps joystick wobble from taxing a player who
+      is merely holding a direction.
+    - **It is why bot aim jitter became a bounded WALK** (`Bot::drift_x/y`): the
+      offset used to be redrawn from scratch sixty times a second, which was
+      harmless while the aim point was bookkeeping and became a barrel VIBRATING
+      several degrees a tick the moment `turn` priced traverse. Every bot's cone
+      sat saturated and `rounds_are_fought_to_a_finish` ran all three rounds to
+      the clock. Walking the offset keeps each tick's turn inside the dead zone,
+      so a shaky bot pays with misses that drift across the target — which is
+      also what a hand actually does — rather than with a cone it never earned.
+  * **`Aim::stir`** — how much this pawn has been MOVING lately (instant rise,
+    `STIR_DECAY` = 1 s to fade), and it does not feed the cone at all: it feeds
+    CONCEALMENT. `Block::conceal_moving` scales grass concealment down by
+    `MOTION_REVEAL` (0.75) times stir SQUARED, so a sprint through deep grass
+    forfeits most of it (measured: a pawn seen at 34/256 while still is seen at
+    201/256 sprinting), a crouched trot ~23%, a prone crawl ~7% — stance caps
+    speed, so the stances price themselves. **`Aim::flash` sets stir to full on
+    every shot**: a muzzle flash is a flare above the grass whatever stance you
+    fire from, so one aimed shot buys a second of being seen and a held trigger
+    is a held flare. Deliberately range-independent — you spot grass rustling
+    across the whole map; what range buys is knowing what is under it.
+  * **`SPREAD_MAX`** (0.22) — what the sway + bloom + swing sum is worth in
+    angle, as the **tangent of the half-angle** rather than an angle, because
+    the question is where the round lands and `offset = tan × distance` is one
+    multiply where an angle would be a trig table.
+  Things that are load-bearing:
+  * **`Aim` is rollback-registered AND checksummed**, like `Stance` and for one
+    step further on the same argument: two peers disagreeing about how steady a
+    shooter is disagree about where its rounds went, and that only reaches `Pos`
+    when somebody dies of it. It also carries its own LCG, advanced ONLY when a
+    round is actually fired, so two pawns holding fire never drift apart.
+  * **The draw leans slightly toward the middle and then stops dead at the rim**
+    (`SPREAD_CORE`, `taper`) — two flat steps in a 17:15 ratio, not a bell.
+    A bell fades the rim to nothing and quietly refunds most of what a wide cone
+    is supposed to cost; a flat draw reads as a broken gun rather than an
+    unsteady soldier. Three things about it are load-bearing:
+    - **Leaning inward is a SUBSIDY TO THE CARELESS.** It lifts the odds a round
+      lands by a factor that grows with how bad the cone already is — a tight
+      cone gets nothing because it was hitting anyway, a saturated one gets the
+      full `1/c`. Measured: at core 7/8 the run-and-gun kit went from +14 elo
+      (flat) to **+108**. So `SPREAD_MAX` was widened from 0.22 to 0.32 to pay
+      for it, and the lean kept gentle. **Change one and re-measure the other.**
+    - **It is piecewise-linear so it INVERTS in closed form**, which is why
+      `bot::shot_quality` can stay exact integer arithmetic instead of an erf
+      approximation. That function is what the `discipline` gate and the whole
+      close-the-distance judgement are built on, so a shape the bots cannot
+      compute the hit probability of is a shape that silently miscalibrates
+      every one of them. `shot_quality_matches_the_rounds_it_predicts` pins the
+      predictor against the actual draw at five ranges and four spreads.
+    - `shot_quality` works in SUBUNITS, not through `Aim::cone_half_width` —
+      whole world units truncate, and when the cone is within a unit or two of
+      the target's own size that truncation is most of the answer (240 predicted
+      against 254 actual, caught by that test).
+  * **`step`/`step_speed` exist so the aim model and the movement share one
+    answer.** How fast a shooter is going is most of what decides its cone, and
+    `settle_aim` runs in the same tick as `move_players` off the same `Intent`;
+    two copies of that arithmetic that drifted apart would charge a pawn for a
+    sprint it never took. There is nothing keeping them honest but this being the
+    only copy.
+  * **A fresh pawn is NOT perfectly steady.** `Aim::rest` (and the constructor)
+    start `sway` at standing's settled value. Zero was the first version and it
+    handed every pawn on the field one free unmissable shot at the top of every
+    round — caught by `rounds_kill_and_the_dead_stay_down`, which was trying to
+    prove a standing shooter *cannot* reach across the arena and watched it land
+    52 damage before settling into anything.
+  * **The cone is angular, so closing the distance opts out of it.** At 30 units
+    even a saturated cone is narrower than a pawn, which means charging to
+    point-blank genuinely neutralises the cone on its own — measured, twice:
+    widening `SPREAD_MAX` to 0.50 with the stance sways rescaled was tried and
+    did not change the verdicts, only broke three combat tests. The counters to
+    the charge are the OTHER mechanics: the charger is lit up by its own stir
+    the whole way in, and a head-on approach is the cheapest thing in the game
+    to track (near-zero angular rate), so the settled defender shoots first and
+    accurately. Read the cone as "firing while moving is punished", not
+    "aggression is punished".
+  **How the goal was actually reached** — "make careful play win" took three
+  attempts, and the failures are more instructive than the fix:
+  * The cone alone taxed a runner's own shooting, and a bot (or a person) who
+    charges and only fires after arriving never paid it — measured as
+    `aggression=0.9` costing only -26 elo.
+  * Movement-costs-concealment and traverse-costs-accuracy added the taxes that
+    cannot be opted out of: being SEEN on the way in, and being hard-tracked
+    only when crossing, not when being charged head-on.
+  * **Firing itself had to cost something, and the cost had to be concealment**
+    (`Aim::flash`), because with no ammunition every withheld
+    positive-expectation shot is a donation to the other side. `discipline=0.0`
+    beat two successive quality-threshold trigger gates (+424 and +247 elo, one
+    a clean 18-of-18 sweep) before this was understood — there is provably no
+    trigger policy for a VISIBLE bot that beats "fire whenever anything might
+    land". What a hidden bot loses by firing is its concealment, which is why
+    the discipline gate binds exactly while hidden and never after (see Bots).
 - **Stance** (`sim/src/lib.rs` `Stance` + `client/src/stance.rs`): standing /
   crouching / prone, driven by the two chevron buttons on the right edge (or
   C to go down, V to get up). What crosses the wire is the *level* the player
@@ -292,6 +437,17 @@ nothing.
     drops them), and a bot's mind (seed and 24 ticks of sightings, rebuilt from
     the handle by `Bot::seeded` — costs the bots their memory, buys one less
     thing that could disagree).
+  * **The gun IS in the blob** — `Aim`'s sway, recoil, stir, swing and its own
+    LCG seed, all five, which is what took `FORMAT` to 2. Rebuilding them from the handle the
+    way a bot's mind is rebuilt would hand a player who reloaded mid-burst a
+    clean first shot, and the whole accuracy model is about what you were doing a
+    second ago; a rejoin is exactly a second ago. Carrying the seed also removed
+    a bug the moment it was written: `Aim::from_parts` defensively forced it odd
+    (copied from `Bot::seeded`, where it is harmless), so half of all restored
+    pawns came back with a gun that was not the gun that was saved.
+    `a_restored_world_is_the_world_that_was_saved` caught it as a one-off in a
+    single field, which is exactly what comparing BLOBS rather than hand-picked
+    assertions is for.
   * **The dials go in the blob**, and that is not bookkeeping: restore five bots
     into a client whose bot dial reads zero and `reconcile_bots` will correctly
     delete all five. The dial is where the count lives; the pawns are its
@@ -567,6 +723,143 @@ nothing.
     the grass and kill in three shots, so a minute of eight of them is about
     FIFTEEN rounds fired and five deaths. Quiet, close and decisive is what this
     concealment model implies; it is not a sign they have stopped working.
+  **What the accuracy model changed about the brain**, and it is less than it
+  sounds because the architecture was already halfway there:
+  * **`discipline` is a sixth `BotProfile` dial and it is AMBUSH PATIENCE — a
+    gate on the trigger that binds only while the bot is still hidden.** It took
+    three designs, and the two dead ones are worth more than the live one:
+    - A gate on absolute `shot_quality` only ever passed point-blank (proximity
+      saturates quality whatever the cone does — measured: "disciplined" bots
+      fired at a mean spread of 250/256) and held fire FOREVER at long range.
+      `discipline=0.0` beat it 23 of 25 decisive pairs.
+    - A gate relative to the best-from-here honed shot fixed both ends and
+      STILL lost +247 elo, and the loss is a theorem, not a tuning miss: fire
+      costs no ammunition, so for a VISIBLE bot every withheld
+      positive-expectation shot is a donation. No trigger policy beats "fire
+      whenever anything might land" once you are seen.
+    - What firing does cost is concealment (`Aim::flash`), and that cost only
+      exists while you have concealment to lose. So the gate runs exactly while
+      the bot is hidden — buried in its own grass, not lit by its own stir —
+      and asks whether this shot is honed enough to be worth breaking cover
+      for, `discipline` setting the bar as a share of the best shot available
+      from here. One round later the flash has spent the concealment, the gate
+      is moot by its own logic, and the bot fires at will like everyone else.
+      The first shot out of an ambush is the aimed one; the burst after is not.
+    It is a gate, not a consideration, so the three-considerations rule below
+    is untouched. "Hidden" is the bot's honest estimate of itself —
+    `is_concealed` at its own position plus its own low stir — both things it
+    genuinely knows, so no peer can disagree.
+  * **`Act::Fight` and `Act::Push` weigh `worth_a_round` where they used to weigh
+    `nearness`**, and that swap is what stops the model deadlocking a match.
+    Range alone said "you are close enough to shoot", which stopped being the
+    same question as "you can hit them from here" the moment a round came out of
+    a cone: two bots at a standoff both scored `Fight`, both rooted, both fired,
+    and neither ever connected. Measured before the swap — the whole arena stood
+    still for **38 seconds** and got through 4 rounds in 90 instead of 7.
+    Scoring the *shot* closes the loop: a bot that cannot hit from where it
+    stands scores `not(worth)` on `Push` and walks in until it can.
+  * **`worth` is computed from the SETTLED cone, not the live one.** Using the
+    live one reads as sound and is a feedback loop: moving widens the cone, a
+    wide cone raises `Push`, and `Push` moves — so once a bot started closing it
+    could never stop, because the reason it could not shoot was that it was
+    walking. What that looks like from above is the whole side breaking into a
+    charge and arriving in a heap. Asking what the shot would be worth *from a
+    settled hold* makes the answer a fact about range and stance, which are the
+    two things closing and getting down actually change.
+  * **A bot holds fire for a lane as wide as the CONE, not as the aim line**
+    (`blocked_by_a_friend`), measured where the teammate stands rather than at
+    the target, since a cone opens with range. Without it the bots started
+    shooting their own side the day rounds stopped flying straight.
+  * **`Act::Hunt`'s third consideration is `risk`, and it is `hp` only while the
+    bot can ACTUALLY SEE somebody.** Walking into a fight in progress while weak
+    is what the hp term prices; searching is not that, and charging `hp` for it
+    produced the same stall twice, at both ends of the mistake. Keyed on
+    nothing: a lone survivor on 18 hp scored Hunt at `ADVANCE × 0.18 ≈ 23`
+    against Settle's flat 32 and held still **84 seconds** with nobody in its
+    memory. Keyed on a STALE contact: two hurt bots 45 units apart, each with a
+    seconds-old memory of the other and neither able to see anything now, both
+    prone in grass — both settled, **116 seconds**. A memory is not an enemy you
+    are looking at. The rule that survives both: avoid a fight you can see,
+    search whatever your health.
+  * **Bots have no pathfinding and now notice when that isn't working**
+    (`STUCK_TICKS`, `Bot::blocked`/`veer`). They steer straight at what they
+    want and let `push_out_of_cover` deflect them, which works because it
+    cancels only the into-the-rock part of a step — but a DEAD-ON approach
+    cancels entirely and the bot pushes at the same boulder for the rest of the
+    round (measured: 68 s, 23 units short of the enemy it was marching at, and
+    `Act::Hunt` does not shoot). Three things this got wrong before it worked:
+    - **"Did I move?" must be a checkpoint over a window, not tick-to-tick.**
+      A bot leaning on a rock is shoved back to the surface every tick and lands
+      on a different SUBUNIT, so exact inequality is true every tick while it
+      goes nowhere.
+    - **It must ask `step_speed`, not whether the move vector is non-zero** —
+      the move vector doubles as the AIM direction, so an aiming bot (rooted by
+      `BTN_ADS`) trivially "never moves". Getting this wrong rotated every
+      aiming bot's aim a quarter turn: two bots at point-blank firing at right
+      angles to each other, forever.
+    - **The side it steps to must alternate when it doesn't help.** A fixed side
+      is a coin flip against the geometry: a bot marching due north into a
+      boulder veered due east into the arena wall and stayed there.
+  * **Bots patrol, because a bot that arrived and found nothing used to sit down
+    for the rest of the round.** `ARRIVED * 6` fades `Act::Hunt` out over the last
+    stretch of the walk so a bot does not grind into the far wall — which is
+    right, and which leaves `Act::Settle` the only thing scoring, and a bot that
+    settles on empty ground never gets up again because nothing it can see will
+    ever change. The recorded case: two bots stopped a hundred-odd units short of
+    the enemy's line and spent the remaining **36 seconds** there, while the last
+    live enemy lay prone and hidden in the middle of the map they had just walked
+    across. Neither was hiding from the other; both had run out of anywhere to be.
+    So the objective alternates ends, and the leg changes when the bot has watched
+    one spot for `SEARCH_PATIENCE` (4 s) and nothing came.
+    - **It is patience, not arrival.** Tying the flip to a distance means two
+      thresholds that have to agree about what "arrived" means and don't: a bot
+      stops advancing wherever `Hunt` falls under `Settle`, which moves with its
+      health, so any fixed radius leaves a band where it is too close to keep
+      walking and too far to have got anywhere. Measured with the flip at
+      `ARRIVED`: it stopped 170 units short of a line it never reached and sat
+      exactly as long as before.
+    - **Contact resets it**, so a bot in a firefight is never on a schedule and
+      one lying in ambush stays as long as it has anything to watch. Four seconds
+      is deliberately long: holding still in cover IS the careful game.
+    - Sweeping is also what finds someone prone in deep grass — concealment falls
+      off with range, so a searcher that keeps moving eventually gets close
+      enough and one that sits still never will.
+  * **Most bot rounds come from a planted stance, but no longer all of them.**
+    Before the ambush gate, no bot ever fired on the move (97 rounds over 90 s,
+    none moving — `Act::Fight` roots the shooter, a free property of the
+    behaviour list). The ambush gate deliberately reintroduced a minority of
+    walking fire: an EXPOSED closer squeezing off taxed rounds is correct play
+    now, measured at ~12%. `bots_stop_before_they_shoot` pins a 25% ceiling —
+    walking spray as the rule rather than the taxed exception is the regression
+    it guards.
+  **The dial landscape after the full accuracy model is FLAT, and that is the
+  measured result, not a failure to measure.** On the final tree (`--pairs
+  80-100` against the shipping default): `aggression=0.9` about -61; the whole
+  run-and-gun kit (`aggression=0.95,caution=0.05,discipline=0.0`) about -11,
+  undecided at 100 pairs; `caution=0.05` about +27; both `discipline` extremes
+  inside noise with ~70 of 80 pairs tied; `skill=1.0` dead level. Only three
+  things stand out of the plain: `reaction` still dominates absolutely (5 sweeps
+  every decisive pair, 23 loses every one), `accuracy` still registers (0.4
+  about -249), and **`caution=0.9` — hide forever — loses every single decisive
+  pair**, because a round is won by numbers standing and a side that never
+  advances never changes the numbers.
+  Read the flatness correctly before reaching for the dials:
+  * Bots never produced run-and-gun inputs in the first place — they already
+    stopped to shoot, and they close in straight lines, which is the cheapest
+    thing in the game to track. The taxes the model levies fall on inputs
+    HUMANS produce: strafing while firing, whip-aiming, sprinting between
+    cover, holding the trigger. Bot-v-bot elo cannot see those.
+  * An earlier tree on this branch showed run-and-gun losing decisively (-38,
+    SPRT-confirmed) — and part of that edge was the hurt-survivor stall
+    (`risk`, above): "careful" was winning partly by hiding out the clock in a
+    way that also froze the game. Fixing the stall traded the headline number
+    for honest resolution. When re-measuring after a bot change, know which of
+    those two you are looking at.
+  * Mean round on the final tree is ~33 s of fighting with a ~12% draw rate
+    (was 71.5 s / 1.8% before the model). Faster and drawier: engagements
+    resolve quicker because attackers are seen coming, and more rounds end
+    with both sides still standing. Watch both numbers whenever these
+    constants move.
   Things that will bite:
   * **Every behavior scores on EXACTLY THREE considerations.** Multiplying values
     in `0..=FP` drags a score down as considerations are added, which penalises
@@ -933,7 +1226,11 @@ nothing.
   integer and it has to be somewhere both the sim and the renderer can ask.
   `client/src/vision.rs` keeps only unit conversion (`Vec2`/f32 shares ⟷ `Pos`/FP),
   so there is exactly ONE implementation and what hides a bot is what hides a
-  player by construction rather than by agreement.
+  player by construction rather than by agreement. That includes motion:
+  `fade_hidden` passes the enemy's `Aim::stir` into `Block::conceal_moving`, so
+  a sprinter fades back IN on your screen by exactly the number the bots hunt
+  it by. The fog TILES pass stir 0 — a tile asks about ground, and ground holds
+  still.
   The port is checked, not asserted: `integer_concealment_matches_the_f32_model_it_replaced`
   reimplements the old f32 model verbatim and requires agreement within 2% over
   every stance pairing × 9 depths × 5 ranges, and
@@ -1090,6 +1387,25 @@ nothing.
   rooms — new pairings then stall even at the signaling stage. When p2p
   "mysteriously stops working": `pkill matchbox_server` and restart it, and
   always use FRESH room codes per test (rooms remember dead peers).
+- **`FP` is 256, so a per-tick rate written as a fraction of it rounds HARD.**
+  `RECOIL_DECAY` was first written `FP / 150`, meaning "a saturated bloom clears
+  in 2.5 s". Integer division makes that **1**, not 1.7 — so it cleared in 4.3 s
+  instead, and the extra 0.7 subunits a tick was the entire margin the stances
+  were balanced on. Every stance saturated at the same rate: a prone shooter
+  meant to hold a steady bipod was spraying at `SPREAD_MAX` after eight rounds,
+  and the arena test that fires down the one clear lane could not kill anybody
+  from any posture at all. The symptom pointed at the spread constants, which
+  were fine. Write these as `FP / 128` or a plain integer — something that
+  divides — and check the arithmetic in **whole subunits** before trusting it.
+  `recoil_settles_at_a_different_rate_in_each_stance` asserts `RECOIL_DECAY >= 2`
+  in a `const` block precisely so the next one is a build failure.
+- **Don't run `cargo fmt` on this repo.** `main` is not rustfmt-clean and never
+  has been (119 files' worth of diff), so formatting the crate you are editing
+  buries a real change in several hundred lines of reflow — half of a 750-line
+  diff, measured. If it happens anyway, the recovery is: stash your work, `cargo
+  fmt` a clean tree and keep that as a baseline, restore your work, diff your
+  tree against the baseline to get the semantic patch alone, then apply THAT to
+  an unformatted checkout.
 - **A FRESH WORLD MUST START A FRESH ROUND**, and forgetting it desynced every
   p2p match this game ever played. `Round` is a rollback-registered, CHECKSUMMED
   resource, so it is not part of the world — it outlives one. The warmup
@@ -1213,6 +1529,35 @@ need a TURN server eventually.
   can't just be called directly. `arena_with(humans, bots)` takes 0 humans and
   still builds a one-seat session, which is the shape the harness runs: a human
   pawn standing inert on a post is a free kill that quietly decides a match.
+  Three of these are about the accuracy model and are worth knowing separately:
+  * `rounds_kill_and_the_dead_stay_down` now fires **twice**, and the contrast is
+    the test. Ten seconds of held trigger standing in the open at 660 units must
+    NOT kill; the same soldier flat, braced and settled must. It is the one place
+    the model's claim is stated end to end, and it is what caught a fresh pawn
+    starting perfectly steady.
+  * `the_cone_leans_toward_the_middle_and_stops_dead_at_its_edge` histograms
+    200k rounds: the outermost bin must stay populated (a bell would empty it)
+    and the inner half must outnumber the outer by a little and not a lot.
+  * `bots_stop_before_they_shoot` pins that walking fire stays a taxed MINORITY
+    (≤25%; ~12% measured) — the ambush gate made some of it correct play, so
+    the bound is a ceiling, not the zero it once was (see Bots).
+  * `running_in_grass_gives_you_away` and
+    `swinging_the_aim_costs_accuracy_until_it_is_honed_back_in` (lib tests) pin
+    the stir and swing mechanics with printed measurements: still 34/256 seen
+    vs 201 sprinting; peak swing 244 tracking a crosser at 40 units vs 0 at
+    150.
+  * **`a_match_never_stops_moving_around_an_idle_player` has now caught SIX
+    distinct causes**, and the last three came from this branch: a hurt lone
+    survivor that would not search (84 s), two hurt bots each sitting on a
+    seconds-old memory of the other (116 s), and a bot walking into a boulder
+    forever (68 s). It watches **200 seconds**
+    now, not 90: a round that runs its full clock is a legitimate outcome (a
+    still pawn is nearly invisible, so a last survivor genuinely can hide it
+    out) and the old window quietly assumed every round ends in a wipe. Its
+    round-count floor now only catches the clock itself wedging.
+  * `recoil_settles_at_a_different_rate_in_each_stance` (a lib test) exists
+    because `FP` is 256, so a per-tick decay written as a fraction of it is a very
+    small integer and **rounds hard** — see the gotcha below.
 - **`tools/grass-table.sh [outfile]`** — the concealment measuring rig
   (`client/src/vision/strip_table.rs`). Two pawns either side of a ONE-HEX-wide
   strip of grass, one clear hex off it, tabulated over every grass depth x every
@@ -1269,7 +1614,8 @@ need a TURN server eventually.
   **Ghost War rounds** — muster at opposite ends, two minutes or until one side
   is wiped out, nobody respawning — and scored on **rounds won minus rounds
   lost**. `-c`/`-b` take `skill=0.8,reaction=6` style specs that fill in from the
-  shipping profile, so a spec says exactly what is being varied. A match is
+  shipping profile, so a spec says exactly what is being varied — six dials now,
+  `discipline` being the one the accuracy model added. A match is
   ~70 ms, so a verdict is usually a few seconds — run it before committing any
   change to `bot.rs` or `BotProfile`.
   It lives in its own crate (`harness/`, bin `selfplay`) for one reason: sim's
@@ -1296,6 +1642,11 @@ need a TURN server eventually.
     when the salt is inert: a bot that never misses never touches its dice, so
     `accuracy=1.0` on both sides leaves exactly one distinct pair and the run
     caps itself there rather than printing the same margin a hundred times.
+    **The accuracy model quietly retired that caveat**: the gun has an LCG of its
+    own, salted per match out of `BotRoster::salt` and drawn on EVERY shot
+    whatever the profile is, so the salt is never inert now. The guard is still
+    worth keeping — it costs nothing and it names a real failure — but no profile
+    reaches it any more.
   * **A sequential test (Wald's SPRT), so it stops when the answer is in.** H0
     is "wins half the decisive pairs", H1 is `--p1` (default 0.60, ~+70 elo),
     alpha = beta = 0.05, bounds ±ln(19). Ties are dropped and counted rather than

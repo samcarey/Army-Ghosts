@@ -38,8 +38,8 @@ use bevy_ggrs::ggrs::Config;
 use bevy_ggrs::PlayerInputs;
 
 use crate::{
-    spawn_facing, spawn_post, Bot, Bullet, Cooldown, Health, Player, PlayerInput, Pos, Scenario,
-    Stance, Team, MAX_PLAYERS, TEAM_COUNT, TEAM_SIZE, TICK_HZ,
+    spawn_facing, spawn_post, Aim, Bot, Bullet, Cooldown, Health, Player, PlayerInput, Pos,
+    Scenario, Stance, Team, MAX_PLAYERS, TEAM_COUNT, TEAM_SIZE, TICK_HZ,
 };
 
 /// How long a round runs before the clock decides it.
@@ -185,7 +185,7 @@ pub fn run_round<C: Config<Input = PlayerInput>>(
             round.ticks += 1;
             let mut alive = [0u32; TEAM_COUNT];
             let mut present = [0u32; TEAM_COUNT];
-            for (_, team, _, _, _, _, health, _) in &pawns {
+            for (_, team, _, _, _, _, _, health, _) in &pawns {
                 present[team.index()] += 1;
                 if health.alive() {
                     alive[team.index()] += 1;
@@ -244,6 +244,7 @@ type PawnData = (
     &'static mut crate::Facing,
     &'static mut Stance,
     &'static mut Cooldown,
+    &'static mut Aim,
     &'static mut Health,
     Option<&'static Bot>,
 );
@@ -260,7 +261,7 @@ fn start_round<C: Config<Input = PlayerInput>>(
     // guarantee.
     let mut entries: Vec<(usize, u8, Option<u8>)> = pawns
         .iter()
-        .map(|(player, team, _, _, _, _, _, is_bot)| {
+        .map(|(player, team, _, _, _, _, _, _, is_bot)| {
             // A bot never asks for a side; it goes where it is put. `get` rather
             // than an index because a bot's handle is deliberately outside the
             // session's range.
@@ -285,9 +286,10 @@ fn start_round<C: Config<Input = PlayerInput>>(
         }
     }
 
-    for (player, mut team, mut pos, mut facing, mut stance, mut cooldown, mut health) in pawns
-        .iter_mut()
-        .map(|(p, t, pos, f, s, c, h, _)| (p, t, pos, f, s, c, h))
+    for (player, mut team, mut pos, mut facing, mut stance, mut cooldown, mut aim, mut health) in
+        pawns
+            .iter_mut()
+            .map(|(p, t, pos, f, s, c, a, h, _)| (p, t, pos, f, s, c, a, h))
     {
         let (side, slot) = posting[player.handle.min(MAX_PLAYERS - 1)];
         let (x, y) = spawn_post(side, slot);
@@ -296,6 +298,11 @@ fn start_round<C: Config<Input = PlayerInput>>(
         *facing = spawn_facing(side);
         *stance = Stance::default();
         *cooldown = Cooldown::default();
+        // Steady again, and owing no recoil — but the dice carry on where they
+        // left off rather than being re-seeded. Re-seeding would need the
+        // roster's salt, which this doesn't have, and would hand every round of
+        // a match the identical sequence of deviations besides.
+        aim.rest();
         // Everything, including `down` — this is the only place anyone comes
         // back, and they come back whole.
         *health = Health::default();

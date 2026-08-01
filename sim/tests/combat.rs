@@ -265,9 +265,72 @@ fn rounds_kill_and_the_dead_stay_down() {
     assert_eq!(pos, start_pos);
 
     // Pawns muster facing down the field at the other side, and the victim is
-    // due east, so the trigger is the whole input: no walking, so the range
-    // stays the 660 units between the two lines.
-    drive(&mut app, SHOOTER, PlayerInput { move_x: 0, move_y: 0, buttons: BTN_FIRE, ..default() });
+    // due east, so no walking is needed: the range stays the 660 units between
+    // the two lines.
+    //
+    // **The shooter goes prone and puts the sights up first, and that is the
+    // accuracy model showing through rather than a flourish.** A round comes out
+    // of a cone whose width is decided by what the shooter is doing (`Aim`), and
+    // a pawn standing in the open settles at a spread `SPREAD_MAX` turns into
+    // about 75 units of scatter at this range — six times the target's own
+    // radius, so a shot across the whole arena is simply not a thing a standing
+    // soldier can take. Flat, braced, and steady it is about 8, and the lane is
+    // a shooting gallery again. The old version of this test held the trigger
+    // standing up and failed the day the cone arrived, correctly.
+    // **What standing in the open is worth at this range, stated exactly.**
+    //
+    // This used to be an end-to-end phase — ten seconds of held trigger, then
+    // assert the victim lived — and it was a COIN FLIP dressed as an assertion.
+    // Fifty rounds at a mid-teens hit rate is one sample of a wide binomial;
+    // the run that shipped it happened to land 2 hits (27 damage) and a later,
+    // equally valid realisation landed 8 and killed. Nothing about the model
+    // had changed. A statistical claim tested once is not a test, so the claim
+    // moved to where it is exact: the cone itself.
+    let standing = Aim::settled(&Stance::default(), 0, false);
+    let prone_braced = Aim::settled(&Stance { level: STANCE_PRONE, change: 0 }, 0, true);
+    let (standing_cone, prone_cone) = (
+        Aim::cone_half_width(standing, 660),
+        Aim::cone_half_width(prone_braced, 660),
+    );
+    println!(
+        "cone half-width at 660 units: standing {standing_cone}, prone with sights up \
+         {prone_cone} (a pawn's own radius is {PLAYER_R})"
+    );
+    assert!(
+        standing_cone > 4 * PLAYER_R,
+        "a soldier standing in the open must not be able to reach across the whole \
+         arena: cone {standing_cone} against a {PLAYER_R}-unit target"
+    );
+    assert!(
+        prone_cone <= PLAYER_R,
+        "flat and braced must make this shot: cone {prone_cone} against a \
+         {PLAYER_R}-unit target"
+    );
+
+    // Now flat and braced, which is what the model asks for in exchange. Prone
+    // settles at a fifth of standing and the sights halve it again, and the cone
+    // closes to under the target's own width.
+    // Get into position FIRST and only then open fire, so the first round the
+    // victim feels is a settled one. (Holding the trigger through the settle
+    // window instead means rounds are already in the air when the measurement
+    // starts, and the "one round" assertion below silently measures three.)
+    let mut posture = PlayerInput { move_x: 0, move_y: 0, buttons: BTN_ADS, ..default() };
+    posture.set_stance(STANCE_PRONE);
+    drive(&mut app, SHOOTER, posture);
+
+    // Getting down is two levels of `STANCE_DOWN_TICKS`, and the sway then has
+    // `SWAY_SETTLE_TICKS` to bleed away — the deliberate second or two before a
+    // shooter who has just changed what it was doing is worth anything.
+    run(&mut app, 2 * STANCE_DOWN_TICKS as usize + SWAY_SETTLE_TICKS as usize);
+    assert_eq!(
+        pawn(&mut app, VICTIM).1.hp,
+        MAX_HEALTH,
+        "nobody fired yet; the victim should be untouched"
+    );
+
+    let mut aimed = posture;
+    aimed.buttons |= BTN_FIRE;
+    drive(&mut app, SHOOTER, aimed);
 
     // 660 units of flight is about 41 ticks, and rounds leave every
     // FIRE_COOLDOWN, so the first one lands well inside this.
@@ -280,7 +343,8 @@ fn rounds_kill_and_the_dead_stay_down() {
     let (_, health, _) = pawn(&mut app, VICTIM);
     assert!(
         health.hp < MAX_HEALTH,
-        "a round fired straight down a clear lane at a pawn 660 units away must land"
+        "a settled prone shooter with the sights up must land a round down a clear \
+         lane at 660 units"
     );
     assert!(health.hp > 0, "one round must not kill from across the arena");
     // Range falloff is the point: the same shot point blank is the full figure.
@@ -954,7 +1018,15 @@ fn bots_close_the_distance_at_the_start_of_a_round() {
 #[test]
 fn a_match_never_stops_moving_around_an_idle_player() {
     const SAMPLE: usize = 120; // two seconds
-    const SAMPLES: usize = 45; // …of a minute and a half
+    // Long enough to hold one WHOLE round plus its intermission (126 s) with
+    // time over, because a round that runs its full clock is now a legitimate
+    // outcome rather than a stall: a pawn that holds perfectly still in grass
+    // is nearly invisible (`MOTION_REVEAL` — being still is the one concealment
+    // money can't buy back), so a last survivor who goes to ground genuinely
+    // can hide out the clock, and the round is decided on numbers standing.
+    // The 90-second window this used before quietly assumed every round ends
+    // in a wipe, which stopped being true the day stillness started working.
+    const SAMPLES: usize = 100; // …of three and a third minutes
     /// Consecutive samples with every pawn on exactly the same subunit. Contact
     /// legitimately pauses — a rooted firefight is pawns holding still on
     /// purpose — so this is generous, and still nowhere near the 30-plus seconds
@@ -1011,7 +1083,77 @@ fn a_match_never_stops_moving_around_an_idle_player() {
         worst,
         (worst * SAMPLE) as f32 / TICK_HZ as f32
     );
-    // And it was a real match, not a quiet one: the clock alone would give 2
-    // rounds in this window, so anything less means rounds are not resolving.
-    assert!(rounds_seen >= 2, "only {rounds_seen} round(s) in 90 seconds");
+    // And the round machinery kept turning: even if EVERY round ran its full
+    // clock, this window holds one round, its intermission and change — so
+    // fewer than 2 rounds means the clock itself has wedged, not that the
+    // fighting was slow.
+    assert!(rounds_seen >= 2, "only {rounds_seen} round(s) in {} seconds", SAMPLES * SAMPLE / 60);
+}
+
+/// **Most rounds come from a planted stance, and every round fired from
+/// concealment is an aimed one.** What the accuracy model promises about bot
+/// fire, from outside.
+///
+/// This assertion has been through three regimes, and the history is the
+/// spec:
+///
+///   * Before the cone existed, NO bot ever fired on the move — `Act::Fight`
+///     roots the shooter, so the property held by the shape of the behaviour
+///     list, free and unmeasured (97 rounds over 90 s, none moving).
+///   * The first discipline gate kept it at literally zero, but did it by
+///     throttling fire wholesale, and the harness convicted it:
+///     `discipline=0.0` beat the default in 23 of 25 decisive pairs, because
+///     with fire costing nothing every withheld positive-expectation round is
+///     a donation to the other side.
+///   * The AMBUSH gate (see `engage`) is the settled design: a bot that is
+///     still hidden holds its first shot until it is honed, and a bot that is
+///     already exposed fires whenever a round might land — including on the
+///     move, paying for it in the cone. Some walking fire is therefore now
+///     CORRECT (an exposed closer squeezing off a taxed round), measured at
+///     ~12%.
+///
+/// So the bound is a ceiling, not a zero: walking spray must stay a clear
+/// minority. If this fails, either a behaviour has started firing wholesale on
+/// the move — the run-and-gun regression the model exists to prevent — or the
+/// gate has stopped binding while hidden.
+#[test]
+fn bots_stop_before_they_shoot() {
+    let mut app = arena_with(0, MAX_PLAYERS);
+    let mut cooldowns = [0u16; MAX_PLAYERS];
+    let (mut fired, mut on_the_move) = (0usize, 0usize);
+
+    for _ in 0..90 * TICK_HZ {
+        run(&mut app, 1);
+        let mut rows: Vec<(usize, u16, i32)> = app
+            .world_mut()
+            .query::<(&Player, &Cooldown, &Intent, &Stance, &Health)>()
+            .iter(app.world())
+            .filter(|(.., health)| health.alive())
+            .map(|(p, c, i, s, _)| (p.handle, c.0, step_speed(&i.0, s)))
+            .collect();
+        rows.sort_unstable_by_key(|r| r.0);
+        for &(handle, cooldown, speed) in &rows {
+            // A round left the barrel exactly when the cooldown was reloaded.
+            if cooldown == FIRE_COOLDOWN && cooldowns[handle] != FIRE_COOLDOWN {
+                fired += 1;
+                if speed > 0 {
+                    on_the_move += 1;
+                }
+            }
+            cooldowns[handle] = cooldown;
+        }
+    }
+
+    let share = (on_the_move * 100).checked_div(fired).unwrap_or(0);
+    println!("{fired} rounds fired, {on_the_move} of them on the move ({share}%)");
+    // A sample floor, for the same reason `bots_do_not_shoot_their_own_side` has
+    // one: "none of them were moving" is trivially true of a match nobody fired
+    // a shot in, and that is a failure this would otherwise report as a pass.
+    assert!(fired >= 40, "only {fired} rounds fired; too few to conclude anything");
+    assert!(
+        share <= 25,
+        "{on_the_move} of {fired} rounds ({share}%) were fired on the move — \
+         walking spray has become the rule rather than the taxed exception, \
+         which is the run-and-gun regression the cone exists to stop"
+    );
 }

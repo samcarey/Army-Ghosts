@@ -55,7 +55,7 @@
 use bevy::prelude::*;
 
 use crate::{
-    isqrt, spawn_post, visible_fraction, Health, Intent, Occluder, Player,
+    isqrt, spawn_post, visible_fraction, Aim, Health, Intent, Occluder, Player,
     PlayerInput, Pos, Scenario, Stance, Team, BTN_FIRE, BULLET_R, FP, MAX_PLAYERS,
     PLAYER_R, STANCE_CROUCH, STANCE_PRONE, STANCE_STAND, TEAM_SIZE,
 };
@@ -105,8 +105,56 @@ const PUSH_STANDOFF: i32 = 72;
 /// sometimes doesn't.
 const FRIENDLY_CLEARANCE: i32 = 12;
 
-/// Where a bot heads when nothing has been seen yet, world units: **the middle
-/// of the enemy's muster line**.
+/// The middle of one side's muster line. The posts are symmetric about `y = 0`,
+/// so it is the average of the two ends whatever [`TEAM_SIZE`] is.
+fn muster_middle(line: u8) -> Pos {
+    let (x, top) = spawn_post(line, TEAM_SIZE - 1);
+    let (_, bottom) = spawn_post(line, 0);
+    Pos::from_units(x, (top + bottom) / 2)
+}
+
+/// How long a bot will push against something it is not getting past before it
+/// tries going round, in ticks. A third of a second — long enough that brushing
+/// a rock in passing is not "stuck", short enough that nobody watches it happen.
+///
+/// **Bots have no pathfinding**, deliberately: they steer straight at whatever
+/// they want and let `push_out_of_cover` deflect them, which works because that
+/// cancels only the INTO-the-rock part of a step, so an angled approach slides
+/// around. A DEAD-ON approach cancels entirely, and then the bot walks into the
+/// same boulder for the rest of the round. Measured: a bot marching at an enemy
+/// it had lost track of ground against a rock 23 units short of it for **68
+/// seconds**, never arriving and — because `Act::Hunt` does not shoot — never
+/// firing either. That is the fifth distinct cause
+/// `a_match_never_stops_moving_around_an_idle_player` has caught, and the first
+/// that is about geometry rather than about deciding.
+const STUCK_TICKS: u16 = 20;
+
+/// How far a bot must get from where it stood [`STUCK_TICKS`] ticks ago to
+/// count as making progress, world units.
+///
+/// **A tick-to-tick comparison does not work**, and the reason is worth having
+/// written down: a bot leaning on a boulder is shoved back out to the rock's
+/// surface every tick by `push_out_of_cover`, and lands on a slightly different
+/// SUBUNIT each time. Exact "did my position change" is therefore true every
+/// tick while the bot goes nowhere at all, and the counter never climbs — which
+/// is exactly what the first version of this did, silently. A crouched bot
+/// genuinely walking covers about 22 units in this window; a jammed one covers
+/// a fraction of one.
+const STUCK_REACH: i32 = 6;
+
+/// How long a bot will hold a spot it has seen nothing from before trying
+/// somewhere else, in ticks. Four seconds.
+///
+/// This is the whole of the search behaviour and it is deliberately a long time:
+/// holding still in cover and watching an approach IS the careful game, and a bot
+/// that moved on the moment it lost contact would never be lying in wait for
+/// anybody. What it must not be is permanent.
+const SEARCH_PATIENCE: u16 = 4 * crate::TICK_HZ as u16;
+
+/// Where a bot with nobody in sight is walking, and which end of its patrol it
+/// is on.
+///
+/// # Which point, and why it is the middle of the enemy's line
 ///
 /// Something like this became necessary the moment the sides started at opposite
 /// ends of the field. Under the old scattered spawns every bot could see someone
@@ -141,13 +189,47 @@ const FRIENDLY_CLEARANCE: i32 = 12;
 /// fighting happens, and arriving late and bunched beats arriving early and
 /// apart. The concern is real enough to have its own mitigation:
 /// [`blocked_by_a_friend`] is what stops a column shooting through itself.
-fn objective(team: Team) -> Pos {
-    let line = team.other().0;
-    // The posts are symmetric about y = 0, so the middle of the line is the
-    // average of its two ends whatever `TEAM_SIZE` is.
-    let (x, top) = spawn_post(line, TEAM_SIZE - 1);
-    let (_, bottom) = spawn_post(line, 0);
-    Pos::from_units(x, (top + bottom) / 2)
+///
+/// **A bot that arrived and found nothing used to sit down for the rest of the
+/// round**, and that is the "then nothing happens" failure in its purest form.
+/// [`ARRIVED`] fades `Act::Hunt` out over the last stretch of the walk so a bot
+/// does not grind into the far wall — which is right, and which leaves
+/// `Act::Settle` the only thing scoring. A bot that settles on empty ground then
+/// never gets up again, because nothing it can see will ever change.
+///
+/// Caught by `a_match_never_stops_moving_around_an_idle_player` once the accuracy
+/// model made rounds survivable enough to reach that state. The recorded case is
+/// worth keeping: two bots stopped a hundred-odd units short of the enemy's line,
+/// sat down, and spent the remaining **36 seconds** of the round there — while
+/// the last live enemy lay prone and hidden in the middle of the map they had
+/// just walked across. Neither side was hiding from the other; both had simply
+/// run out of anywhere to be.
+///
+/// So the objective is a PATROL — their end, then yours, then theirs — and the
+/// leg changes when the bot has **watched one spot for [`SEARCH_PATIENCE`] and
+/// nothing came**. Two things about that trigger are load-bearing:
+///
+/// * **It is patience, not arrival.** Tying the flip to a distance means two
+///   thresholds that have to agree about what "arrived" means, and they don't:
+///   the bot stops advancing wherever `Act::Hunt` falls under `Act::Settle`,
+///   which moves with its health, so any fixed radius leaves a band where it is
+///   too close to walk and too far to have got there. Measured with the flip at
+///   `ARRIVED`: the bot stopped 170 units short of a line it never reached, and
+///   sat exactly as long as before.
+/// * **Contact resets it**, so a bot in a firefight is never on a schedule, and
+///   one lying in ambush stays there as long as it has anything to watch.
+///
+/// Sweeping is also what finds someone prone in deep grass: concealment falls off
+/// with range, so a searcher that keeps moving eventually gets close enough to
+/// see, and one that sits still never will.
+fn patrol(bot: &mut Bot, team: Team) -> Pos {
+    if bot.patience >= SEARCH_PATIENCE {
+        bot.patience = 0;
+        bot.homing = !bot.homing;
+    } else {
+        bot.patience += 1;
+    }
+    muster_middle(if bot.homing { team.0 } else { team.other().0 })
 }
 
 /// How close counts as arriving at the objective, world units.
@@ -171,6 +253,9 @@ fn objective(team: Team) -> Pos {
 /// roughly where the two advances meet. The constant itself is a few body widths
 /// because that is the unit "have I arrived" is naturally measured in; the
 /// multiplier is what the harness picked.
+///
+/// **Stopping short is correct and used to be permanent**, which is what
+/// [`SEARCH_PATIENCE`] is for — see [`patrol`].
 const ARRIVED: i32 = 80;
 
 /// How much a bot wants to walk to its objective when it has seen nobody.
@@ -276,6 +361,20 @@ pub struct BotProfile {
     pub aggression: i32,
     /// `0..=FP`. Weights using concealment and breaking contact when hurt.
     pub caution: i32,
+    /// `0..=FP`. How good a shot this bot insists on before it will take one —
+    /// the share of the cone the target has to fill (see [`shot_quality`]).
+    ///
+    /// **This is the dial the accuracy model added, and it is the one that
+    /// decides whether a bot plays carefully or sprays.** 0 pulls the trigger
+    /// whenever an enemy is in range, which under a cone that opens with
+    /// movement means emptying a magazine into the grass while running. `FP`
+    /// waits for a round that essentially cannot miss, which costs opportunities
+    /// and — past a point — costs the round, because a bot that never shoots
+    /// never wins one.
+    ///
+    /// It is a gate on the trigger rather than a sixth consideration, so the
+    /// "exactly three considerations" rule below is untouched.
+    pub discipline: i32,
 }
 
 /// Above this `skill`, a bot leads a moving target. Quake III's threshold for
@@ -309,8 +408,74 @@ impl Default for BotProfile {
             reaction: 15,
             aggression: FP / 2,
             caution: FP / 2,
+            discipline: FP * 55 / 100,
         }
     }
+}
+
+/// How good a shot this is: the odds a round lands within the target's own
+/// width, `0..=FP`. Capped at `FP` once the cone is the narrower of the two,
+/// which is what "this cannot really miss" means.
+///
+/// **This is the exact inverse of the draw, not an approximation of it**, and
+/// keeping it exact is why [`crate::taper`] is piecewise-linear rather than a
+/// curve. The deviation is drawn as a tapered quantile (denser in the middle,
+/// hard edge at the rim), so the share of draws inside the target is
+/// [`crate::taper_share`] of the target's half-width over the cone's — which is
+/// a closed form. Under the flat draw this was simply that ratio; the taper
+/// lifts it, most at long range where the cone is widest, which is exactly the
+/// case the middle-heavy shape exists to soften.
+///
+/// If the draw's shape ever changes, THIS MUST CHANGE WITH IT. It is what the
+/// `discipline` trigger gate and `worth_a_round`'s close-the-distance judgement
+/// are both built on, so a mismatch does not fail loudly — it quietly teaches
+/// every bot the wrong thing about its own gun.
+/// `shot_quality_matches_the_rounds_it_predicts` is the test that pins them
+/// together.
+///
+/// It is an estimate of the GUN, deliberately, and takes no account of the bot's
+/// own aim jitter or of how much of the target it can see. Those are the other
+/// two thirds of the Quake III split and they are scored elsewhere; folding them
+/// in here would make one number mean three things and the dial that reads it
+/// impossible to tune.
+pub fn shot_quality(spread: i32, range_units: i32) -> i32 {
+    // **In SUBUNITS throughout.** Going through `Aim::cone_half_width` (whole
+    // world units, for the renderer and the friendly-lane test) truncates, and
+    // when the cone is within a unit or two of the target's own size that
+    // truncation IS the answer — measured at 240 predicted against 254 actual
+    // at 60 units, an error a twentieth-wide tolerance still caught.
+    let tan = crate::SPREAD_MAX as i64 * spread.clamp(0, FP) as i64 / FP as i64;
+    let half = tan * range_units.max(0) as i64;
+    let target = PLAYER_R as i64 * FP as i64;
+    if half <= target {
+        return FP;
+    }
+    crate::taper_share(target * FP as i64 / half).clamp(0, FP as i64) as i32
+}
+
+/// What a round fired right now is worth: how likely it is to land, times
+/// whether this is a range worth spending it at.
+///
+/// **This replaced the bare `nearness` that [`Act::Fight`] and [`Act::Push`]
+/// used to weigh, and the swap is what stops the accuracy model deadlocking the
+/// match.** Range alone said "you are close enough to shoot" — which, once a
+/// round came out of a cone, stopped being the same question as "you can hit
+/// them from here". Two bots that had closed to a standoff both scored `Fight`
+/// at the top, both rooted, both fired, and with the cone wide open at that
+/// range neither ever connected. Measured before this: the whole arena stood
+/// still for **38 seconds** in `a_match_never_stops_moving_around_an_idle_player`
+/// and the match got through 4 rounds in 90 seconds instead of 7.
+///
+/// Scoring the *shot* instead closes the loop: a bot that cannot hit from where
+/// it stands scores `not(worth)` on `Push` and walks in until it can. Steadiness
+/// and distance are both ways of being unable to hit, and the fix is the same
+/// one for both — get closer, or hold still.
+///
+/// Two curves multiplied into one consideration, which is the same shape
+/// `cowardice` already has, so the three-considerations-per-behavior rule below
+/// still holds.
+fn worth_a_round(spread: i32, dist_units: i32) -> i32 {
+    shot_quality(spread, dist_units) * nearness(dist_units, ENGAGE_RANGE) / FP
 }
 
 /// Which profile each handle's bot is built with, and what salts their dice.
@@ -370,6 +535,26 @@ pub struct Bot {
     seed: u32,
     pub profile: BotProfile,
     memory: Memory,
+    /// Which leg of the patrol this bot is on — see [`patrol`]. `false` is the
+    /// outbound one, which is where a round starts.
+    homing: bool,
+    /// Ticks spent watching an empty field, reset by any contact. Both of these
+    /// are tick state and roll back with the rest of the pawn.
+    patience: u16,
+    /// The aim wander, subunits — where in its miss envelope this bot's barrel
+    /// currently points. A bounded random walk; see the note in [`engage`].
+    drift_x: i32,
+    drift_y: i32,
+    /// Where this bot stood when the progress check last ran, how long ago that
+    /// was, and what it concluded — see [`STUCK_TICKS`].
+    last: Pos,
+    stuck: u16,
+    blocked: bool,
+    /// Which way it steps aside when it is stuck. Fixed at construction from
+    /// the handle so it is stable (a bot that picked a new side each tick would
+    /// jitter in place) and so two bots wedged against each other peel off in
+    /// opposite directions rather than shadowing one another.
+    veer: i8,
 }
 
 impl Default for Bot {
@@ -401,7 +586,19 @@ impl Bot {
         seed ^= seed >> 15;
         seed = seed.wrapping_mul(0xC2B2_AE35);
         seed ^= seed >> 13;
-        Self { seed: seed | 1, profile, memory: Memory::default() }
+        Self {
+            seed: seed | 1,
+            profile,
+            memory: Memory::default(),
+            homing: false,
+            patience: 0,
+            drift_x: 0,
+            drift_y: 0,
+            last: Pos { x: 0, y: 0 },
+            stuck: 0,
+            blocked: false,
+            veer: if handle.is_multiple_of(2) { 1 } else { -1 },
+        }
     }
 
     /// The same LCG the layout code uses, advanced once per call. Deterministic
@@ -490,10 +687,10 @@ enum Act {
 /// Both read `Pos`, which is fine, and neither writes what the other reads.
 pub fn bot_think(
     scenario: Res<Scenario>,
-    pawns: Query<(&Player, &Team, &Pos, &Stance, &Health)>,
+    pawns: Query<(&Player, &Team, &Pos, &Stance, &Health, &Aim)>,
     rocks: Query<(&crate::Rock, &Pos)>,
     bushes: Query<(&crate::Bush, &Pos)>,
-    mut bots: Query<(&Player, &Team, &Pos, &Stance, &Health, &mut Bot, &mut Intent)>,
+    mut bots: Query<Thinker>,
 ) {
     // Built once and shared: a pairwise sweep asks this many times over.
     // Order-independent — every use is an `any()` — so no sort is needed.
@@ -507,17 +704,18 @@ pub fn bot_think(
     // not a determinism guarantee.
     let mut others: Vec<Contact> = pawns
         .iter()
-        .map(|(player, team, pos, stance, health)| Contact {
+        .map(|(player, team, pos, stance, health, aim)| Contact {
             handle: player.handle,
             team: *team,
             pos: *pos,
             stance: stance.level,
+            stir: aim.stir,
             alive: health.alive(),
         })
         .collect();
     others.sort_unstable_by_key(|c| c.handle);
 
-    for (player, team, pos, stance, health, mut bot, mut intent) in &mut bots {
+    for (player, team, pos, stance, health, aim, mut bot, mut intent) in &mut bots {
         // The dead do nothing. Still push an empty sighting so the memory keeps
         // advancing in step with the tick count — otherwise "12 ticks ago"
         // would mean something different after every round.
@@ -543,9 +741,73 @@ pub fn bot_think(
             .filter(|c| c.alive && c.team == *team && c.handle != player.handle)
             .map(|c| c.pos)
             .collect();
-        *intent = decide(&mut bot, *pos, *team, stance.level, health, &friends);
+        // Last tick's cone — `settle_aim` runs later in this one. That is the
+        // right answer as well as the only available one: a shooter decides on
+        // how steady it FEELS, which is how steady it was a moment ago.
+        //
+        // "Hidden" is the bot's own honest estimate of itself: buried where it
+        // stands, and not lit up by its own recent movement or muzzle flash.
+        // Both are things it genuinely knows — its grass and its own `stir` —
+        // so no peer can disagree.
+        // **Stuck detection reads LAST tick's intent**, which is still sitting
+        // in the component at this point — `decide` overwrites it below. So the
+        // question is exactly "did I ask to walk, and did I get anywhere?",
+        // with no extra bookkeeping.
+        //
+        // It asks `step_speed`, NOT whether the move vector is non-zero, and
+        // the difference is the whole thing: **the move vector doubles as the
+        // AIM direction**, so a bot standing still and aiming (`engage` sets
+        // both the vector and `BTN_ADS`, which roots the pawn) has a non-zero
+        // vector and by definition never moves. Counting that as stuck made
+        // every aiming bot "stuck" within a third of a second and then rotated
+        // its aim a quarter turn — two bots at point-blank range firing at
+        // right angles to each other, forever. `step_speed` is the one place
+        // that knows rooted from walking.
+        let tried_to_walk = crate::step_speed(&intent.0, stance) > 0;
+        if !tried_to_walk {
+            bot.stuck = 0;
+            bot.blocked = false;
+            bot.last = *pos;
+        } else {
+            bot.stuck = bot.stuck.saturating_add(1);
+            if bot.stuck >= STUCK_TICKS {
+                let no_progress = units(dist(*pos, bot.last)) < STUCK_REACH;
+                // **Still stuck after stepping aside means that side was the
+                // wrong one — so try the other.** A fixed side is a coin flip
+                // against the geometry and loses half the time: measured, a bot
+                // marching due north into a boulder veered due east into the
+                // arena wall and stayed there. Alternating guarantees escape
+                // within two windows, and the flip is deterministic state so
+                // every peer picks the same way out.
+                if no_progress && bot.blocked {
+                    bot.veer = -bot.veer;
+                }
+                bot.blocked = no_progress;
+                bot.stuck = 0;
+                bot.last = *pos;
+            }
+        }
+
+        let gun = Gun {
+            spread: aim.spread(),
+            poised: Aim::settled(&Stance { level: stance.level, change: 0 }, 0, true),
+            hidden: is_concealed(&scenario, *pos, stance.level) && aim.stir < FP / 4,
+        };
+        *intent = decide(&mut bot, *pos, *team, stance.level, health, gun, &friends);
     }
 }
+
+/// A pawn the brain drives, and everything it decides from.
+type Thinker = (
+    &'static Player,
+    &'static Team,
+    &'static Pos,
+    &'static Stance,
+    &'static Health,
+    &'static Aim,
+    &'static mut Bot,
+    &'static mut Intent,
+);
 
 /// One pawn as the brain sees it. A struct rather than a tuple because it grew a
 /// `team` and "which of these five fields was the bool again" is exactly the
@@ -556,6 +818,11 @@ struct Contact {
     team: Team,
     pos: Pos,
     stance: u8,
+    /// The pawn's [`Aim::stir`] — how much it has been moving. Movement costs
+    /// grass concealment, so a runner enters the memory buffer from much
+    /// further away than a creeper: bots hunt movement without a line of code
+    /// that says so.
+    stir: i32,
     alive: bool,
 }
 
@@ -583,8 +850,15 @@ fn look(
         if other.handle == me || !other.alive || other.team == my_team {
             continue;
         }
-        let exposure =
-            visible_fraction(scenario, pos, stance, other.pos, other.stance, occluders);
+        let exposure = visible_fraction(
+            scenario,
+            pos,
+            stance,
+            other.pos,
+            other.stance,
+            other.stir,
+            occluders,
+        );
         if exposure == 0 {
             continue;
         }
@@ -606,12 +880,30 @@ fn look(
 }
 
 /// Score the courses of action and carry out the winner.
+/// The state of this bot's gun and its cover, bundled: the three facts the
+/// trigger decision needs travel together or not at all.
+#[derive(Copy, Clone)]
+struct Gun {
+    /// The live cone, [`crate::Aim::spread`] — last tick's, which is the right
+    /// answer as well as the only available one.
+    spread: i32,
+    /// The cone a settled, braced, honed hold would have from this stance —
+    /// **the shot the bot could take if it planted its feet**, which is what
+    /// the SCORING reads (see the note in [`decide`]); only the trigger reads
+    /// the live one.
+    poised: i32,
+    /// Whether this bot still has concealment to lose — see the gate in
+    /// [`engage`].
+    hidden: bool,
+}
+
 fn decide(
     bot: &mut Bot,
     pos: Pos,
     team: Team,
     stance: u8,
     health: &Health,
+    gun: Gun,
     friends: &[Pos],
 ) -> Intent {
     let profile = bot.profile;
@@ -621,11 +913,23 @@ fn decide(
     let contact = bot.memory.attended(profile.reaction);
     let stale = bot.memory.last_contact();
 
-    // Facts the scoring reads. All `0..=FP`.
-    let (visible, near, target) = match contact {
+    // Facts the scoring reads. All `0..=FP`. Note `worth` is scored on the
+    // POISED cone, not the live one, and that is load-bearing: scoring the live
+    // spread reads as sound and is a feedback loop — moving widens the cone, a
+    // wide cone makes `Act::Push` score higher, and `Push` moves, so once a bot
+    // started closing it could never stop, because the reason it could not
+    // shoot was that it was walking. What that looks like from above is the
+    // whole side breaking into a charge and arriving in a heap — which is how
+    // it was found: `bots_do_not_shoot_their_own_side` went from 3 rounds in 60
+    // lined up on a teammate to 5 in 30, not because the clearance test got
+    // worse but because the bots were standing on top of each other. The
+    // settled hold makes `worth` a fact about RANGE and STANCE — the two things
+    // closing and getting down actually change — and leaves the live cone the
+    // one job it is right for: the trigger, in `engage`.
+    let (visible, worth, target) = match contact {
         Some(s) => (
             s.exposure,
-            nearness(units(dist(pos, s.pos)), ENGAGE_RANGE),
+            worth_a_round(gun.poised, units(dist(pos, s.pos))),
             Some(s),
         ),
         None => (0, 0, None),
@@ -635,12 +939,37 @@ fn decide(
     // how far away it still is — a bot that has arrived has nothing left to
     // advance toward and should be looking around instead of walking into a wall.
     let (march, ground_to_make) = match stale {
-        Some(s) => (s.pos, FP),
+        // Somebody to go and look at, and the patrol's clock stops: a bot with
+        // anything at all to watch is not searching.
+        Some(s) => {
+            bot.patience = 0;
+            (s.pos, FP)
+        }
         None => {
-            let aim = objective(team);
+            let aim = patrol(bot, team);
             (aim, not(nearness(units(dist(pos, aim)), ARRIVED * 6)))
         }
     };
+
+    // The third consideration on the walk: what walking would cost. It is `hp`
+    // only while the bot can ACTUALLY SEE somebody — advancing on a fight in
+    // progress while weak is the risk this exists to price. With nobody in
+    // sight there is no fight to walk into, and charging `hp` anyway is a stall
+    // that has now been found TWICE, at both ends of the same mistake:
+    //
+    //   * keyed on nothing at all, a lone survivor on 18 hp scored `Hunt` at
+    //     `ADVANCE × 0.18 ≈ 23` against `Settle`'s flat 32 and held still for a
+    //     measured 84 seconds with nobody in its memory;
+    //   * keyed on a STALE contact, two hurt bots 45 units apart — each with a
+    //     seconds-old memory of the other and neither able to see anything now,
+    //     both prone in grass — both settled and held still for 116 seconds.
+    //     A memory is not an enemy you are looking at.
+    //
+    // Between them these are two of the five distinct causes
+    // `a_match_never_stops_moving_around_an_idle_player` has caught. The rule
+    // that survives both: a bot avoids a fight it can see, and searches
+    // whatever its health.
+    let risk = if contact.is_some() { hp } else { FP };
     let cowardice = sharp(hurt) * profile.caution / FP;
 
     // Every behavior scores on exactly three considerations — see `score`.
@@ -648,10 +977,10 @@ fn decide(
     for (act, s) in [
         // Shoot what you can see, the more of it the better, from a range the
         // round will still hurt at.
-        (Act::Fight, score(FP, sharp(visible), near, not(cowardice))),
+        (Act::Fight, score(FP, sharp(visible), worth, not(cowardice))),
         // Closing is for when you can see them but not well enough to trade,
         // and you're in shape to take the ground.
-        (Act::Push, score(profile.aggression, visible, not(near), hp)),
+        (Act::Push, score(profile.aggression, visible, not(worth), hp)),
         // Breaking is the mirror: hurt, and someone has eyes on you.
         (Act::Break, score(profile.caution, cowardice, sharp(visible), FP)),
         // Nothing in sight, but there is always somewhere to go — the enemy
@@ -675,7 +1004,7 @@ fn decide(
         //
         // So closing on a visible enemy is aggression, and walking to an
         // objective you have seen nobody at is not — it is just playing.
-        (Act::Hunt, score(ADVANCE, not(visible), ground_to_make, hp)),
+        (Act::Hunt, score(ADVANCE, not(visible), ground_to_make, risk)),
         // The default. Deliberately weak, so it wins only when nothing else
         // scores at all — a bot that settles while being shot at is a bug.
         //
@@ -704,8 +1033,8 @@ fn decide(
         }
     }
 
-    match best.1 {
-        Act::Fight => engage(bot, pos, target, stance, friends, true),
+    let mut intent = match best.1 {
+        Act::Fight => engage(bot, pos, target, stance, gun, friends, true),
         Act::Push => {
             // Already close enough: hold and shoot rather than walk into them.
             // `engage(hold)` roots the pawn, so this is `Act::Fight` in all but
@@ -713,7 +1042,7 @@ fn decide(
             let inside = target
                 .map(|t| units(dist(pos, t.pos)) <= PUSH_STANDOFF)
                 .unwrap_or(true);
-            let mut intent = engage(bot, pos, target, stance, friends, inside);
+            let mut intent = engage(bot, pos, target, stance, gun, friends, inside);
             if let (false, Some(t)) = (inside, target) {
                 let (dx, dy) = toward(pos, t.pos);
                 intent.0.move_x = dx;
@@ -751,7 +1080,32 @@ fn decide(
             intent.0.set_stance(want);
             intent
         }
+    };
+
+    // **Going round whatever it has been walking into.** Applied last, over
+    // whatever the winning behaviour decided, because being stuck is a fact
+    // about the WORLD rather than about the choice: `Act::Hunt` marching at a
+    // last known position and `Act::Push` closing on a live one wedge against a
+    // boulder identically, and both want the same answer.
+    //
+    // A quarter turn rather than a reversal, and to a fixed side ([`Bot::veer`]):
+    // `push_out_of_cover` cancels only the into-the-rock part of a step, so a
+    // step ALONG the obstacle survives in full and the bot slides round instead
+    // of bouncing off and coming straight back. Reversing would do exactly that
+    // bouncing, and picking a fresh side each tick would jitter on the spot.
+    // Never while aiming, for the reason spelled out at the stuck counter: the
+    // move vector is also the aim, and a rotated aim is a bot shooting at
+    // nothing. `bot.stuck` cannot climb while rooted anyway; this is the belt
+    // to that braces.
+    if bot.blocked && !intent.0.ads() {
+        let (mx, my) = (intent.0.move_x as i32, intent.0.move_y as i32);
+        if mx != 0 || my != 0 {
+            let side = bot.veer as i32;
+            intent.0.move_x = (-my * side).clamp(-127, 127) as i8;
+            intent.0.move_y = (mx * side).clamp(-127, 127) as i8;
+        }
     }
+    intent
 }
 
 /// Face a target and (optionally) fire, with Quake III's aim model: the shot
@@ -762,6 +1116,7 @@ fn engage(
     pos: Pos,
     target: Option<Sighting>,
     stance: u8,
+    gun: Gun,
     friends: &[Pos],
     hold: bool,
 ) -> Intent {
@@ -792,11 +1147,29 @@ fn engage(
     // Q3's `bestorigin[i] += 20 * crandom() * (1 - aim_accuracy)`, in subunits
     // and scaled by range so the jitter is an ANGLE rather than a fixed offset
     // — otherwise perfect accuracy at 300 units would be easier than at 30.
+    //
+    // **A bounded random WALK, not a fresh draw every tick — because the
+    // barrel is real now.** The offset used to be redrawn from scratch sixty
+    // times a second, which was harmless while the aim point was bookkeeping;
+    // the moment [`crate::Aim::turn`] started charging for traverse it became a
+    // barrel VIBRATING several degrees per tick, and the sim — correctly —
+    // priced it: every bot's cone sat wide open, nobody could finish a kill,
+    // and with salt 0 all three rounds of `rounds_are_fought_to_a_finish` ran
+    // the clock out. Walking the offset in small steps keeps each tick's turn
+    // inside [`crate::SWING_FREE`], so a shaky bot pays with MISSES (the offset
+    // is still nonzero most of the time) rather than with a saturated cone —
+    // and the misses now drift across the target instead of teleporting, which
+    // is also what a hand actually does. A real flick — switching targets —
+    // still swings the whole facing and still costs; that is the mechanic, not
+    // a bug in it.
     let miss = not(bot.profile.accuracy);
     if miss > 0 {
         let span = (units(dist(pos, aim)).max(1) * miss / FP / 3) * FP;
-        aim.x += bot.jitter(span);
-        aim.y += bot.jitter(span);
+        let step = (span / 6).max(1);
+        bot.drift_x = (bot.drift_x + bot.jitter(step)).clamp(-span, span);
+        bot.drift_y = (bot.drift_y + bot.jitter(step)).clamp(-span, span);
+        aim.x += bot.drift_x;
+        aim.y += bot.drift_y;
     }
 
     let (dx, dy) = toward(pos, aim);
@@ -807,8 +1180,52 @@ fn engage(
         // anywhere. Same bit a player's sights button sets.
         intent.0.buttons |= crate::BTN_ADS;
     }
-    // Face them regardless, but only shoot if the lane is your own.
-    if units(dist(pos, t.pos)) <= ENGAGE_RANGE && !blocked_by_a_friend(pos, aim, friends) {
+    // Face them regardless. Three separate things have to be true before the
+    // trigger goes, and they fail for different reasons:
+    //
+    //  * in range at all, or the round is wasted on the damage floor;
+    //  * steady enough to be worth a round — `discipline`, and this is the
+    //    clause that makes a bot stop and settle instead of firing on the move;
+    //  * nobody of its own in the lane.
+    //
+    // Note the bot goes on HOLDING (the sights bit above is set whatever this
+    // decides), so a bot that finds itself too unsteady stands still and gets
+    // steady rather than doing nothing. That is the whole behaviour change: it
+    // waits out its own sway and then fires, which from outside reads as taking
+    // aim.
+    let range = units(dist(pos, t.pos));
+    // **The discipline gate is AMBUSH PATIENCE, and nothing else.** It took
+    // three designs to land here, and the two failures say why this is the
+    // shape:
+    //
+    //   1. A gate on absolute quality only ever passed point-blank (proximity
+    //      saturates quality whatever the cone does) and held fire FOREVER at
+    //      long range. `discipline=0.0` beat it in 23 of 25 decisive pairs.
+    //   2. A gate on quality relative to the best-from-here honed shot fixed
+    //      both ends and still lost by +247 elo, and the loss is a theorem,
+    //      not a tuning miss: firing costs no ammunition, so once you are in a
+    //      fight every withheld positive-expectation shot is a pure loss.
+    //      There is NO trigger policy for a visible bot that beats "fire
+    //      whenever anything might land", and pretending otherwise just
+    //      donates rounds to whoever isn't.
+    //
+    // What firing DOES cost is concealment ([`Aim::flash`]), and that cost
+    // only exists while you have concealment to lose. So the gate runs
+    // exactly while the bot is still hidden — buried in its own grass and not
+    // lit up by its own recent movement or muzzle — and asks whether this
+    // shot is honed enough to be worth breaking cover for, with `discipline`
+    // setting the bar as a share of the best shot available from here
+    // (`poised`). One round later the flash has spent the concealment, the
+    // gate is moot by its own logic, and the bot fires at will like everyone
+    // else — which is why the first shot out of an ambush is the aimed one
+    // and the burst that follows is not.
+    let live = shot_quality(gun.spread, range) as i64;
+    let best = shot_quality(gun.poised, range) as i64;
+    let worth_breaking_cover = live * FP as i64 >= bot.profile.discipline as i64 * best;
+    if range <= ENGAGE_RANGE
+        && (worth_breaking_cover || !gun.hidden)
+        && !blocked_by_a_friend(pos, aim, gun.spread, friends)
+    {
         intent.0.buttons |= BTN_FIRE;
     }
     intent
@@ -836,8 +1253,7 @@ fn engage(
 /// * nearer than the MUZZLE and you are not in front of the barrel at all — the
 ///   round is born `PLAYER_R + BULLET_R + 2` units out and is already past you;
 /// * beyond the aim point and you are behind the target, which is not danger.
-fn blocked_by_a_friend(pos: Pos, aim: Pos, friends: &[Pos]) -> bool {
-    let reach = radius_fp(PLAYER_R + BULLET_R + FRIENDLY_CLEARANCE);
+fn blocked_by_a_friend(pos: Pos, aim: Pos, spread: i32, friends: &[Pos]) -> bool {
     let muzzle = radius_fp(PLAYER_R + BULLET_R + 2);
     let (dx, dy) = ((aim.x - pos.x) as i64, (aim.y - pos.y) as i64);
     let len = isqrt(dx * dx + dy * dy);
@@ -849,6 +1265,25 @@ fn blocked_by_a_friend(pos: Pos, aim: Pos, friends: &[Pos]) -> bool {
         // How far down the shot they stand, and how far off it.
         let along = (fx * dx + fy * dy) / len;
         let across = (fx * dy - fy * dx).abs() / len;
+        // **The lane is as wide as the CONE, not as the aim line**, and it has
+        // to be measured where the teammate actually stands rather than at the
+        // target: a cone opens with range, so a friend ten units ahead is in far
+        // less danger than one at the far end of the same shot.
+        //
+        // Without this the bots started shooting their own side the day rounds
+        // stopped flying straight — `bots_do_not_shoot_their_own_side` went from
+        // clean to 5 of 30 rounds lined up on a teammate, because every one of
+        // those decisions was made against a line the round no longer took. It
+        // is the same arithmetic the fixed [`FRIENDLY_CLEARANCE`] was always
+        // doing by hand, now that there is a real number to do it with.
+        // Capped: an uncapped flare at a saturated cone reached 57 units at
+        // the far end of a long shot, so a teammate nowhere near the line
+        // blocked it — measured as four bots firing NINETEEN rounds in a
+        // minute, a squad strangling itself. The cap concedes that a wildly
+        // sprayed round MIGHT hit a friend well off the line; that risk is
+        // priced by the round being wild everywhere, not by never firing.
+        let flare = Aim::cone_half_width(spread, units(along)).min(FRIENDLY_CLEARANCE);
+        let reach = radius_fp(PLAYER_R + BULLET_R + FRIENDLY_CLEARANCE + flare);
         along > muzzle && along < len && across <= reach
     })
 }
@@ -981,37 +1416,37 @@ mod tests {
         let at = |x: i32, y: i32| vec![Pos::from_units(x, y)];
 
         assert!(
-            blocked_by_a_friend(me, target, &at(100, 0)),
+            blocked_by_a_friend(me, target, 0, &at(100, 0)),
             "a teammate squarely in the lane must block"
         );
         assert!(
-            blocked_by_a_friend(me, target, &at(100, PLAYER_R + BULLET_R)),
+            blocked_by_a_friend(me, target, 0, &at(100, PLAYER_R + BULLET_R)),
             "a teammate a body's width off the lane is still in danger"
         );
         assert!(
-            !blocked_by_a_friend(me, target, &at(100, 60)),
+            !blocked_by_a_friend(me, target, 0, &at(100, 60)),
             "a teammate well clear of the lane must not block"
         );
         // The regression, in both directions along the line.
         assert!(
-            !blocked_by_a_friend(me, target, &at(-24, 0)),
+            !blocked_by_a_friend(me, target, 0, &at(-24, 0)),
             "a teammate BEHIND the shooter blocked the shot — this is the deadlock"
         );
         assert!(
-            !blocked_by_a_friend(me, target, &at(-24, 8)),
+            !blocked_by_a_friend(me, target, 0, &at(-24, 8)),
             "a teammate behind and to one side blocked the shot"
         );
         assert!(
-            !blocked_by_a_friend(me, target, &at(260, 0)),
+            !blocked_by_a_friend(me, target, 0, &at(260, 0)),
             "a teammate beyond the target is not in the round's way"
         );
         // Right against the muzzle: the round is born 16 units out, so a friend
         // inside that is already behind it.
         assert!(
-            !blocked_by_a_friend(me, target, &at(10, 0)),
+            !blocked_by_a_friend(me, target, 0, &at(10, 0)),
             "a teammate inside the muzzle offset blocked a round born past them"
         );
-        assert!(!blocked_by_a_friend(me, target, &[]), "nobody about, nothing to block");
+        assert!(!blocked_by_a_friend(me, target, 0, &[]), "nobody about, nothing to block");
     }
 
     /// Two pawns at the minimum separation `separate_players` allows, facing
@@ -1021,8 +1456,42 @@ mod tests {
     fn touching_teammates_do_not_jam_each_other() {
         let a = Pos::from_units(0, 0);
         let b = Pos::from_units(2 * PLAYER_R, 0);
-        assert!(!blocked_by_a_friend(a, Pos::from_units(-200, 0), &[b]));
-        assert!(!blocked_by_a_friend(b, Pos::from_units(200, 0), &[a]));
+        assert!(!blocked_by_a_friend(a, Pos::from_units(-200, 0), 0, &[b]));
+        assert!(!blocked_by_a_friend(b, Pos::from_units(200, 0), 0, &[a]));
+    }
+
+    /// **An unsteady shooter needs a wider lane**, because the round is not
+    /// going where the aim line points — it is going somewhere in a cone that
+    /// opens with range. A teammate 40 units off a 200-unit shot is clear of a
+    /// steady gun and squarely inside a saturated one.
+    ///
+    /// This is the half of `bots_do_not_shoot_their_own_side` that unit-tests:
+    /// when rounds started coming out of a cone and this did not, five rounds in
+    /// thirty were lined up on somebody's own side.
+    #[test]
+    fn a_wide_cone_needs_a_wider_lane() {
+        let me = Pos::from_units(0, 0);
+        let target = Pos::from_units(200, 0);
+        // 34 units off the line: outside the steady lane (26), inside the
+        // saturated one (26 + the flare, capped at FRIENDLY_CLEARANCE = 38).
+        let beside = vec![Pos::from_units(100, 34)];
+        assert!(
+            !blocked_by_a_friend(me, target, 0, &beside),
+            "a steady gun's round goes where it is pointed; 34 units is clear"
+        );
+        assert!(
+            blocked_by_a_friend(me, target, FP, &beside),
+            "a saturated cone at 100 units down the line must widen the lane \
+             over a teammate 34 units off it"
+        );
+        // And the widening is by RANGE (up to its cap), not a flat bonus: the
+        // same teammate the same distance off the line, but close enough that
+        // the cone has not opened yet, is still not in danger.
+        let close = vec![Pos::from_units(25, 34)];
+        assert!(
+            !blocked_by_a_friend(me, Pos::from_units(400, 0), FP, &close),
+            "the cone is under 6 units wide at 25; a teammate 34 off is safe"
+        );
     }
 
     /// The same handle always starts from the same seed — a bot is deterministic

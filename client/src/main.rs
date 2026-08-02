@@ -16,6 +16,7 @@ mod spectate;
 mod stance;
 mod touch;
 mod vision;
+mod wind;
 
 pub use net::LaunchConfig;
 
@@ -165,6 +166,9 @@ fn main() {
             (hud::copy_link_pressed, hud::tick_copied_flash).chain(),
             menu::menu_interactions,
             menu::update_dial_labels,
+            // The clock the grass leans by. Unordered on purpose: it is one
+            // float in a uniform and nothing else this frame reads it.
+            wind::drive_grass,
             (touch::read_touches, touch::update_overlay, touch::update_trigger_bar).chain(),
             // advance_ads owns the aim transition; the aim line and the camera
             // shift both read it, so they follow it in the same frame.
@@ -185,7 +189,11 @@ fn main() {
                 // Owns the pawns' rgb; `fade_hidden` below owns their alpha.
                 render::update_health_visuals,
                 render::bullet_trails,
-                render::sync_transforms,
+                // The sway rides on top of the position the sim just laid
+                // down, so it has to follow it — and being a fresh write every
+                // frame is what makes a lean that cannot accumulate. Nested
+                // rather than listed: this tuple is already at bevy's 20.
+                (render::sync_transforms, wind::sway_bushes).chain(),
                 grass::update_grass_shade,
                 ads::update_aim_line,
                 vision::update_fog,

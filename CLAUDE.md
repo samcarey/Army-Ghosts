@@ -1357,6 +1357,129 @@ nothing.
   The predecessor was a "curtain": a band of blades parented to each pawn and
   scaled by `grass_cover`. Do not go back to it. Grass that moves with you reads
   as grass you are *wearing*, and it covered heads while boots stuck out.
+- **Wind** (`client/src/wind.rs` + the vertex half of `client/assets/grass.wgsl`)
+  — the grass and the bushes stir on their own, unevenly, and **it is
+  camouflage rather than weather.** A perfectly still field hands the human eye
+  its best trick for free: motion against a static background. A prone soldier
+  crawling a pixel a tick is then the ONLY thing changing on screen and reads
+  instantly however deep the grass he is in — the concealment model says he
+  cannot be seen and the renderer gives him away anyway. Foliage that moves puts
+  that crawl back among a thousand other small movements, which is what long
+  grass actually does.
+  * **The first version was WATER, and the mistake is the obvious
+    implementation.** It leaned everything along a travelling SINE: a crest
+    sweeps the field, blades bend, the trough arrives, blades bend back.
+    Reported from play as *"waves of water oscillating back and forth"* — which
+    is exactly what a symmetric wave is, since it spends half of every cycle
+    leaning blades INTO the wind. Air does not do that. **Wind blows one way
+    and varies in how hard**, and a blade it lets go of returns to upright
+    rather than swinging past it. So the field is now a single **downwind lean
+    between 0 and 1**, never negative, and everything interesting is in how
+    that number varies. `nothing_ever_leans_into_the_wind` is the whole
+    correction in one assertion.
+  Three requirements, from the deception rather than from meteorology, each
+  with a test:
+  * **Fine in SPACE.** Neighbours must catch different amounts of the same
+    gust, or the field is one big object and a soldier out of step with it is
+    *more* conspicuous, not less. `FINE_CELL` is 52 units — a few clump-widths
+    — and measured, 45 units apart differs seven times as much as 6 units
+    apart, which is the half that stops "fine" being satisfied by white noise.
+  * **Slow in TIME.** Peak rate of change is ~1.0 of lean per second: a deep
+    clump's tip crossing its own eighteen pixels in a second, a stir rather
+    than a flick. This is also what makes it WORK — motion at the speed of a crawl is
+    motion a crawl hides in, and a fast flutter would read as a different kind
+    of movement and mask nothing.
+  * **The time variation must be independent of the spatial pattern.** Pure
+    advection fails this: a frozen field carried downwind means when the gust
+    over you dies is readable off what is upwind, and cover you can time is not
+    cover. Hence `noise3` — value noise in three dimensions, two 2D slices
+    eased between — so a gust can fade where it stands and another get up out
+    of nothing. `a_lull_is_not_just_a_gust_that_moved_on` pins it: advect the
+    field by exactly one drift and a purely-carried one would be unchanged to
+    the last bit.
+  Things that are load-bearing:
+  * **The sim never hears about it**, and this one has to be said out loud
+    because it looks like a mechanic. Concealment, `visible_fraction`, the fog
+    tiles and every bot decision are computed off `Scenario::depth` exactly as
+    before; a bush's sprite leans a few px off the concealment circle the sim
+    put it on. **The masking is done to the player's EYE and to nothing else.**
+    A wind that changed what could be seen would have to be sim state —
+    integers, rollback registration, a checksum — for a decoration.
+  * **The field is written TWICE and that is forced.** The tufts are baked
+    static meshes (the whole reason they are a mesh and not 22,750 sprites), so
+    the only place they can lean is the vertex shader; bushes are sprites the
+    CPU moves. Same split as `sound.rs`'s `bell` and `sound.wgsl`'s, for the
+    same reason. What is NOT left to a careful reader is the numbers:
+    `the_shader_runs_the_same_wind` reads `grass.wgsl` and holds all fifteen
+    shared constants against their Rust twins. They have to agree — a bush
+    leaning east while the grass at its feet leans west reads as a bug, not as
+    wind. **The bearing is deliberately NOT among them**: `wind::bearing` is a
+    function of the clock alone, so the CPU works it out once a frame and hands
+    it over in `params.w`, and `VEER_SWING` exists in one file.
+  * **A clump BENDS, it does not slide.** How far each vertex takes the wind is
+    baked into `ATTRIBUTE_UV_1` at build time: the clump's tip moves
+    `TUFT_SWAY_FRAC` of its own drawn height (3.4-18.2 px across the field), its
+    root moves nothing. A *fraction* rather than a pixel count because short and
+    deep grass are the same plant. The same attribute carries a per-clump
+    `TUFT_GRAIN` — a small offset into the fine term, so a stand dapples instead
+    of tilting as a slab — and the whole thing costs two floats in a uniform per
+    frame, because everything else is a pure function of world position.
+    **The amplitude has a ceiling not far above where it sits**, and both
+    halves of it are now guarded: a tuft sprite is a rigid quad whose top edge
+    alone moves, so a tip travelling much past half the clump's own height
+    stops reading as a bend and starts reading as the clump being dragged
+    along the ground. `TUFT_SWAY_FRAC` carries a `const` block that fails the
+    build past 0.5, and the mesh test bounds the px it produces.
+  * **Bushes get a whole-sprite lean, not a pivot.** Their root sits INSIDE the
+    canopy circle (`gen_assets.py`: the ground line is 0.22 of a frame below
+    centre), so rotating about it moves the visible bulk by under a pixel.
+    This is not the "curtain" mistake above — the bush is the thing moving, and
+    nothing is parented to a pawn. Because the sprite is proportional to the
+    canopy, `BUSH_SWAY_PX` states exactly one thing: **a bush leans by half its
+    own canopy radius at a full gust**, whatever size it is. That is the most
+    that can be spent — the sim's concealment circle does not move, so a bush
+    at full lean is that far out of register with the cover it gives, and a
+    sprite cannot shear, so the whole canopy travels rather than its top.
+  * **The measuring rig gets a dead calm.** `Scenario::GrassStrip` freezes the
+    clock at 0 and `sway_bushes` returns early: `tools/grass-shots.sh` captions
+    each frame with the alpha `grass-table.sh` measured for that pairing, and a
+    rig whose blades sit somewhere different in every screenshot is one whose
+    pictures cannot be compared with the last set.
+  * **`LATTICE` is not decoration — it is what lets the wind run for hours.**
+    The fine term's sample point travels downwind forever and the hash
+    multiplies coordinates by ~123 before taking a fractional part, so at an
+    hour's drift the product wants 19 of the 24 mantissa bits and the noise
+    quietly collapses onto a few dozen values. Wrapping the lattice makes the
+    field periodic, so the sample point folds back into a bounded box with no
+    seam (`the_field_repeats_without_a_seam`); 256 cells is 13,300 px of fine
+    detail, far larger than the arena, so the repeat is never in shot.
+  * **`GUST_LO`/`GUST_HI` is the knob for HOW OFTEN it blows, and it has been
+    wrong in both directions.** Value noise is bunched around its middle (over
+    the arena: p25 0.335, median 0.451, p75 0.576), so a window that looks
+    reasonable sits off where the numbers are. The sine-era window left the
+    wind never reaching full strength anywhere; the first one-signed window
+    left **91% of the ground at the floor**; sitting it on the quartiles was
+    tidy and still left the map 47% calm with a patch of grass leaning only 40%
+    of the time — reported from play as the grass needing to blow more, and
+    more often. Near p05..p50 gives 14% calm, 76% of the time leaning, and
+    **nearly twice the total motion** (mean travel over 100 s: 10.0 → 18.7).
+  * **Activity bought at `FINE_SHARE` is not the same as activity bought at the
+    window**, and this is the trap in "make it blow more". Flattening the fine
+    term raises the average lean while cutting how far anything travels — more
+    grass bent over, less grass moving — and the same goes for raising
+    `GUST_FLOOR`, which adds an offset rather than movement. Measured across
+    ten combinations: lowering the window while keeping `FINE_SHARE` high beats
+    every alternative that reached the same activity by other means. Print the
+    quantiles before moving any of them; the tests state what the field has to
+    DO and will not tell you which knob to turn.
+  * **A lull is something that HAPPENS, not something present everywhere at
+    once.** `the_wind_is_not_the_same_everywhere_at_once` first demanded calm
+    ground in every photograph of the arena, which is stronger than the design
+    ever wanted and quietly caps how hard the wind may blow at its peak — it
+    failed on a tuning that was right. It now asserts over TIME: the calm share
+    has to reach above 20% sometimes and below 10% at others (measured 1%..38%),
+    because a field that is always half calm is as predictable as one that
+    never is.
 - **Line of sight** (`client/src/vision.rs` + `client/assets/fog.wgsl`):
   render-only — the sim never computes visibility (it can't; every peer
   simulates every pawn). Split in two halves, and keeping them apart is what
@@ -1739,6 +1862,21 @@ nothing.
   unconditionally — see `FogMaterial`. Also: `LinearRgba::rgb(v)` is NOT
   `Color::srgb(v)`; feeding sRGB numbers to a shader as linear gives a washed
   out, far paler color (`.to_linear()` on the way in).
+- **A WGSL mistake is only ever reported by a RUNNING FRAME, so a shader change
+  is not verified until a browser has drawn with it.** A shader is compiled the
+  first time something draws with its pipeline: `cargo build` never looks at it,
+  no test can (there is no GPU in the test binary), and a native run started
+  from a windowless shell never reaches `Startup` at all, so it cannot either.
+  What a broken shader looks like from outside is not an error — it is the
+  affected layer silently missing. The path that does work is
+  `tools/build-web.sh` + headless chromium, watching the CONSOLE: bevy logs
+  `pipeline_cache.rs: failed to process shader error:` with naga's message and
+  the offending line.
+  The specific one that cost a round trip: **`patch` is a reserved keyword in
+  WGSL** and naga rejects the whole file over a `let patch = ...` — which took
+  out the entire grass pipeline, ground and tufts together. `sample`, `filter`,
+  `shared`, `active` and `common` are on the same list; none of them look like
+  keywords, and the compiler you would expect to catch it isn't in the loop.
 
 ## Public dev serving (caddy vhost on this Mac)
 

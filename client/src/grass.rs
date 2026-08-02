@@ -154,8 +154,16 @@ pub struct GrassAssets {
 /// `ColorMaterial` (the same vertex-color specialization trap as `FogMaterial`).
 #[derive(Asset, TypePath, AsBindGroup, Clone)]
 pub struct GrassMaterial {
-    /// `x` is how much of a second, finer octave of the texture to cross in —
-    /// only the tiled ground wants it (see the shader).
+    /// `(octave cross, sward ripple in uv, seconds, spare)`.
+    ///
+    /// `x` is how much of a second, finer octave of the texture to cross in and
+    /// `y` how far that texture slides with the wind — only the tiled ground
+    /// wants either, because the tuft sheet's UVs point into an ATLAS and
+    /// moving them samples the neighbouring frame. `z` is the clock, written
+    /// every frame by [`crate::wind::drive_grass`], and it is the only thing
+    /// the CPU tells the wind: everything else about it is a pure function of
+    /// world position, so thousands of baked quads lean without a byte of
+    /// geometry being re-uploaded.
     #[uniform(0)]
     pub params: Vec4,
     #[texture(1)]
@@ -184,6 +192,10 @@ impl Material2d for GrassMaterial {
         descriptor.vertex.buffers = vec![layout.0.get_layout(&[
             Mesh::ATTRIBUTE_POSITION.at_shader_location(0),
             Mesh::ATTRIBUTE_UV_0.at_shader_location(2),
+            // How this vertex takes the wind: px at full gust, and the clump's
+            // phase. Both meshes must carry it — a layout is per pipeline and
+            // both share this material — so the field's is all zeroes.
+            Mesh::ATTRIBUTE_UV_1.at_shader_location(3),
             Mesh::ATTRIBUTE_COLOR.at_shader_location(4),
         ])?];
         Ok(())
@@ -297,7 +309,7 @@ pub fn setup_grass(
     commands.spawn((
         Mesh2d(meshes.add(field_mesh(*scenario))),
         MeshMaterial2d(materials.add(GrassMaterial {
-            params: Vec4::new(0.4, 0.0, 0.0, 0.0),
+            params: Vec4::new(0.4, crate::wind::SWARD_RIPPLE_PX / GRASS_TEX_PX, 0.0, 0.0),
             texture,
         })),
         Transform::from_xyz(0.0, 0.0, Z_FIELD),
@@ -305,7 +317,10 @@ pub fn setup_grass(
     // One mesh per band, all sharing a material: a mesh has a single sort key,
     // so a band is the unit of y-sorting.
     let tufts = materials.add(GrassMaterial {
-        params: Vec4::ZERO, // atlas UVs — crossing octaves would sample the neighbours
+        // Atlas UVs: neither crossing octaves nor sliding them with the wind is
+        // available here — both would sample the neighbouring frame. A clump
+        // leans by having its geometry moved instead (`ATTRIBUTE_UV_1` below).
+        params: Vec4::ZERO,
         texture: assets.load("tufts.png"),
     });
     let mut clumps = 0;
@@ -327,6 +342,11 @@ pub fn setup_grass(
 fn field_mesh(scenario: Scenario) -> Mesh {
     let (mut positions, mut uvs, mut colors, mut indices) =
         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    // The sward is a flat sheet with nothing to bend, so it takes no geometric
+    // wind at all — it ripples in its texture instead. The attribute is here
+    // because the vertex layout is shared with the tufts, not because the
+    // ground moves.
+    let mut sway: Vec<[f32; 2]> = Vec::new();
     let cols = (ARENA_HALF_W * 2 / GRASS_GRID) as u32;
     let rows = (ARENA_HALF_H * 2 / GRASS_GRID) as u32;
     for row in 0..=rows {
@@ -337,6 +357,7 @@ fn field_mesh(scenario: Scenario) -> Mesh {
             let tint = tint.to_linear();
             positions.push([x as f32, y as f32, 0.0]);
             uvs.push([x as f32 / GRASS_TEX_PX, -y as f32 / GRASS_TEX_PX]);
+            sway.push([0.0, 0.0]);
             colors.push([tint.red, tint.green, tint.blue, alpha]);
         }
     }
@@ -350,6 +371,7 @@ fn field_mesh(scenario: Scenario) -> Mesh {
     let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_1, sway);
     mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
     mesh.insert_indices(Indices::U32(indices));
     mesh
@@ -421,6 +443,7 @@ fn tuft_bands(scenario: Scenario) -> Vec<(f32, Mesh, usize)> {
         let count = clumps.len();
         let (mut positions, mut uvs, mut colors, mut indices) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut sway: Vec<[f32; 2]> = Vec::new();
         for (x, y, noise) in clumps {
             let h = scenario.depth(x, y) as f32;
             // Clumps aren't all the same size even where the grass is level —
@@ -442,15 +465,26 @@ fn tuft_bands(scenario: Scenario) -> Vec<(f32, Mesh, usize)> {
             };
             let (tint, _) = grass_look(h);
             let tint = tint.to_linear();
+            // How this clump takes the wind, baked in once: how far its TIP
+            // travels at a full gust (its root does not move, which is what
+            // makes it bend instead of slide), and its own grain — a small
+            // offset into the fine term, so a stand of grass dapples instead of
+            // moving as one piece at the finest scale. It costs nothing here,
+            // because the clump already has a hash.
+            let tip = crate::wind::TUFT_SWAY_FRAC * height;
+            let grain = ((noise / 1_048_576 % 1024) as f32 / 1024.0 - 0.5)
+                * 2.0
+                * crate::wind::TUFT_GRAIN;
             let base = positions.len() as u32;
-            for (px, py, u, v) in [
-                (x - half_w, top, u0, 0.0),
-                (x + half_w, top, u1, 0.0),
-                (x + half_w, bottom, u1, 1.0),
-                (x - half_w, bottom, u0, 1.0),
+            for (px, py, u, v, lean) in [
+                (x - half_w, top, u0, 0.0, tip),
+                (x + half_w, top, u1, 0.0, tip),
+                (x + half_w, bottom, u1, 1.0, 0.0),
+                (x - half_w, bottom, u0, 1.0, 0.0),
             ] {
                 positions.push([px, py, 0.0]);
                 uvs.push([u, v]);
+                sway.push([lean, grain]);
                 colors.push([tint.red, tint.green, tint.blue, 1.0]);
             }
             indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
@@ -458,6 +492,7 @@ fn tuft_bands(scenario: Scenario) -> Vec<(f32, Mesh, usize)> {
         let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
         mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
         mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+        mesh.insert_attribute(Mesh::ATTRIBUTE_UV_1, sway);
         mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
         mesh.insert_indices(Indices::U32(indices));
         // The band sorts as if it all stood on its MIDDLE line. Its southern
@@ -526,5 +561,77 @@ pub fn update_grass_shade(
         sprite.custom_size = Some(Vec2::new(profile.width, buried * profile.span));
         sprite.color = SHADE_COLOR.with_alpha(SHADE_ALPHA * buried);
         transform.translation.y = profile.base;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::mesh::VertexAttributeValues;
+
+    fn wind_attribute(mesh: &Mesh) -> Vec<[f32; 2]> {
+        match mesh.attribute(Mesh::ATTRIBUTE_UV_1) {
+            Some(VertexAttributeValues::Float32x2(values)) => values.clone(),
+            _ => panic!("this mesh carries no wind attribute"),
+        }
+    }
+
+    /// **A clump BENDS.** Its tip takes the wind and its root is pinned, which
+    /// is the difference between grass leaning and grass sliding across the
+    /// ground — and it is decided here, at bake time, because the tufts are a
+    /// static mesh and there is no frame in which this could be checked by
+    /// looking. Getting it the other way round (every vertex leaning equally)
+    /// would have the whole field skate downwind and back sixty times a second.
+    #[test]
+    fn a_clump_takes_the_wind_at_its_tip_and_not_at_its_root() {
+        let (mut tips, mut grains) = (Vec::new(), Vec::new());
+        for (_, mesh, count) in tuft_bands(Scenario::Arena) {
+            let sway = wind_attribute(&mesh);
+            assert_eq!(sway.len(), count * 4, "a clump is four vertices");
+            // Vertex order per clump: top-left, top-right, bottom-right,
+            // bottom-left (see the quad wound in `tuft_bands`).
+            for quad in sway.chunks(4) {
+                assert!(quad[0][0] > 0.0 && quad[1][0] > 0.0, "a clump's tip is pinned: {quad:?}");
+                assert!(quad[2][0] == 0.0 && quad[3][0] == 0.0, "a clump's root moves: {quad:?}");
+                // One grain for the whole clump. Per-vertex, it would shear as
+                // well as bend, which is a clump changing width in the wind.
+                assert!(quad.iter().all(|v| v[1] == quad[0][1]), "a clump is out of step with itself");
+                tips.push(quad[0][0]);
+                grains.push(quad[0][1]);
+            }
+        }
+        let (lo, hi) = (
+            tips.iter().cloned().fold(f32::MAX, f32::min),
+            tips.iter().cloned().fold(0.0_f32, f32::max),
+        );
+        println!("{} clumps: tips travel {lo:.1}..{hi:.1} px at a full gust", tips.len());
+        // Deep grass leans further than short grass, because the lean is a
+        // fraction of the clump's own height rather than a number of pixels.
+        assert!(hi > lo * 2.0, "every clump leans the same distance: {lo}..{hi}");
+        // The deepest clump on the map draws about 62 px tall, and a tip that
+        // travelled much past half of that would read as the clump being
+        // dragged rather than bent — `wind::TUFT_SWAY_FRAC`'s `const` block is
+        // the other half of this guard, and catches it at build time.
+        assert!(hi < 31.0, "a clump leans further than it stands: {hi}");
+
+        // …and neighbours are not in lockstep, which is what makes a patch
+        // dapple instead of tilting as one sheet.
+        let spread = grains.iter().cloned().fold(f32::MIN, f32::max)
+            - grains.iter().cloned().fold(f32::MAX, f32::min);
+        assert!(
+            spread > crate::wind::TUFT_GRAIN,
+            "the whole field moves as one: grain spread {spread}"
+        );
+    }
+
+    /// The sward is a flat sheet with nothing to bend, so it takes no geometric
+    /// wind at all — it ripples in its own texture instead. It carries the
+    /// attribute only because the vertex layout is shared with the tufts, and a
+    /// non-zero one here would be the GROUND sliding under everybody's feet.
+    #[test]
+    fn the_ground_itself_never_moves() {
+        for value in wind_attribute(&field_mesh(Scenario::Arena)) {
+            assert_eq!(value, [0.0, 0.0], "the ground took the wind");
+        }
     }
 }

@@ -1484,10 +1484,14 @@ nothing.
     means no — is reading it correctly.
     - **This REVERSED the first version**, which drew a flat plateau and
       displaced it uniformly on the argument that a peak in the middle hands back
-      the bearing the cue exists to withhold. That is true of a peak the
-      statistics do not support. Make the two agree and the display stops being a
-      bluff: the centre really is the best guess, the wedge really is the width
-      of the doubt, and the information is imprecise rather than hidden.
+      the bearing the cue exists to withhold. It still does not hand it back —
+      **the centre of any ONE arc is NOT the truth**, it is off by whatever the
+      error field says at this offset. The truth is the AXIS OF THE SWING: walk
+      at the sound and the wedge oscillates about the true bearing — average
+      equal to the truth, amplitude equal to the bell's width, dwell time in the
+      bell's own proportions (`walking_at_the_sound_swings_the_arc_around_the_
+      truth` pins all three). A static read gives the width of the doubt; the
+      bearing is earned by moving.
     - **The wedge's half-angle IS the error's whole budget** — there is no
       separate share held back (`OFFSET_SHARE` is gone), because the bell already
       vanishes at the rim. The shot is always inside the arc and the extremes of

@@ -27,15 +27,18 @@
 //! * **The opacity across the wedge is a bell** — [`bell`], a half-cosine that is
 //!   full at the centre and reaches exactly zero at both rims, so the arc has no
 //!   edge to be startled by and no direction it claims that it does not mean.
-//! * **The error is distributed as that same bell** ([`toward_the_middle`]). This
-//!   is a REVERSAL of what shipped first, and worth understanding rather than
-//!   just reading: the first version drew a flat plateau and displaced it
-//!   uniformly, on the argument that a peak in the middle would hand the player
-//!   back the bearing the cue exists to withhold. That is true of a peak the
-//!   statistics do not support. Make the two agree instead and the display stops
-//!   being a bluff: the centre really is the best guess, the wedge really is how
-//!   wide the doubt is, and nothing is being hidden — the information is simply
-//!   imprecise, which is the honest thing for a noise heard through a field.
+//! * **The error is distributed as that same bell** ([`toward_the_middle`]), so
+//!   the picture and the odds agree. But do NOT read that as "the centre of the
+//!   arc is the answer" — the centre of any ONE arc is off by whatever the error
+//!   field says at this offset, and a player who takes it at face value is off
+//!   by up to the whole half-angle. **The truth is the AXIS OF THE SWING**: walk
+//!   at the sound and the wedge oscillates about the true bearing — its average
+//!   is the truth, its amplitude is the bell's width, and it lingers near the
+//!   middle and hurries past the rims in exactly the bell's proportions
+//!   (`walking_at_the_sound_swings_the_arc_around_the_truth` pins all three).
+//!   So the bearing is EARNED BY MOVING, which is the bargain the rest of this
+//!   game makes: a static read gives you the wedge's width of doubt, an
+//!   approach gives you the axis.
 //! * **The wedge's half-angle IS the error's whole budget.** There is no separate
 //!   share of it held back, because the bell already vanishes at the rim: the
 //!   shot is always inside the arc, and the extremes of the arc are exactly the
@@ -609,6 +612,55 @@ mod tests {
             assert!(
                 (0.17..0.23).contains(&share),
                 "fifth {bin} covers {share} of the field, so the sweep is not even: {bins:?}"
+            );
+        }
+    }
+
+    /// **Walking at the sound swings the arc AROUND the truth, and the truth is
+    /// the axis of the swing** — not the centre of any one arc. Three claims,
+    /// each the user's own words: the average angle it oscillates about is the
+    /// true angle, the swing spans the wedge (proportional to the bell's
+    /// width), and how long it lingers at each offset is the bell itself (the
+    /// histogram test above owns that one).
+    #[test]
+    fn walking_at_the_sound_swings_the_arc_around_the_truth() {
+        for toward in [
+            Vec2::X,
+            Vec2::NEG_Y,
+            Vec2::new(0.6, 0.8),
+            Vec2::new(-0.8, 0.6),
+            Vec2::new(-0.47, -0.88),
+        ] {
+            // A long straight walk-in, sampled every unit. Longer than any real
+            // approach so the partial last cycle of the wave cannot bias the
+            // mean by more than a whisker — this is a property of the field,
+            // not of the map.
+            let (mut sum, mut n) = (0.0f32, 0.0f32);
+            let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+            let mut dist = 3000.0;
+            while dist > 30.0 {
+                let error = error_at(toward * dist);
+                sum += error;
+                n += 1.0;
+                lo = lo.min(error);
+                hi = hi.max(error);
+                dist -= 1.0;
+            }
+            let mean = sum / n;
+            assert!(
+                mean.abs() < 0.05,
+                "walking in along {toward} the swing is centred {mean} off the truth"
+            );
+            // The full budget is actually used: the swing genuinely spans the
+            // wedge, so its amplitude IS the bell's width and narrows with it
+            // as the arcs tighten on the way in. The bound is 0.89 rather than
+            // 1.0 only because the rims are isolated instants — the triangle's
+            // tips — and the asin warp sweeps FASTEST exactly there (least time
+            // at the least likely bearings, which is the point), so a 1-unit
+            // sample lattice straddles them. The continuous wave attains ±1.
+            assert!(
+                lo < -0.89 && hi > 0.89,
+                "the swing along {toward} only covered {lo}..{hi} of the wedge"
             );
         }
     }

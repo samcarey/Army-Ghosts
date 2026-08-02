@@ -1318,11 +1318,73 @@ nothing.
     This was the third and actual cause of a "foot under the grass" report that
     also had two real but insufficient causes (see `GRASS_BAND` below and
     `render::STANCE_ANCHOR`); if it comes back, measure the sheet's opacity by
-    row before touching the ordering again.
+    row before touching the ordering again. `gen_tufts` now PRINTS that opacity
+    per plant every time it runs, so the check is a glance rather than an
+    investigation (meadow 0.37, tussock 0.49, bent 0.35, weed 0.45 — averaged
+    over the whole frame, so read them against each other, not against 0.50).
   * **Shade** — the only thing parented to a pawn: a `shade.png` gradient over
     its lower body, reaching as far up as `grass_cover` says the grass buries
     it (`STANCE_SHADE`, measured off `soldier.png` bboxes — prone's ground line
     hangs 17px BELOW `Pos` because that sprite is anchored mid-body).
+- **Which plant grows where** (`client/src/grass.rs` `dryness`/`species`/
+  `SPECIES_MIX` + `gen_assets.py` `_GRASS_SPECIES`) — a SECOND field over the
+  arena, render-only, saying how parched the ground is: 0 lush, 1 straw. It
+  picks the tint's hue and which of four plants grows, and it exists because a
+  field of one plant at one colour reads as MOWN. Reported exactly that way —
+  "a picturesque field, all very uniform and healthy and green" — and the cost
+  is not only prettiness: if the ground has no texture of its own then the
+  soldier crossing it is the only thing on screen that has one, which is the
+  same free gift to the eye that `wind.rs` exists to take back.
+  * **Four plants, four frames each, species-major in `tufts.png`**: meadow
+    (the original, unchanged down to the byte for its four frames), tussock
+    (dense, dark, squat), bent (fine dry stems gone to seed) and a broadleaf
+    weed. What separates them is WHERE EACH PUTS ITS MASS, not how tall its
+    frame is — the engine still draws every clump at exactly
+    `sprite_height(depth)`, so a species cannot be "shorter" without lying about
+    the grass a pawn is hiding in. A tussock spends thirty-odd blades below half
+    height and sends three to the top: squat to look at, honest at the top line.
+  * **A patch is DOMINATED, never pure, and there are THREE kinds of it.** Even
+    weights everywhere would be confetti — four plants mixed evenly at every
+    scale reads as noise rather than as one place differing from the next. The
+    first mix was a straight lush→dry lerp and made only TWO kinds of place,
+    because the tussock's weight sat under the meadow's at every dryness and so
+    led nothing anywhere (measured: 11 of 12 patches meadow, 1 bent, 0 tussock).
+    Three stops fixed it for one number: tussock cushions on the best ground,
+    open meadow in the middle, bent where it has burnt off (22 / 24 / 2 of 48).
+  * **Dryness takes HUE; depth keeps VALUE.** They have to stay on separate axes
+    or the tint becomes a second, contradictory readout of the one number a
+    player needs off it — dark means deep means you can hide there. Measured:
+    drying moves luminance by 5-12% of what depth moves it, and the test states
+    it as that RATIO rather than an absolute tolerance, because the question was
+    never "is this shift small" but "could anyone mistake it for depth".
+  * **The dry look belongs to the PLANT, not to the tint.** The first version
+    put twice as much red in `DRY_SHIFT` on top of a plant that was already tan,
+    and the two multiplied into rust: the dry areas read as an autumn wood, not
+    as a field gone over. Both were pulled toward khaki (red and green close
+    together, since the per-area tint multiplies and a palette with red clearly
+    ahead of green comes out of that multiply as rust). What now says "dry" is
+    mostly the bent plant's silhouette — fine stems with seed heads, which is a
+    shape that survives being twelve pixels tall — and the tint only tips the
+    ground under it far enough to agree.
+  * **Width is per TIER, not per species**, and that one was learned. Thin stems
+    are most of what makes the dry plant read as dry, and applied to its skirt as
+    well they took its root band from 0.37 to 0.26 — buying the look by
+    reopening the boots-through-the-grass hole above. A plant that has gone over
+    has fine stems and a base of coarse dead litter; the two want opposite
+    numbers.
+  * The field is smooth where the depth field is hex-quantized, and crosses its
+    tiles at its own scale. That is the other half of "uncorrelated": colour
+    varying across a tile boundary is what stops the honeycomb reading as a
+    honeycomb.
+  * **`Scenario::GrassStrip` gets one fixed dryness** (`DRY_RIG`), for the same
+    reason it gets a dead calm: `tools/grass-shots.sh` compares this run's
+    photographs against the last set, and a rig whose ground is a different
+    colour every time is one whose pictures cannot be compared.
+  * It changes NOTHING about what can be seen. `tools/grass-table.sh` prints the
+    identical arena numbers before and after (0.875 / 0.449 / 0.266 standing,
+    0.121 for a prone viewer at 40) — concealment reads `Scenario::depth` and
+    only that. Grass that hid you by being brown would have to be sim state:
+    integers, rollback registration and a checksum, for a colour.
   **Y-SORTING is what makes the grass behave, and it is not optional.** Grass is
   baked one mesh per `GRASS_BAND` (4-unit) slice of the arena, each drawn at
   the z of its MIDDLE line, and everything standing on the ground — pawns,

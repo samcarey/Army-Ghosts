@@ -26,12 +26,14 @@ Outputs to client/assets/:
                 of short blade strokes, every stroke wrapped so the tile is
                 seamless. The ground mesh repeats it in WORLD space and tints it
                 per area from the sim's grass depth.
-  tufts.png   - 12x1 grid of 28x48 grass clumps (RGBA, COLOUR), modelled in 3D
+  tufts.png   - 16x1 grid of 28x48 grass clumps (RGBA, COLOUR), modelled in 3D
                 and projected at the same 40 degrees as everything else, ground
                 line GRASS_BASE_FRAC up from the bottom edge. Small and narrow:
                 the engine scatters thousands of them, scaled to the local
                 depth, and y-sorts them against everything standing in the
-                field.
+                field. FOUR PLANTS, four frames each, species-major: meadow,
+                tussock, bent (dry, gone to seed) and a broadleaf weed. The
+                engine picks the mix from how dry the ground is there.
   shade.png   - 64x64 white vertical gradient (RGBA), full at the bottom: the
                 shadow the grass throws up the front of whatever is standing in
                 it. Tinted dark green at draw time.
@@ -854,19 +856,55 @@ _GRASS_GREENS = [
 _GRASS_SOIL = (0.16, 0.17, 0.11)
 _GRASS_SUN = (0.70, 0.74, 0.48)
 
+# The palettes the four species draw from. Repeats are the weighting — a
+# standing blade is seen whole, unlike the strokes in the ground tile that
+# average against the soil between them, so an even draw from a six-colour
+# ramp makes every clump read as straw.
+#
+# These survive the engine's tint, which is the thing to check before moving
+# them: the per-area tint MULTIPLIES, so it drags every species toward its own
+# hue but preserves the differences BETWEEN them. A straw blade under the deep
+# green tint still comes out a third lighter and visibly yellower than a meadow
+# blade under the same tint. What the tint can do is flatten a species that
+# differed only in value, so the separation here is mostly in hue.
+_PALETTE_MEADOW = [_GRASS_GREENS[i] for i in (0, 0, 1, 1, 1, 2, 2, 3, 4, 5)]
+_PALETTE_TUSSOCK = [
+    (0.15, 0.26, 0.11), (0.15, 0.26, 0.11), (0.19, 0.31, 0.13), (0.19, 0.31, 0.13),
+    (0.24, 0.36, 0.15), (0.24, 0.36, 0.15), (0.29, 0.40, 0.18), (0.33, 0.43, 0.21),
+]
+# Khaki, NOT tan. Red and green run close together here on purpose: the per-area
+# tint multiplies, and a palette with red clearly ahead of green comes out of
+# that multiply as rust — an autumn wood rather than a dry field. Measured on
+# the arena at depth 40: (0.48, 0.36, 0.11) before, (0.41, 0.41, 0.11) now.
+_PALETTE_BENT = [
+    (0.47, 0.45, 0.24), (0.54, 0.52, 0.29), (0.54, 0.52, 0.29), (0.61, 0.58, 0.34),
+    (0.42, 0.42, 0.23), (0.36, 0.38, 0.21), (0.32, 0.35, 0.19),
+]
+_PALETTE_WEED = [
+    (0.37, 0.44, 0.16), (0.37, 0.44, 0.16), (0.45, 0.51, 0.20), (0.45, 0.51, 0.20),
+    (0.52, 0.56, 0.24), (0.30, 0.37, 0.14),
+]
+# What a seed head is painted with — always paler and drier than the stem
+# carrying it, whatever the species, because a head has dried out and gone over
+# whether or not the plant under it has.
+_GRASS_SEED = (0.60, 0.57, 0.35)
 
-def _blade(parts, base, azim, height, bend, rng):
+
+def _blade(parts, base, azim, height, bend, rng,
+           palette=_PALETTE_MEADOW, thick=1.0, head=0.0):
     """One blade of grass: a chain of tapering capsules arcing over.
 
     Straight blades read as bristles, so the lateral offset grows with the
     square of the height — the blade leaves the ground vertical and tips over
     near the top, which is what makes a patch look soft.
+
+    `head` puts a seed head on the tip of a tall blade. It is what makes the dry
+    species read as a plant that has gone over rather than as green grass with
+    the colour turned down: the silhouette changes, not just the hue, and a
+    silhouette survives being 12 px tall.
     """
     ux, uy = math.cos(azim), math.sin(azim)
-    # Weighted toward the green end. A standing blade is seen whole, unlike the
-    # strokes in the ground tile that average against the soil between them, so
-    # an even draw from the palette makes every clump read as straw.
-    colour = _GRASS_GREENS[rng.choice((0, 0, 1, 1, 1, 2, 2, 3, 4, 5))]
+    colour = rng.choice(palette)
     pale = rng.uniform(0.03, 0.14)
     segs = 3
     nodes = []
@@ -883,9 +921,19 @@ def _blade(parts, base, azim, height, bend, rng):
         lit = tuple(max(0.0, min(1.0, c * dome)) for c in _mix(colour, _GRASS_SUN, pale * t))
         parts.append((
             nodes[i], nodes[i + 1],
-            0.050 * max(0.5, height) * (1.0 - 0.72 * t),
+            0.050 * thick * max(0.5, height) * (1.0 - 0.72 * t),
             lit, 1.0,
         ))
+    # Only a blade that got somewhere carries a head; a seed head down in the
+    # skirt reads as litter.
+    if head > 0.0 and height > 0.45:
+        tip, below = nodes[-1], nodes[-2]
+        step = tuple((tip[c] - below[c]) / segs for c in range(3))
+        for i in range(3):
+            a = tuple(tip[c] + step[c] * (i - 1.6) * 0.5 for c in range(3))
+            b = tuple(tip[c] + step[c] * (i - 1.1) * 0.5 for c in range(3))
+            grade = 0.55 + 0.45 * (1.0 - abs(i - 1.0))
+            parts.append((a, b, 0.022 * head * grade * max(0.6, height), _GRASS_SEED, 1.0))
 
 
 def _render_grass_frame(parts, w, h, scale):
@@ -963,8 +1011,82 @@ def _write_grass_sheet(path, frames, w, h):
     write_png(path, w * len(frames), h, rows, color_type=6)  # RGBA
 
 
-def gen_tufts(path, w=28, h=48, variants=12):
-    """Small clumps of grass standing on the ground, one row of `variants`.
+# The four plants, in sheet order. A tier is
+# `(fewest, most, shortest, tallest, least bend, most bend, root spread, width)`
+# and the FIRST tier of every species is its skirt.
+#
+# What separates them is where each puts its mass, NOT how tall its frame is.
+# The engine draws every clump at exactly `sprite_height(depth)` whatever grows
+# in it, so a species cannot be "shorter" without lying about the grass a pawn
+# is hiding in. What it can be is squatter: a tussock spends 30-odd blades below
+# half height and sends three to the top, so it reads as a low dense cushion
+# while its top line stays honest. Only the weed tops out genuinely short
+# (0.86), and it is never more than a sixth of any patch.
+#
+# EVERY species keeps a real skirt — short, wide, hard-bent leaves right at the
+# root, drawn FIRST. Without one the bottom of a frame is ~26% opaque against
+# ~33% higher up: a pawn's boots sit exactly on that line, so whatever the sort
+# order does you see them through the stems of every clump in front of them.
+# That is the "foot under the grass" that survived three passes at the sprite
+# anchor and the y-sort banding — it was never the ordering, it was that there
+# is nothing painted down there. The dry species is the one to watch, since
+# thinning its base is exactly what would make it read as dry; it gets pale
+# splayed litter down there instead of bare stems, and `gen_tufts` prints the
+# root-band opacity of every frame so the next person can check rather than
+# assume.
+#
+# Width is per TIER and not per species, which is the one thing here that was
+# learned rather than designed. Thin stems are most of what makes the dry plant
+# read as dry — but applied to its skirt as well they took its root band from
+# 0.37 to 0.26, i.e. they bought the look by reopening the boots-through-the-
+# grass hole. A plant that has gone over has fine stems and a base of coarse
+# dead litter, so the two want opposite numbers.
+_GRASS_SPECIES = [
+    dict(
+        name='meadow', palette=_PALETTE_MEADOW, head=0.0,
+        tiers=[(10, 14, 0.08, 0.24, 0.15, 0.35, 0.15, 1.00),
+               # Bend is capped by the narrow frame: a blade that arcs further
+               # than this leaves the quad and gets cut off mid-leaf.
+               (4, 8, 0.50, 1.00, 0.05, 0.17, 0.07, 1.00)],
+    ),
+    dict(
+        name='tussock', palette=_PALETTE_TUSSOCK, head=0.0,
+        tiers=[(16, 20, 0.10, 0.32, 0.20, 0.45, 0.18, 1.25),
+               (8, 12, 0.30, 0.62, 0.10, 0.26, 0.11, 1.25),
+               (2, 3, 0.84, 1.00, 0.04, 0.12, 0.05, 1.25)],
+    ),
+    dict(
+        name='bent', palette=_PALETTE_BENT, head=0.8,
+        # Stems shorter than anything else's, because a seed head sits ABOVE the
+        # tip it grows on: one that reached 1.0 like the others would carry its
+        # head off the top of the frame.
+        tiers=[(12, 16, 0.07, 0.22, 0.25, 0.50, 0.17, 0.95),
+               (6, 9, 0.62, 0.94, 0.06, 0.20, 0.13, 0.45)],
+    ),
+    dict(
+        name='weed', palette=_PALETTE_WEED, head=0.0,
+        tiers=[(5, 7, 0.10, 0.24, 0.35, 0.55, 0.20, 1.25),
+               (4, 6, 0.44, 0.86, 0.30, 0.52, 0.14, 1.25)],
+    ),
+]
+GRASS_VARIANTS = 4   # frames per species; the sheet is species-major
+
+
+def _grow(parts, rng, spec, tier):
+    """One tier of blades on one clump."""
+    fewest, most, shortest, tallest, slack, arc, spread, width = tier
+    for _ in range(rng.randint(fewest, most)):
+        azim = rng.uniform(0, 2 * math.pi)
+        rad = rng.uniform(0.0, spread)
+        base = (math.cos(azim) * rad, math.sin(azim) * rad, 0.0)
+        _blade(parts, base, rng.uniform(0, 2 * math.pi),
+               rng.uniform(shortest, tallest), rng.uniform(slack, arc), rng,
+               spec['palette'], width, spec['head'])
+
+
+def gen_tufts(path, w=28, h=48):
+    """Small clumps of grass standing on the ground: `GRASS_VARIANTS` frames of
+    each of `_GRASS_SPECIES`, species-major in one row.
 
     Deliberately NARROW and only a few blades each: the arena is covered by
     thousands of these rather than a few hundred big ones, so that walking north
@@ -972,37 +1094,43 @@ def gen_tufts(path, w=28, h=48, variants=12):
     obvious tussocks. They keep the full model height, though — a clump's height
     is the depth of the grass where it stands, and the whole occlusion model
     rests on that being honest.
+
+    Four plants rather than one because a field of a single plant reads as
+    mown: every clump the same silhouette and the same green, so the only thing
+    on screen with a texture of its own is the soldier crossing it. The engine
+    draws mostly one or two species in any given area (`grass.rs` `species`), so
+    the mix says something about the ground rather than being confetti.
     """
     scale = h * GRASS_RISE_FRAC / math.sin(SOLDIER_TILT)
     frames = []
-    for v in range(variants):
-        rng = random.Random(4400 + v)
-        parts = []
-        # A skirt of short, wide, hard-bent leaves right at the root FIRST, so
-        # the clump meets the ground instead of standing on bare stems.
-        #
-        # Without it the bottom of a frame is ~26% opaque against ~33% higher up:
-        # a pawn's boots sit exactly on that line, so whatever the sort order
-        # does you see them through the stems of every clump in front of them.
-        # That is the "foot under the grass" that survived three passes at the
-        # sprite anchor and the y-sort banding — it was never the ordering, it
-        # was that there is nothing painted down there.
-        for _ in range(rng.randint(10, 14)):
-            azim = rng.uniform(0, 2 * math.pi)
-            rad = rng.uniform(0.0, 0.15)
-            base = (math.cos(azim) * rad, math.sin(azim) * rad, 0.0)
-            _blade(parts, base, rng.uniform(0, 2 * math.pi),
-                   rng.uniform(0.08, 0.24), rng.uniform(0.15, 0.35), rng)
-        for _ in range(rng.randint(4, 8)):
-            azim = rng.uniform(0, 2 * math.pi)
-            rad = rng.uniform(0.0, 0.07)
-            base = (math.cos(azim) * rad, math.sin(azim) * rad, 0.0)
-            # Bend is capped by the narrow frame: a blade that arcs further than
-            # this leaves the quad and gets cut off mid-leaf.
-            _blade(parts, base, rng.uniform(0, 2 * math.pi),
-                   rng.uniform(0.50, 1.0), rng.uniform(0.05, 0.17), rng)
-        frames.append(_render_grass_frame(parts, w, h, scale))
+    for spec in _GRASS_SPECIES:
+        for v in range(GRASS_VARIANTS):
+            rng = random.Random(4400 + len(frames))
+            parts = []
+            for tier in spec['tiers']:
+                _grow(parts, rng, spec, tier)
+            frames.append(_render_grass_frame(parts, w, h, scale))
+        _report_roots(spec['name'], frames[-GRASS_VARIANTS:], h)
     _write_grass_sheet(path, frames, w, h)
+
+
+def _report_roots(name, frames, h):
+    """Print how solid each species is down where the boots are.
+
+    The root band is the bottom `GRASS_BASE_FRAC` plus a little — the strip a
+    standing pawn's feet occupy — averaged over the WHOLE frame, so the numbers
+    are far below the share of the clump itself that is opaque. Read them
+    against each other, not against a target: the meadow is the field's
+    reference at 0.37, and a species much under it is one whose boots will show.
+    Measured: meadow 0.37, tussock 0.49, bent 0.32, weed 0.55. The dry one is
+    the thin one, which is both correct and the one to keep an eye on.
+    """
+    lo = int(h * (1.0 - GRASS_BASE_FRAC - 0.10))
+    root = sum(sum(sum(acc[y]) for y in range(lo, h)) for _, acc in frames)
+    body = sum(sum(sum(acc[y]) for y in range(0, lo)) for _, acc in frames)
+    span = len(frames) * len(frames[0][1][0])
+    print(f'  {name:8s} roots {root / (span * (h - lo)):.2f} '
+          f'body {body / (span * lo):.2f}')
 
 
 def gen_grass_tex(path, size=128):

@@ -81,7 +81,73 @@ const GRASS_GRID: i32 = 20;
 const TUFT_STEP: i32 = 4;
 /// Depth below which the ground is bare — the sward texture is the grass there.
 const TUFT_MIN_H: i32 = 6;
-const TUFT_VARIANTS: usize = 12;
+/// `tufts.png` layout: four plants, four frames each, species-major (see
+/// `gen_assets.py` `_GRASS_SPECIES`) — meadow, tussock, bent, weed.
+const TUFT_SPECIES: usize = 4;
+const SPECIES_FRAMES: usize = 4;
+const TUFT_FRAMES: usize = TUFT_SPECIES * SPECIES_FRAMES;
+
+/// How much of each plant grows on lush, middling and parched ground, as raw
+/// weights read off [`dryness`] and normalised.
+///
+/// A patch is DOMINATED rather than pure, which is the whole point of drawing
+/// the species from a field instead of from the clump's own hash: even weights
+/// everywhere would be confetti — four plants evenly mixed at every scale reads
+/// as noise, not as ground that differs from the ground next to it. Dominance
+/// is what makes an area a place.
+///
+/// **Three stops rather than two, because two only ever made two kinds of
+/// place.** With a straight lush→dry lerp the greenest ground and the merely
+/// average ground were both meadow-led — the tussock's weight sat under the
+/// meadow's at every dryness, so it was a supporting plant everywhere and led
+/// nothing (measured: 11 of 12 patches meadow, 1 bent, 0 tussock). Giving the
+/// lush end to the tussock costs one number and buys a third kind of area:
+/// dark dense cushions where the ground is best, open meadow in the middle,
+/// fine seed-headed bent where it has burnt off.
+const SPECIES_MIX: [[f32; 3]; TUFT_SPECIES] = [
+    [0.30, 0.55, 0.20], // meadow
+    [0.55, 0.22, 0.05], // tussock
+    [0.05, 0.13, 0.58], // bent
+    [0.10, 0.10, 0.17], // weed
+];
+
+/// How dry the ground is, area to area: two octaves of value noise, coarse
+/// enough to make regions and fine enough that their edges are ragged.
+const DRY_CELL: f32 = 190.0;
+const DRY_CELL_FINE: f32 = 58.0;
+const DRY_FINE_SHARE: f32 = 0.32;
+/// The window the blend is stretched through. Value noise bunches hard around
+/// its middle and blending two octaves narrows it further, so a window that
+/// looks reasonable sits off where the numbers actually are — the same trap the
+/// wind's `GUST_LO`/`GUST_HI` fell into twice. `the_ground_is_mostly_green_with_
+/// dry_patches_here_and_there` prints the distribution; tune against that
+/// rather than against these numbers looking sensible.
+const DRY_LO: f32 = 0.53;
+const DRY_HI: f32 = 0.96;
+const DRY_SEED: u32 = 0x5EED_1A17;
+const DRY_SEED_FINE: u32 = 0x9C4F_20B3;
+/// What full dryness does to the tint, as an rgb offset. It is a HUE shift and
+/// almost not a value one — red up, blue down, green left alone — so that
+/// depth keeps the light-to-dark axis to itself (see [`dryness`]). Straw is not
+/// brighter than grass; it is yellower.
+///
+/// **Deliberately smaller than the plants' own contribution.** The first
+/// version leaned twice as hard on red here, on top of a dry plant that was
+/// already tan, and the two multiplied into rust: the dry areas read as an
+/// autumn wood rather than as a field that had gone over. What says "dry" is
+/// mostly the bent plant's silhouette and palette; this only tips the ground it
+/// stands on far enough to agree with it.
+const DRY_SHIFT: [f32; 3] = [0.14, -0.01, -0.10];
+/// How much of the sward's cover full dryness takes away, letting the dry earth
+/// underneath show through between the blades. Small: this is grass thinning
+/// out, not bare ground, and the tufts standing in it are unaffected — a dry
+/// patch you could see the soil through everywhere would be a patch nobody
+/// could hide in, which is the one thing the brief said not to do.
+const DRY_THIN: f32 = 0.20;
+/// What the measuring rig gets. `Scenario::GrassStrip` exists to be
+/// photographed and compared against the last set of photographs, so its ground
+/// is one fixed shade for the same reason its wind is a dead calm.
+const DRY_RIG: f32 = 0.25;
 
 /// The ground itself, under everything (the dirt tile is at -10).
 const Z_FIELD: f32 = -9.0;
@@ -235,30 +301,103 @@ fn units(pos: &Pos) -> (i32, i32) {
     (pos.x / FP, pos.y / FP)
 }
 
-/// The look of grass `h` units deep: a near-white tint over the sheets' own
-/// greens (so hue and value drift from area to area without repainting
-/// anything), and how completely it covers the dirt underneath. Thin ground is
-/// dry, pale and see-through; deep grass is greener, darker and solid.
-fn grass_look(h: f32) -> (Color, f32) {
+/// Smooth interpolation between two lattice corners, sampled off [`scatter`] so
+/// the field costs nothing to store and every peer grows the same one.
+fn value_noise(x: f32, y: f32, cell: f32, salt: u32) -> f32 {
+    let (gx, gy) = (x / cell, y / cell);
+    let (ix, iy) = (gx.floor(), gy.floor());
+    let (fx, fy) = (gx - ix, gy - iy);
+    let (ux, uy) = (fx * fx * (3.0 - 2.0 * fx), fy * fy * (3.0 - 2.0 * fy));
+    let corner = |cx: f32, cy: f32| (scatter(cx as i32, cy as i32, salt) & 0xFFFF) as f32 / 65535.0;
+    let top = corner(ix, iy) + (corner(ix + 1.0, iy) - corner(ix, iy)) * ux;
+    let bottom = corner(ix, iy + 1.0) + (corner(ix + 1.0, iy + 1.0) - corner(ix, iy + 1.0)) * ux;
+    top + (bottom - top) * uy
+}
+
+/// How dry the ground is here: 0 lush green, 1 straw. **Render-only, and
+/// deliberately UNCORRELATED with the depth field.**
+///
+/// Both of those are load-bearing.
+///
+/// *Render-only*, because dryness changes nothing about what can be seen —
+/// concealment, `visible_fraction`, the fog tiles and every bot decision still
+/// read `Scenario::depth` and nothing else. Grass that hid you by being brown
+/// would have to be sim state: integers, rollback registration, a checksum, all
+/// for a colour.
+///
+/// *Uncorrelated*, because the alternative is a second readout of the same
+/// number. Depth already drives the tint's VALUE — dark is deep — and painting
+/// dryness on the same axis would just make deep tiles doubly dark and say
+/// nothing new. So depth keeps value and dryness takes HUE: a dry deep patch is
+/// dark khaki, a lush thin one is pale green, and the two facts stay separately
+/// readable. That the field crosses the depth field's hex tiles at its own scale
+/// is the other half of it — smooth colour over hard-edged tiles is what stops
+/// the honeycomb reading as a honeycomb.
+fn dryness(scenario: Scenario, x: i32, y: i32) -> f32 {
+    if matches!(scenario, Scenario::GrassStrip { .. }) {
+        return DRY_RIG;
+    }
+    let t = ((parch(x, y) - DRY_LO) / (DRY_HI - DRY_LO)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// The raw two-octave blend, before the window. Split out because the window is
+/// the part that has to be tuned against measured quantiles rather than guessed
+/// (see [`DRY_LO`]), and a number you cannot print is a number you will guess.
+fn parch(x: i32, y: i32) -> f32 {
+    let (x, y) = (x as f32, y as f32);
+    (1.0 - DRY_FINE_SHARE) * value_noise(x, y, DRY_CELL, DRY_SEED)
+        + DRY_FINE_SHARE * value_noise(x, y, DRY_CELL_FINE, DRY_SEED_FINE)
+}
+
+/// Which of the four plants grows at a spot, from how dry it is there plus the
+/// spot's own roll.
+fn species(dry: f32, roll: u32) -> usize {
+    let mut weights = [0.0_f32; TUFT_SPECIES];
+    let mut total = 0.0;
+    // Which half of the curve, and how far along it.
+    let (stop, t) = if dry < 0.5 { (0, dry * 2.0) } else { (1, (dry - 0.5) * 2.0) };
+    for (i, stops) in SPECIES_MIX.iter().enumerate() {
+        weights[i] = stops[stop] + (stops[stop + 1] - stops[stop]) * t;
+        total += weights[i];
+    }
+    let mut pick = (roll & 0xFFFF) as f32 / 65535.0 * total;
+    for (i, w) in weights.iter().enumerate() {
+        pick -= w;
+        if pick <= 0.0 {
+            return i;
+        }
+    }
+    TUFT_SPECIES - 1
+}
+
+/// The look of grass `h` units deep on ground `dry` parched: a near-white tint
+/// over the sheets' own greens (so hue and value drift from area to area
+/// without repainting anything), and how completely it covers the dirt
+/// underneath. Thin ground is pale and see-through; deep grass is greener,
+/// darker and solid.
+fn grass_look(h: f32, dry: f32) -> (Color, f32) {
     let f = (h / GRASS_MAX_H as f32).clamp(0.0, 1.0);
-    let lerp = |dry: f32, lush: f32| dry + (lush - dry) * f;
+    let lerp = |thin: f32, deep: f32| thin + (deep - thin) * f;
+    // A WIDE spread, pale thin green to dark lush green, because this is what
+    // actually makes one tile read as deeper than the next. Seen from almost
+    // straight down, a third more blade height barely registers — the
+    // silhouettes overlap into the same mass either way — so depth has to carry
+    // in value and hue as well, the way it does on any top-down map.
+    // Kept out of the bright end regardless: `TEAM_COLORS` were picked to sit
+    // above the ground in value, and a vivid sward puts a camouflaged soldier
+    // back into the background it was tuned against.
+    let base = [lerp(0.90, 0.46), lerp(0.85, 0.68), lerp(0.60, 0.42)];
+    let tint: [f32; 3] = std::array::from_fn(|c| (base[c] + DRY_SHIFT[c] * dry).clamp(0.0, 1.0));
     (
-        // A WIDE spread, pale dry green to dark lush green, because this is what
-        // actually makes one tile read as deeper than the next. Seen from almost
-        // straight down, a third more blade height barely registers — the
-        // silhouettes overlap into the same mass either way — so depth has to
-        // carry in value and hue as well, the way it does on any top-down map.
-        // Kept out of the bright end regardless: `TEAM_COLORS` were picked to
-        // sit above the ground in value, and a vivid sward puts a camouflaged
-        // soldier back into the background it was tuned against.
-        Color::srgb(lerp(0.90, 0.46), lerp(0.85, 0.68), lerp(0.60, 0.42)),
+        Color::srgb(tint[0], tint[1], tint[2]),
         // Saturating fast, not linear: grass covers the soil long before it gets
         // tall, so anything from ankle deep up is solid sward with no dirt
         // showing through — the ground layer is the thatch the tufts stand in,
         // and if it fades with depth then short grass reads as bare earth with
         // clumps on it. Only genuinely bare ground (`Scenario::GrassStrip` uses
         // depth 0 for its clear lanes) shows soil.
-        (0.12 + 3.0 * f).min(1.0),
+        ((0.12 + 3.0 * f) * (1.0 - DRY_THIN * dry)).min(1.0),
     )
 }
 
@@ -353,7 +492,8 @@ fn field_mesh(scenario: Scenario) -> Mesh {
         for col in 0..=cols {
             let x = -ARENA_HALF_W + col as i32 * GRASS_GRID;
             let y = -ARENA_HALF_H + row as i32 * GRASS_GRID;
-            let (tint, alpha) = grass_look(scenario.depth(x, y) as f32);
+            let (tint, alpha) =
+                grass_look(scenario.depth(x, y) as f32, dryness(scenario, x, y));
             let tint = tint.to_linear();
             positions.push([x as f32, y as f32, 0.0]);
             uvs.push([x as f32 / GRASS_TEX_PX, -y as f32 / GRASS_TEX_PX]);
@@ -446,6 +586,15 @@ fn tuft_bands(scenario: Scenario) -> Vec<(f32, Mesh, usize)> {
         let mut sway: Vec<[f32; 2]> = Vec::new();
         for (x, y, noise) in clumps {
             let h = scenario.depth(x, y) as f32;
+            // Which PLANT grows here comes from the ground (`dryness`); which of
+            // its four frames is this clump's own business. Rolled off a
+            // separate salt rather than more bits of `noise`, which is already
+            // spoken for four times over — two draws that shared bits would
+            // correlate the plant with the clump's height or its mirroring, and
+            // that reads as a pattern long before anyone works out what it is.
+            let dry = dryness(scenario, x, y);
+            let frame = species(dry, scatter(x, y, 0xB0A5)) * SPECIES_FRAMES
+                + (noise / 128) as usize % SPECIES_FRAMES;
             // Clumps aren't all the same size even where the grass is level —
             // but only just. This jitter competes directly with the tile-to-tile
             // depth difference the field is quantized to produce, and at the
@@ -457,13 +606,12 @@ fn tuft_bands(scenario: Scenario) -> Vec<(f32, Mesh, usize)> {
             // edge, so the quad hangs that much below the clump's own position.
             let (bottom, top) =
                 (y - height * GRASS_BASE_FRAC, y + height * (1.0 - GRASS_BASE_FRAC));
-            let variant = (noise / 128) as usize % TUFT_VARIANTS;
             let (u0, u1) = {
-                let (a, b) = (variant as f32 / TUFT_VARIANTS as f32,
-                              (variant + 1) as f32 / TUFT_VARIANTS as f32);
+                let (a, b) = (frame as f32 / TUFT_FRAMES as f32,
+                              (frame + 1) as f32 / TUFT_FRAMES as f32);
                 if noise / 32 % 2 == 0 { (b, a) } else { (a, b) } // mirror = swapped u
             };
-            let (tint, _) = grass_look(h);
+            let (tint, _) = grass_look(h, dry);
             let tint = tint.to_linear();
             // How this clump takes the wind, baked in once: how far its TIP
             // travels at a full gust (its root does not move, which is what
@@ -622,6 +770,165 @@ mod tests {
             spread > crate::wind::TUFT_GRAIN,
             "the whole field moves as one: grain spread {spread}"
         );
+    }
+
+    /// Sample the dryness field on the same grid the sward mesh is built on.
+    fn arena_dryness() -> Vec<f32> {
+        let mut out = Vec::new();
+        let mut y = -ARENA_HALF_H;
+        while y <= ARENA_HALF_H {
+            let mut x = -ARENA_HALF_W;
+            while x <= ARENA_HALF_W {
+                out.push(dryness(Scenario::Arena, x, y));
+                x += GRASS_GRID;
+            }
+            y += GRASS_GRID;
+        }
+        out
+    }
+
+    /// **Brown here and there, not brown all over.** The whole request this
+    /// field answers was for the ground to stop being one picturesque green,
+    /// and the failure mode on the other side is a field that is uniformly
+    /// mottled — which is just as flat, only browner, and costs the concealment
+    /// model the lush ground it is tuned against.
+    ///
+    /// So this prints the distribution and asserts the SHAPE of it: a green
+    /// majority, a real dry minority, and both ends actually reached somewhere.
+    /// Value noise bunches around its middle and blending two octaves narrows it
+    /// further, so the window that produces this is not one anybody guessed —
+    /// print before tuning.
+    #[test]
+    fn the_ground_is_mostly_green_with_dry_patches_here_and_there() {
+        let field = arena_dryness();
+        let share = |lo: f32, hi: f32| {
+            field.iter().filter(|&&d| d >= lo && d < hi).count() as f32 / field.len() as f32
+        };
+        let (green, turning, dry) = (share(0.0, 0.25), share(0.25, 0.6), share(0.6, 1.01));
+        // The window is tuned against these, not against what looks sensible.
+        let mut raw = Vec::new();
+        let mut y = -ARENA_HALF_H;
+        while y <= ARENA_HALF_H {
+            let mut x = -ARENA_HALF_W;
+            while x <= ARENA_HALF_W {
+                raw.push(parch(x, y));
+                x += GRASS_GRID;
+            }
+            y += GRASS_GRID;
+        }
+        raw.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let q = |p: f32| raw[(p * (raw.len() - 1) as f32) as usize];
+        println!(
+            "blend quantiles: p05 {:.3} p25 {:.3} p50 {:.3} p75 {:.3} p95 {:.3} (window {DRY_LO}..{DRY_HI})",
+            q(0.05), q(0.25), q(0.50), q(0.75), q(0.95),
+        );
+        println!(
+            "{} samples: {:.0}% green, {:.0}% turning, {:.0}% dry (min {:.2} max {:.2})",
+            field.len(),
+            green * 100.0,
+            turning * 100.0,
+            dry * 100.0,
+            field.iter().cloned().fold(f32::MAX, f32::min),
+            field.iter().cloned().fold(0.0_f32, f32::max),
+        );
+        assert!(green > 0.45, "the field has gone brown: only {green:.2} of it is green");
+        assert!(dry > 0.08, "there is nowhere dry: {dry:.2}");
+        assert!(dry < 0.30, "dry ground is the exception, not the rule: {dry:.2}");
+        // Both ends have to be REACHED, not merely approached: a field that only
+        // ever ran 0.2..0.7 would tint the whole map and never say "this patch,
+        // not that one".
+        assert!(field.iter().cloned().fold(f32::MAX, f32::min) < 0.02, "nowhere is fully lush");
+        assert!(field.iter().cloned().fold(0.0_f32, f32::max) > 0.98, "nowhere is fully dry");
+    }
+
+    /// A patch is dominated by one plant and is never pure. Both halves matter:
+    /// an even mix everywhere is confetti (four plants at every scale reads as
+    /// noise rather than as one place differing from the next), and a pure patch
+    /// is a tiled texture with a visible seam where it meets the next one.
+    #[test]
+    fn a_patch_is_dominated_by_one_plant_but_never_only_one() {
+        // Half the coarse dryness cell, which is about what fits on a phone
+        // screen at once — the scale at which "this patch differs from that
+        // one" is a thing a player can actually see. A whole cell is too coarse
+        // to measure leadership with: dry ground is 17% of the map, so at that
+        // size every block averages some of it in and the dry plant leads
+        // nothing while plainly taking over on screen.
+        let block = DRY_CELL as i32 / 2;
+        let (mut leaders, mut pure) = (vec![0_usize; TUFT_SPECIES], 0);
+        let mut blocks = 0;
+        let mut y = -ARENA_HALF_H;
+        while y + block <= ARENA_HALF_H {
+            let mut x = -ARENA_HALF_W;
+            while x + block <= ARENA_HALF_W {
+                let mut counts = [0_usize; TUFT_SPECIES];
+                for sy in (y..y + block).step_by(TUFT_STEP as usize) {
+                    for sx in (x..x + block).step_by(TUFT_STEP as usize) {
+                        let dry = dryness(Scenario::Arena, sx, sy);
+                        counts[species(dry, scatter(sx, sy, 0xB0A5))] += 1;
+                    }
+                }
+                let total: usize = counts.iter().sum();
+                let best = counts.iter().max().unwrap();
+                assert!(
+                    *best as f32 / total as f32 > 0.30,
+                    "no plant leads this patch: {counts:?}"
+                );
+                if counts.contains(&0) {
+                    pure += 1;
+                }
+                leaders[counts.iter().position(|c| c == best).unwrap()] += 1;
+                blocks += 1;
+                x += block;
+            }
+            y += block;
+        }
+        println!("{blocks} patches, led by {leaders:?} (meadow, tussock, bent, weed)");
+        assert_eq!(pure, 0, "{pure} patches grow only some of the plants");
+        // The dry plant has to actually take over somewhere, or the sheet's most
+        // distinctive frames are scattered thinly and never read as a place.
+        assert!(leaders[2] > 0, "the dry plant never leads a patch: {leaders:?}");
+        // …and the green ones still hold the field.
+        assert!(
+            leaders[0] + leaders[1] > blocks / 2,
+            "the field is more dry than green: {leaders:?}"
+        );
+    }
+
+    /// Dryness paints HUE, depth paints VALUE, and they have to stay on their
+    /// own axes — otherwise a dry deep patch reads as shallow and the tint stops
+    /// being a usable answer to "can I hide there?".
+    #[test]
+    fn drying_the_ground_changes_its_colour_without_changing_how_deep_it_looks() {
+        let luma = |c: Color| {
+            let c = c.to_linear();
+            0.2126 * c.red + 0.7152 * c.green + 0.0722 * c.blue
+        };
+        // What depth is worth on the value axis, which is the yardstick the
+        // dryness shift has to stay well under. Stated as a RATIO rather than
+        // an absolute tolerance because the two are only ever read against each
+        // other: the question is never "is this shift small" but "could anyone
+        // mistake it for depth".
+        let depth_swing = luma(grass_look(0.0, 0.0).0) - luma(grass_look(GRASS_MAX_H as f32, 0.0).0);
+        for &h in &[10.0_f32, 30.0, 50.0, GRASS_MAX_H as f32] {
+            let (green, _) = grass_look(h, 0.0);
+            let (straw, _) = grass_look(h, 1.0);
+            let (dl, dr) = (luma(straw) - luma(green), straw.to_srgba().red - green.to_srgba().red);
+            println!(
+                "depth {h:>5.0}: drying moves luma {dl:+.3} ({:.0}% of what depth moves it), red {dr:+.3}",
+                100.0 * dl.abs() / depth_swing,
+            );
+            assert!(
+                dl.abs() < depth_swing / 4.0,
+                "drying changed how deep the grass looks: {dl:+.3} against depth's {depth_swing:.3}"
+            );
+            assert!(dr > 0.10, "drying barely changed the colour: {dr:+.3}");
+        }
+        // And depth still owns value at either extreme of dryness.
+        for dry in [0.0_f32, 1.0] {
+            let thin = luma(grass_look(0.0, dry).0);
+            let deep = luma(grass_look(GRASS_MAX_H as f32, dry).0);
+            assert!(thin - deep > 0.15, "depth stopped reading at dryness {dry}: {thin} {deep}");
+        }
     }
 
     /// The sward is a flat sheet with nothing to bend, so it takes no geometric

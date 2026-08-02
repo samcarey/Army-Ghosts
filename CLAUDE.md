@@ -1135,6 +1135,34 @@ nothing.
   quantised bands in part-local coords so it travels with the limb, and a noise
   jitter on the silhouette so nothing reads as a clean analytic curve.
   Two knock-ons that are easy to miss:
+  * **Which gait block a pawn is on is a decision about a SEQUENCE of frames,
+    not about this one** (`WalkAnim::advance`), and both halves of that were
+    reported as a bug: "at medium running speeds the upper body keeps flickering
+    back and forth between different angles". The run columns are not another
+    set of legs — `gen_assets.py` builds them with `lean=0.16, crouch=0.05`, so
+    crossing `RUN_ABOVE` pitches the whole TORSO forward and drops it, and a
+    threshold crossed twice a second is a soldier changing posture twice a
+    second. Two fixes, kept apart because they answer different questions:
+    - **`RUN_BELOW` (hysteresis).** The band gets crossed constantly because of
+      `heading_scale`: at full deflection the pace runs 120 px/s straight ahead,
+      90 square on, 67.5 dead astern, decided by *where the barrel points*, so a
+      player holding the left stick still and turning the right one sweeps the
+      whole range. 70 sits under a backward diagonal (74.5) and over a straight
+      backpedal (67.5), so a full-stick retreat always lands on the walk frames.
+    - **`PACE_WINDOW` (averaging).** `Pos` moves on a SIM TICK and this runs on a
+      RENDER FRAME, so when the two rates aren't locked, consecutive frames see
+      one tick's whole step and then nothing — an instantaneous reading swings
+      between double pace and a dead stop, and on a 120 Hz phone it does it every
+      other frame. Averaging over ~6 ticks makes the number a property of the
+      pawn rather than of the beat between two clocks.
+    The window must NOT also decide whether the pawn is moving at all, or its lag
+    lands on the step off and the stop, where a player feels it as the animation
+    sticking. `STILL_ENOUGH` and the part-filled-window test answer that
+    separately, and both are proofs rather than estimates: ground already covered
+    can only grow, and a gap longer than a tick cannot be the sampling beat,
+    which only skips a frame when frames are shorter than a tick. The cycle
+    PHASE, meanwhile, advances on distance covered — that sum telescopes exactly
+    however the frames land, which is what keeps footfalls glued to the ground.
   * The sprite is anchored at the figure's ground point (`STANCE_ANCHOR`), so
     feet stand on `Pos` and the body rises above it — except prone, which is
     anchored mid-body, because that is what a horizontal figure pivots around.

@@ -122,7 +122,37 @@ pub struct MuzzleLift(f32);
 /// keeps footfalls glued to the ground speed.
 const IDLE_BELOW: f32 = 6.0;
 const RUN_ABOVE: f32 = 78.0;
+/// …and once running, keep running until the pace falls back THIS far. The two
+/// blocks are not two sets of legs: `gen_assets.py` builds the run frames with
+/// `lean=0.16, crouch=0.05`, which pitches the whole UPPER BODY forward and
+/// drops it, so a bare threshold does not flicker a stride, it flickers the
+/// soldier's posture between two visibly different angles.
+///
+/// The band is where it is because of `heading_scale`, and this is the part
+/// that makes the crossing routine rather than rare: at full deflection the
+/// pace runs from 120 px/s straight ahead down to 90 square on and 67.5 dead
+/// astern, all of it decided by where the BARREL points. A player holding the
+/// left stick still and turning the right one sweeps the whole range, so
+/// `RUN_ABOVE` gets crossed by aiming. 70 is under the 74.5 of a backward
+/// diagonal and over the 67.5 of a straight backpedal, so a full-stick retreat
+/// always lands on the walk frames however fast the player was going before it.
+const RUN_BELOW: f32 = 70.0;
 const CYCLE_LEN_PX: f32 = 36.0;
+/// How long a stretch the pace is averaged over before it is believed.
+/// `Pos` only moves on a SIM TICK and this runs on a RENDER FRAME, so whenever
+/// the two rates aren't locked, consecutive frames see one tick's whole step
+/// and then nothing at all — an instantaneous reading swings between double
+/// pace and a dead stop, and on a 120 Hz phone it does it every other frame.
+/// A window several ticks long makes the number a property of the pawn instead
+/// of a property of the beat between two clocks.
+const PACE_WINDOW: f32 = 0.1;
+/// How long a pawn has to sit perfectly still before the legs are put away.
+/// This is NOT a second helping of the window above: it is what keeps the
+/// window's lag away from the moment a player stops walking, where a tenth of a
+/// second of held stride reads as the animation sticking. It cannot be fooled
+/// by the sampling beat, because that only ever skips a frame when frames are
+/// SHORTER than a sim tick — a gap this long means the pawn really has stopped.
+const STILL_ENOUGH: f32 = 0.05;
 
 /// Render-only walk-cycle state (deliberately NOT rollback-registered:
 /// cosmetic, so rollbacks never touch it and determinism is untouched).
@@ -130,6 +160,56 @@ const CYCLE_LEN_PX: f32 = 36.0;
 pub struct WalkAnim {
     phase: f32,
     last_pos: Option<Vec2>,
+    /// Ground covered and time spent since the pace was last worked out.
+    walked: f32,
+    since: f32,
+    /// How long since this pawn last moved at all.
+    still: f32,
+    /// The believed pace, and whether the run block is currently held.
+    pace: f32,
+    running: bool,
+}
+
+impl WalkAnim {
+    /// Take one frame's travel and answer which of the 13 animation columns to
+    /// draw. Split out from the system so the thing that actually flickered —
+    /// the gait decision over a sequence of frames — can be tested without a
+    /// window.
+    fn advance(&mut self, moved: f32, dt: f32, level: u8) -> usize {
+        self.walked += moved;
+        self.since += dt;
+        self.still = if moved > 0.0 { 0.0 } else { self.still + dt };
+        if self.since >= PACE_WINDOW {
+            self.pace = self.walked / self.since;
+            self.walked = 0.0;
+            self.since = 0.0;
+        }
+        // Whether a pawn is moving AT ALL is asked separately from how fast,
+        // and answered without waiting for the window, because the window's lag
+        // lands on the two instants a player is watching for it — the step off
+        // and the stop. Both halves are proofs rather than estimates: ground
+        // already covered inside this window can only grow, so it settles the
+        // question early; and a still stretch longer than a tick settles the
+        // other one (see `STILL_ENOUGH`).
+        let moving = self.still < STILL_ENOUGH
+            && (self.pace >= IDLE_BELOW || self.walked >= IDLE_BELOW * PACE_WINDOW);
+        if !moving {
+            self.phase = 0.0;
+            self.running = false;
+            return IDLE_FRAME;
+        }
+        // The cycle itself advances on DISTANCE COVERED, not on the averaged
+        // pace: that sum telescopes exactly however the frames land, which is
+        // what keeps footfalls glued to the ground.
+        self.phase = (self.phase + moved / CYCLE_LEN_PX).fract();
+        // Only a standing soldier can outrun the walk cycle: crouching and
+        // crawling top out below the threshold, and the sheet's run columns for
+        // those stances just repeat the walk.
+        let bar = if self.running { RUN_BELOW } else { RUN_ABOVE };
+        self.running = level == STANCE_STAND && self.pace > bar;
+        let start = if self.running { RUN_START } else { WALK_START };
+        start + ((self.phase * CYCLE_FRAMES as f32) as usize).min(CYCLE_FRAMES - 1)
+    }
 }
 
 /// The tracer streak texture (drawn pointing +x; rotated to flight angle).
@@ -489,11 +569,15 @@ fn stance_anchor(level: u8) -> Vec2 {
     Vec2::new(0.0, 0.5 - STANCE_ANCHOR[(level as usize).min(STANCE_COUNT - 1)])
 }
 
-/// Advance each soldier's walk/run cycle from their *rendered* speed (Pos
+/// Advance each soldier's walk/run cycle from their *rendered* travel (Pos
 /// delta per frame — works for remote players too, and rollback corrections
 /// just read as a brief stutter). Stationary → idle frame; sub-max analog
 /// deflection → walk cycle; near-full speed → run cycle. The stance picks
 /// which block of columns all of that indexes into.
+///
+/// This hands the frame's distance to [`WalkAnim::advance`] and does nothing
+/// with it itself: turning travel into a gait is where the averaging window and
+/// the run hysteresis live, and both of those are about a SEQUENCE of frames.
 pub fn animate_players(
     time: Res<Time>,
     mut players: Query<
@@ -512,26 +596,15 @@ pub fn animate_players(
         }
         let (x, y) = pos.to_f32();
         let p = Vec2::new(x, y);
-        let speed = match anim.last_pos {
+        let moved = match anim.last_pos {
             // Cap: a rollback correction or respawn can jump Pos; don't let
             // one frame's teleport read as supersonic legs.
-            Some(last) => (p - last).length().min(6.0) / dt,
+            Some(last) => (p - last).length().min(6.0),
             None => 0.0,
         };
         anim.last_pos = Some(p);
         let Some(atlas) = sprite.texture_atlas.as_mut() else { continue };
-        let column = if speed < IDLE_BELOW {
-            anim.phase = 0.0;
-            IDLE_FRAME
-        } else {
-            anim.phase = (anim.phase + speed * dt / CYCLE_LEN_PX).fract();
-            // Only a standing soldier can outrun the walk cycle: crouching and
-            // crawling top out below the threshold, and the sheet's run
-            // columns for those stances just repeat the walk.
-            let running = speed > RUN_ABOVE && stance.level == STANCE_STAND;
-            let start = if running { RUN_START } else { WALK_START };
-            start + ((anim.phase * CYCLE_FRAMES as f32) as usize).min(CYCLE_FRAMES - 1)
-        };
+        let column = anim.advance(moved, dt, stance.level);
         // Row = facing, measured clockwise from "away from the camera", which
         // is how the generator lays the sheet out; the stance selects which
         // 13-column block of that row to read.
@@ -695,3 +768,157 @@ pub fn camera_follow(
 // rather than as a deliberate edge. A camera locked to the player is the thing
 // players actually notice; black beyond the wall is not.
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use army_ghosts_sim::{STANCE_CROUCH, STANCE_PRONE};
+
+    /// One frame of a pawn travelling at `pace` px/s, at `fps`.
+    fn frame(anim: &mut WalkAnim, pace: f32, fps: f32) -> usize {
+        let dt = 1.0 / fps;
+        anim.advance(pace * dt, dt, STANCE_STAND)
+    }
+
+    /// Which of the three blocks a column belongs to, which is all the eye
+    /// actually reads: idle, upright walk, or torso pitched forward to run.
+    fn block(column: usize) -> u8 {
+        match column {
+            IDLE_FRAME => 0,
+            c if c < RUN_START => 1,
+            _ => 2,
+        }
+    }
+
+    fn blocks(pace: f32, fps: f32, seconds: f32) -> Vec<u8> {
+        let mut anim = WalkAnim::default();
+        let frames = (seconds * fps) as usize;
+        (0..frames).map(|_| block(frame(&mut anim, pace, fps))).collect()
+    }
+
+    /// The reported bug: at a pace near the run threshold the soldier's upper
+    /// body flickered between two angles, because the run block pitches the
+    /// torso forward (`lean` in gen_assets.py) and the threshold was bare.
+    ///
+    /// Swept across the whole band and back, the posture must change exactly
+    /// twice: out on the way up, back on the way down.
+    #[test]
+    fn sweeping_through_the_run_threshold_changes_posture_once_each_way() {
+        let mut anim = WalkAnim::default();
+        let mut seen = Vec::new();
+        // Settled into the walk first: for its first window a fresh pawn has no
+        // pace to believe yet and shows the idle frame, which is a legitimate
+        // change of posture and not the one under test.
+        for _ in 0..12 {
+            frame(&mut anim, 60.0, 60.0);
+        }
+        // 3 s up from a walk to a full run and 3 s back, at 60 fps — with a
+        // small ripple on it, because no thumb pushes a stick smoothly and the
+        // whole complaint is about a pace that sits near the bar and wobbles.
+        for i in 0..360 {
+            let t = (i as f32 / 180.0 - 1.0).abs();
+            let ripple = 4.0 * (i as f32 * 0.7).sin();
+            seen.push(block(frame(&mut anim, 120.0 - 60.0 * t + ripple, 60.0)));
+        }
+        let changes = seen.windows(2).filter(|w| w[0] != w[1]).count();
+        assert_eq!(
+            changes, 2,
+            "posture changed {changes} times crossing the threshold twice: {seen:?}"
+        );
+    }
+
+    /// Holding a pace INSIDE the hysteresis band is the same test standing
+    /// still: whichever block the pawn arrived on, it must keep it.
+    #[test]
+    fn a_pace_inside_the_band_holds_whichever_posture_it_arrived_on() {
+        let mid = (RUN_ABOVE + RUN_BELOW) / 2.0;
+        let mut walking = WalkAnim::default();
+        let mut running = WalkAnim::default();
+        // Arrive from below and from above, then hold for two seconds each.
+        for _ in 0..60 {
+            frame(&mut walking, RUN_BELOW - 10.0, 60.0);
+            frame(&mut running, 120.0, 60.0);
+        }
+        assert_eq!(block(frame(&mut walking, mid, 60.0)), 1);
+        assert_eq!(block(frame(&mut running, mid, 60.0)), 2);
+        for _ in 0..120 {
+            assert_eq!(block(frame(&mut walking, mid, 60.0)), 1, "walk broke into a run");
+            assert_eq!(block(frame(&mut running, mid, 60.0)), 2, "run dropped to a walk");
+        }
+    }
+
+    /// `Pos` moves on a sim tick and this runs on a render frame, so a screen
+    /// that isn't locked to 60 Hz sees one tick's whole step and then nothing.
+    /// Sampled per frame that reads as double pace alternating with a dead
+    /// stop; averaged over a window it reads as the pace the pawn is holding.
+    #[test]
+    fn the_beat_between_the_sim_and_the_screen_does_not_reach_the_gait() {
+        let mut anim = WalkAnim::default();
+        let dt = 1.0 / 120.0;
+        // 60 px/s — a clear walk — delivered as 120 Hz frames carrying a whole
+        // 60 Hz tick's step on every other one.
+        let step = 60.0 / 60.0;
+        let mut seen = Vec::new();
+        for i in 0..240 {
+            let moved = if i % 2 == 0 { step } else { 0.0 };
+            seen.push(block(anim.advance(moved, dt, STANCE_STAND)));
+        }
+        // The opening window is idle (nothing is believed yet); after that the
+        // walk must be unbroken — no run frames, and no blinking back to idle.
+        assert!(
+            seen[24..].iter().all(|&b| b == 1),
+            "the sampling beat reached the gait: {:?}",
+            &seen[24..]
+        );
+    }
+
+    /// The stances that cannot outrun the walk cycle must never reach the run
+    /// block, whatever the pace says — the sheet's run columns for those just
+    /// repeat the walk, and a crawling soldier does not lean into a sprint.
+    #[test]
+    fn only_a_standing_soldier_reaches_the_run_frames() {
+        for level in [STANCE_CROUCH, STANCE_PRONE] {
+            let mut anim = WalkAnim::default();
+            for _ in 0..120 {
+                let column = anim.advance(120.0 / 60.0, 1.0 / 60.0, level);
+                assert!(column < RUN_START, "stance {level} reached column {column}");
+            }
+        }
+    }
+
+    #[test]
+    fn standing_still_idles_and_walking_does_not() {
+        assert!(blocks(0.0, 60.0, 1.0).iter().all(|&b| b == 0));
+        assert!(blocks(60.0, 60.0, 1.0)[24..].iter().all(|&b| b == 1));
+        assert!(blocks(120.0, 60.0, 1.0)[24..].iter().all(|&b| b == 2));
+    }
+
+    /// The window averages a PACE, and a player would feel it if it also
+    /// decided whether the pawn is moving: a tenth of a second of standing
+    /// there after the stick goes over, and of held stride after it comes back,
+    /// at every start and every stop. Both must land within a couple of frames.
+    #[test]
+    fn the_legs_start_and_stop_with_the_player_not_with_the_window() {
+        let mut anim = WalkAnim::default();
+        let mut started = None;
+        for i in 0..30 {
+            if frame(&mut anim, 60.0, 60.0) != IDLE_FRAME {
+                started = Some(i);
+                break;
+            }
+        }
+        assert!(matches!(started, Some(i) if i <= 2), "legs started at {started:?}");
+
+        for _ in 0..60 {
+            frame(&mut anim, 60.0, 60.0);
+        }
+        let mut stopped = None;
+        for i in 0..30 {
+            if frame(&mut anim, 0.0, 60.0) == IDLE_FRAME {
+                stopped = Some(i);
+                break;
+            }
+        }
+        assert!(matches!(stopped, Some(i) if i <= 4), "legs stopped at {stopped:?}");
+    }
+}

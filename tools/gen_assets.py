@@ -446,11 +446,51 @@ def gen_soldier(path, size=SOLDIER_FRAME):
     write_png(path, size * cols, size * SOLDIER_DIRS, rows, color_type=6)  # RGBA
 
 
-def gen_tracer(path, w=32, h=8):
-    """Tracer streak pointing +x: bright rounded head, tail fades out."""
+def gen_tracer(path, w=64, h=8):
+    """Tracer streak pointing +x: no head, just a bolt that fades out at BOTH ends.
+
+    There is no bullet in this game's picture any more — the sprite is the whole
+    of what a shot looks like, drawn `STREAK_TRAVELS` frames' worth of flight
+    long, so what wants drawing is a long bolt rather than a projectile with a
+    tail. Hence a tip that fades and a trail that fades, and nothing solid at
+    either end to read as an object.
+
+    **Whether the length may carry a profile at all depends on the stretch, and
+    that is the whole history of this sprite.** The engine lays one copy per
+    frame, spaced by a frame's travel, and the eye integrates several — so a
+    profile is stamped out repeatedly and any lengthwise variation ripples at one
+    cycle per frame's travel. The ripple goes as `2 / k`, where `k` is how many
+    frames' travel a copy covers:
+
+      * At `k = 1` — a per-frame smear — the copies ABUT and every shape is at
+        its worst. A ramped 0 -> 1 profile measured a **256% of mean** ripple and
+        was reported, twice, as "a bunch of bullets lined up tip to tip" and then
+        "still looks like lots of bullets. Maybe it's an illusion due to the
+        limited frame rate?" It was exactly that, and flat (5%) was the only fix.
+      * At `k = 20` the copies overlap twentyfold, the ripple is down around 10%,
+        and a shaped profile is affordable again — which is what makes the fades
+        below safe where they were not before.
+
+    So: if the stretch ever comes back down toward one frame's travel, this has
+    to go flat again. The two are one decision, not two.
+
+    The tail eases in over five times the length the tip eases out over. That
+    asymmetry is what still says which way the round was going, now that neither
+    end is a head.
+    """
     cy = h / 2
     r = h / 2 - 1
-    tail_x, head_x = r + 1, w - r - 1
+    tail_x, head_x = r, w - r
+    # Halved from 0.55: with the length already capped at the round's flown
+    # distance, easing the trail in over more than half of it was what made a
+    # shot read short. Fading over a quarter roughly doubles how much of the
+    # bolt is actually lit without touching how far it reaches.
+    tail_fade, tip_fade = 0.27, 0.11  # fractions of the length
+
+    def smooth(v):
+        v = max(0.0, min(1.0, v))
+        return v * v * (3.0 - 2.0 * v)
+
     rows = []
     for y in range(h):
         row = bytearray()
@@ -458,8 +498,9 @@ def gen_tracer(path, w=32, h=8):
             px, py = x + 0.5, y + 0.5
             d = _seg_dist2(px, py, tail_x, cy, head_x, cy) ** 0.5
             edge = max(0.0, min(1.0, r - d + 0.5))  # soft capsule edge
-            f = max(0.0, min(1.0, (px - tail_x) / (head_x - tail_x)))
-            row += bytes((255, 255, 255, int(edge * f ** 1.5 * 255)))
+            f = (px - tail_x) / (head_x - tail_x)
+            along = smooth(f / tail_fade) * smooth((1.0 - f) / tip_fade)
+            row += bytes((255, 255, 255, int(edge * along * 255)))
         rows.append(row)
     write_png(path, w, h, rows, color_type=6)  # RGBA
 

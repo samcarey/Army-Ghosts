@@ -425,11 +425,18 @@ nothing.
   is worth about a tenth of that. Both scalings have floors (`DAMAGE_EDGE_FRAC`
   30%, `DAMAGE_FAR_FRAC` 45% beyond `DAMAGE_FAR`), and damage is floored at 1: a
   hit is never worth nothing. Range is free of extra state — every round flies at
-  `BULLET_SPEED`, so the ticks it has burned *are* its range.
-  The part worth understanding is the **sweep**. A bullet covers 16 units a tick
-  against a 24-unit pawn, so the old point-in-circle test on the post-move
-  position was both tunnelling and unable to answer "how centered": a dead-center
-  shot whose sampled position happened to land near the rim read as a graze.
+  `BULLET_SPEED`, so the ticks it has burned *are* its range. **That is also what
+  made raising `BULLET_SPEED` safe**: `travelled` is worked out as
+  `(BULLET_TTL - ttl) * BULLET_SPEED`, so `DAMAGE_NEAR`/`DAMAGE_FAR` stay the
+  distances they claim to be rather than silently becoming five times further out.
+  `BULLET_TTL` stopped being the range limit at the same time — a round now leaves
+  the arena in ten ticks and `move_bullets` despawns it at the wall.
+  The part worth understanding is the **sweep**. A bullet covers **80 units a
+  tick** against a 24-unit pawn — more than three pawn diameters — so the old
+  point-in-circle test on the post-move position was both tunnelling and unable
+  to answer "how centered": a dead-center shot whose sampled position happened to
+  land near the rim read as a graze. It was already wrong at the 16 units a tick
+  rounds used to fly; at this speed a point test would miss almost everything.
   Rounds are now tested against the whole tick's travel as a segment, and the
   centeredness is the perpendicular distance from the pawn to the shot *line*,
   not to the contact point — a round entering someone's edge at the very end of a
@@ -1167,7 +1174,7 @@ nothing.
     feet stand on `Pos` and the body rises above it — except prone, which is
     anchored mid-body, because that is what a horizontal figure pivots around.
     `animate_players` re-anchors on every stance change.
-  * Shots therefore have to be lifted (`muzzle_lift`: 22 px standing, 3 px
+  * Shots therefore have to be lifted (`muzzle_lift`: 26 px standing, 3 px
     prone) or tracers and the ADS aim line appear to leave the soldier's boots.
     Bullets carry the lift they were FIRED at in a render-only `MuzzleLift`
     (the shooter may stand up mid-flight); trails and the aim line apply it too.
@@ -1413,9 +1420,16 @@ nothing.
   of your knee; at 4-and-southern a few still sprouted above the bottom of your
   boot; at 4-and-middle the worst case is 2 units either way.
   Consequences: the whole band `Z_SORT_LO..Z_SORT_HI`
-  (0.1..1.8) is spoken for, so bullets (2.0), trails (1.9), the ADS aim line
+  (0.1..1.8) is spoken for, so bullets (2.0), the ADS aim line
   (1.85) and bush canopies (2.5) must stay above it; and boulders now sort with
   pawns, so you can walk behind one as well as in front of it.
+  **Bullets stay above the band on purpose and are hidden by ALPHA instead**
+  (see "A round is hidden the same way its shooter is"). A tracer covers 16 px a
+  frame across 4-unit bands, so sorting it in would blink it out behind a tuft
+  and back four times per frame — flicker, not cover. The fade is also the more honest half of the
+  choice rather than a consolation for it: grass depth is a FIELD, so what a
+  round crosses is the whole sight line back to your eye, where sorting can only
+  ever answer for whichever clumps happen to have been baked in front of it.
   The predecessor was a "curtain": a band of blades parented to each pawn and
   scaled by `grass_cover`. Do not go back to it. Grass that moves with you reads
   as grass you are *wearing*, and it covered heads while boots stuck out.
@@ -1661,8 +1675,222 @@ nothing.
   across the body so someone edging out of cover fades in rather than pops, and
   the local pawn never fades); terrain only gets `TERRAIN_SHADOW_SCALE` (0.5)
   of it. Cover is therefore total against players while the ground behind it
-  merely dims, so you keep a sense of terrain you can't see into. NOTE bullets
-  and tracers are NOT faded — a hidden enemy's shots still show.
+  merely dims, so you keep a sense of terrain you can't see into.
+- **A round is hidden the same way its shooter is** (`fade_hidden`'s second
+  loop, over `Bullet`) — the same two terms against the same casts, so the
+  tracer and the man agree about what the ground between you is worth.
+  **It used to be exempt** ("a hidden enemy's shots still show"), and that note
+  was written before `sound.rs` existed: once gunfire had an audible bearing with
+  honest doubt in it, a full-strength tracer out of deep grass handed over the
+  same information exactly and for free. It undercut the arcs, and through them
+  the concealment model the arcs were built to make survivable. Reported from
+  play as the bullets being "way too visible in general".
+  * **A ROUND IS A POINT, NOT A COLUMN**, and this took two goes to get right.
+    `grass_block`'s per-step share is *how much of a body standing on the ground
+    and reaching up to `target_h` this step's grass stands over* — exactly right
+    for a pawn. Asked the same way about a round at 44 units it answered "the
+    bottom 31 of this 44-tall thing is behind grass, 70% covered", when what is
+    at 44 is a single round in clear air over blades that stop at 31. A phantom
+    body was standing under every tracer and drowning it. Reported as *"I still
+    can't see bullets that should be above the grass when my player's head is
+    also above the grass unless I am right next to them"*.
+    `grass_block_span` takes a vertical span `lo..hi` instead, and `lo = 0`
+    reproduces the body case EXACTLY — so pawns, fog tiles, `visible_fraction`
+    and the strip table are untouched, which the sim suite confirms by passing
+    unchanged. A round is given its own `BULLET_R` as its extent, so the
+    changeover is sharp, which is what a two-unit object crossing a grass line
+    does.
+  * **What that buys is the rule the whole model claims: grass hides what is
+    shorter than it.** Across a wall of grass 30 deep a standing rifle's round
+    reads **1.000**; across the deepest the field holds, **0.016**. Down the
+    documented lane at 15/30/60/120 units: standing fire 1.000/1.000/1.000/1.000,
+    crouching 1.000/1.000/0.328/0.004, prone 0.629/0.398/0.094/0.000 — the
+    stance ordering intact, and the rifle's height deciding where each dies.
+  * **A tracer may now be PLAINER than the man who fired it, and that is
+    correct.** The old test asserted the opposite and passed only because of the
+    bug above: a body from boots to helmet has its lower half in the sward (the
+    man reads 0.973/0.914/0.707/0.395 across the same ranges) while a round above
+    the blades is simply visible. The assertion that survives is the ordering by
+    stance, which is what was always the real claim.
+  * **It must be `STANCE_MUZZLE_H` and NEVER `render::STANCE_MUZZLE_LIFT`**, and
+    getting that wrong is a bug this shipped once. The lift is how far up the
+    SCREEN to draw a tracer so it does not leave the soldier's boots — a
+    projected offset, foreshortened by `sin(tilt)` and scaled by the sprite,
+    which is the exact confusion `STANCE_HEIGHT`'s own doc comment warns about.
+    Fed to the concealment model it flew every round at a little over half its
+    true height: 26 units instead of 44 standing. Reported from the tracer range
+    — *"standing above the bushes I cannot see the bullet trails coming through
+    the bushes even from the standing shooter... the grass is not that tall"* —
+    and that reading was exactly right, because the grass there is 31 deep and a
+    real rifle at 44 clears it while a phantom one at 26 does not. **Fixing it
+    alone was not enough** — it took a round from invisible to merely faint,
+    because the phantom COLUMN in the bullet above was still standing under the
+    corrected height. The two are one bug reported twice, and only the pair of
+    fixes together makes a tracer above the grass read as above the grass.
+    The physical heights were RECOVERED from the drawn lift rather than guessed,
+    by undoing the projection: 26.3 px drawn is 43.8 units, 19.9 is 27.9, 3.0 is
+    6.0. And note what hid it for so long: the two tests that print these numbers
+    were asking `muzzle_lift` as well, so they went on reporting a consistent —
+    and consistently wrong — table. A test that shares the code's mistake states
+    it rather than catching it.
+  * **Read that curve the right way round: it fades the SHOOTER'S end, not
+    yours.** Grass needs a sight line's whole length to work, so a round closing
+    on you brightens as it comes — you see rounds snapping past and not where
+    they were fired from, which is the same bargain everything else here makes.
+    `a_round_is_harder_to_see_than_the_man_who_fired_it` pins the ORDER (a tracer
+    is never plainer than the soldier it left; prone fire is never plainer than
+    standing) plus that near-miss floor, so it survives tuning.
+  * **One sample point, not the body's five.** The five are what make someone
+    edging out of cover fade in rather than pop; a round crosses a whole penumbra
+    in a tick and a half.
+  * **Stir is 0**, same as the fog tiles: stir is a body's own movement betraying
+    the grass it is buried in, and a round is not buried in anything. What firing
+    costs the SHOOTER is `Aim::flash`, charged in the sim where both eyes see it.
+  * **NOTHING is exempt — not your own side, not your own rifle.** Exempting
+    them "exactly as for pawns" was shipped once and reported within the hour:
+    *"if I lay down prone in tall grass and fire, I can see my bullets all the
+    way to the edge of the screen even if they pass through bushes"*. **The pawn
+    exemption does not transfer, and it is worth knowing why it doesn't.** It
+    exists because a squad whose status you cannot read is unplayable without
+    respawns — a teammate is someone you need to KNOW ABOUT, so the fog is
+    deliberately not a pure statement about sight lines for them. A round is not
+    anybody; it is an object lying in the world, and whether you can see one is
+    nothing but line of sight. `fade_hidden`'s round loop therefore does not
+    query `Bullet` at all any more, so there is no ownership left in it to branch
+    on. Measured, a shooter's view of HIS OWN tracer at 16 (the muzzle) /30/60/
+    120 units: standing 0.812/0.562/0.172/0.000, crouching 0.617/0.375/0.086/
+    0.000, prone 0.164/0.035/0.000/0.000 — fire from the dirt is a flicker at the
+    barrel and then nothing, which is also what it is in life.
+    `a_prone_shooter_cannot_watch_his_own_round_leave` pins it, including the
+    guard that stops the cure being worse than the disease: on BARE ground you
+    watch your rounds go whatever you are lying in, or this reads as the tracer
+    being broken rather than as the terrain doing something.
+  * **What tells you that you FIRED was never the tracer**: the trigger bar
+    lights up, the recoil goes on the cone, and `ads.rs`'s aim line says where
+    the barrel points. Those are statements about your own weapon, so none of
+    them is on this system's ledger — which is what makes it safe for a round to
+    be as hidden from its shooter as from anybody else.
+  * **The trail is baked, not re-asked.** A segment takes its bullet's fade at the
+    moment it is laid down and keeps it, which is why `render::bullet_trails` runs
+    AFTER `fade_hidden` in `main.rs`. Before it, every burst got one
+    full-strength segment per frame — and the muzzle end, the one pointing
+    straight back at the shooter, would have been the brightest thing on screen.
+  * **Rounds fly at 80 units a tick** (`BULLET_SPEED`, raised 5x), which crosses
+    the arena in about a fifth of a second and crosses `ENGAGE_RANGE` in three
+    ticks. Two knock-ons worth knowing before reading any measured number in this
+    file: firefights are effectively **hitscan**, so nobody dodges; and **leading
+    a moving target is worth about a fifth of what it was**, since `bot.rs`
+    divides the flight time by this constant. `skill` is the dial that gates
+    leading (`LEAD_SKILL`) and the one the harness had measured at about +162
+    elo. **Re-measured at this speed it is about -50 and undecided** (60 pairs,
+    24 of 56 decisive, LLR -2.765 against a -2.944 bound) — so leading has
+    stopped paying, and is if anything now leaning the wrong way. Treat every
+    other dial figure in this file the same way until it is re-run: they were all
+    measured on rounds that took five times as long to arrive. The same run puts
+    the mean round at 24.5 s of fighting with 9.7% drawn, against the 33 s / 12%
+    recorded before — engagements resolve faster because they resolve on
+    contact.
+  * **ONE SPRITE IS THE WHOLE TRACER, AND THERE IS NO BULLET IN IT**
+    (`render::sync_transforms`'s bullet loop). `tracer.png` is drawn
+    `STREAK_TRAVELS` (20) frames' flight long — about **1600 px**, longer than
+    the arena — and fades out at BOTH ends, so a shot reads as a bolt down its
+    whole line rather than as an object travelling along one. That suits rounds
+    that are now effectively hitscan.
+    - **The length is ALSO capped at how far the round has actually flown**
+      (from its `ttl`, which the sim already tracks). A trail cannot precede the
+      shot, and without the cap a round fresh out of the barrel trailed 1600 px
+      of bolt back THROUGH its own shooter and out the far side — which reads,
+      exactly and wrongly, as a man firing the other way. Caught in a screenshot
+      of the range, having been predicted and then waved away on the grounds that
+      the faded end would hide it: the fade spans 880 px, so most of that tail
+      was plainly visible. Since no round outlives the arena, the cap means the
+      bolt in practice always reads as a line from where the shot came from to
+      where it has got to.
+    `tracer.png` is already a 32x8 gradient streak — bright rounded head, tail
+    fading to nothing — and it is now stretched along the velocity to cover
+    exactly the ground the round crossed THIS FRAME: head on the true `Pos`,
+    tail reaching back to where it was drawn last, so the quad is centred half a
+    frame's travel behind the round. Stretching to the TRAVEL rather than to a
+    fixed length is what keeps it continuous at any frame rate — the streak is
+    always the smear the round actually made, so consecutive frames abut instead
+    of leaving gaps on a slow phone or piling up on a 120 Hz one. Clamped to
+    `BULLET_LEN_MIN`..`BULLET_LEN_MAX` (13..48), the top end being three frames'
+    travel: enough for a phone well under the tick rate, while a rollback
+    teleport is capped instead of drawn as a stripe across the arena.
+    - **It replaced a chain of per-frame `TrailSegment` rectangles**, reported
+      exactly as it looked: *"a single shot with its trail looks like a bunch of
+      bullets and trails lined up tip to tip"*. Three things made it read that
+      way. Each segment carried a UNIFORM alpha, so the tail was BANDED rather
+      than graded. Consecutive segments stepped in brightness once per frame —
+      and once concealment was baked into them they could step back UP, which no
+      single object ever does. And each segment was a frame's travel, 16 px,
+      against a 9 px bullet, so **every dash in the chain was larger than the
+      round leading it**.
+    - **THE SPRITE MUST BE FLAT ALONG ITS LENGTH**, and this is the part that was
+      got wrong twice. Deleting the chain was necessary and not sufficient: the
+      texture still ramped 0 -> 1 down its length, and since each frame lays one
+      streak end to end with the last, ANY lengthwise profile is stamped out
+      repeatedly at the spacing of a frame's travel. The eye integrates several
+      frames, so a bright-head/fading-tail profile integrates to bright, dark,
+      bright, dark — reported as *"still looks like lots of bullets. Maybe it's
+      an illusion due to the limited frame rate?"*, which is exactly what it was.
+      Measured on the alpha profile at `k = 1`: the ramp put a **256% of mean**
+      ripple into the integrated image, and flat brought it to **5%** (the
+      rounded end caps).
+    - **THE PROFILE AND THE STRETCH ARE ONE DECISION.** The ripple goes as
+      `2 / k`, where `k` is how many frames' travel a copy covers. At `k = 1` the
+      copies ABUT and every shape is at its worst, so a per-frame smear must be
+      flat. At `k = 20` they overlap twentyfold and the ripple is nil — measured
+      0% for the faded profile the sprite now carries, against 165% for the same
+      profile at `k = 1`. So the fades are affordable *because of* the stretch:
+      bring `STREAK_TRAVELS` back toward 1 and `gen_tracer` has to go flat again.
+      Neither constant can be moved on its own.
+      `gen_assets.py`'s `gen_tracer` is flat now and must stay flat — a gradient
+      is the right shape for a trail that remembers where it has been and the
+      wrong one for a single frame's exposure, which is what this is. A camera
+      exposing a moving point light produces a uniform streak.
+    - Its total light did NOT go up in the process: evenly lit at 16x1.5 is about
+      what the old 9x1.5 bullet plus its five dashes came to, so the change
+      reorganises the light into one object rather than adding any.
+    - **The teleport guard clamps the TRAVEL, not the drawn length**
+      (`STREAK_MAX_TICKS`, 3 ticks' flight). The length is whatever
+      `STREAK_TRAVELS` makes of an honest travel, so guarding the input is the
+      only place a guard means anything — and a literal length cap has already
+      been wrong once, as a hardcoded 48 that was three frames at the old bullet
+      speed and less than ONE at the new one.
+    - **A round's first frame is credited one tick's flight**, since it has no
+      previous position to measure from. Without that every shot opened on a stub
+      and jumped to full length a frame later.
+    - **Bullets carry `NoFrustumCulling`.** The streak is longer than the arena
+      and centred half its own length behind the round, so its centre is often
+      off screen while most of it is not — and a sprite's `Aabb` comes from a
+      `custom_size` this rewrites every frame, which is the same stale-bounds
+      shape that blinks the fog out.
+    - **The length is held across a frame in which the round did not move.** A
+      phone rendering above the tick rate sees no travel on half its frames, and
+      a streak that collapsed to its minimum on those would pulse at the beat
+      between the two clocks — the same trap `PACE_WINDOW` exists for on the walk
+      cycle.
+    - Gone with the chain:
+      `TrailSegment`, `TrailState`, `bullet_trails`, `Z_TRAIL` and four constants
+      — plus the ordering constraint that `bullet_trails` had to follow
+      `fade_hidden`, which now cannot be got wrong because there is nothing to
+      order.
+    - What is LOST is that segments outlived their bullet, so a trail lingered
+      briefly past an impact. Judged not worth a second entity: the streak is the
+      smear of a moving object, and there is no moving object once it has hit.
+    - The bearing comes off `Bullet::vx/vy`, NOT off the transform's own rotation
+      that `attach_sprites` set at spawn — reading back the thing you are about
+      to write is how a rounding error becomes a drift.
+  * See it: **`?scenario=tracers`** (`AG_SCENARIO=tracers`) — a firing line of
+    three, one per stance, shooting north across a ramp of known grass depths.
+    That rig is what this bullet should be judged against; the arena varies the
+    stance and the depth at once and holds neither still.
+  * The tracer itself was also **dimmed and shortened** (`BULLET_COLOR` amber
+    rather than near-white, 9x1.5 px rather than 14x2, `TRAIL_TTL` 0.09 s at
+    alpha 0.26). A trail is a LINE, and a line is the one shape that states a
+    bearing exactly; held long enough it draws the flight path back to the muzzle
+    and gives away free what a sound arc charges a wedge of doubt for.
 - **Why it's shaped the way it is** (each of these was a visible bug once):
   each shadow starts INSIDE its caster and ramps from nothing where a sight
   line enters the circle to full where it leaves, so cover is lit on the
@@ -1688,6 +1916,13 @@ nothing.
   rather than tense. `Aim::flash` already made firing cost concealment to the
   BOTS' eyes through the ordinary sighting path; this is the human's half of the
   same bargain.
+  * **It only says anything because the TRACER no longer does.** While a round
+    was drawn at full strength wherever it flew, the arc was competing with a
+    bright line that stated the same bearing exactly and for free, and losing.
+    Fading rounds by the same concealment model as their shooter (see "A round is
+    hidden the same way its shooter is") is what left this the channel that
+    carries at range — read the two together, because a change to either one
+    silently re-tunes the other.
   * **THE ARC IS THE PROBABILITY DISTRIBUTION, and that is the whole design.**
     The opacity across the wedge is a bell (`bell`, a half-cosine, full at the
     centre and exactly zero at both rims) and the bearing error is drawn from a
@@ -2066,6 +2301,46 @@ need a TURN server eventually.
     fired because of a rule of its own would be a second source of truth for the
     trigger. Its frame counter is a `Local` in `read_local_inputs` rather than
     the round clock, which does not run in a scenario at all.
+  * **`Scenario::Tracers` is the third rig: the tracer range** (`?scenario=tracers`,
+    `AG_SCENARIO=tracers`) — a firing line of three, one per stance, all shooting
+    NORTH across a ramp of known grass depths, with a bush standing in each lane.
+    It exists because "a round is hidden the same way its shooter is" (above) is
+    decided by exactly two numbers — the shooter's `MuzzleLift` and the depth on
+    the line to your eye — and in the arena both vary at once with nothing
+    holding either still.
+    - **The layout IS the experiment.** Depth is a function of `y` alone, so the
+      three lanes differ ONLY in stance; all three fire on the same tick, so
+      three tracers dying at three distances is one readable comparison rather
+      than three events. Bands: 5 of `TRACER_BAND_H` (90) running north, depth
+      `band * GRASS_MAX_H / 4` — measured **0 / 15 / 31 / 46 / 62**, which lands
+      band 1 exactly on a prone pawn's height and band 4 on the field's own
+      ceiling.
+    - **Band 0 is BARE on purpose**, and so is everything south of the line: a
+      round wants somewhere to be plainly visible before it starts losing itself,
+      and nobody's own footing should be part of what is being looked at.
+    - **The ramp is the whole gamut, and deliberately stops short of burying a
+      standing pawn.** `GRASS_MAX_H` (62) is under `STANCE_HEIGHT[0]` (64), so no
+      ground in this game hides a man on his feet — a rig that managed it would
+      be showing something the arena cannot.
+      `the_tracer_range_ramps_from_bare_ground_to_the_deepest_grass_there_is`
+      pins both ends, and caught exactly that mistake being written in.
+    - **The scene has to fit the arena at BOTH ends**, and the first draft
+      didn't: 6 bands of 90 fit going north and put the player's own spawn,
+      `TRACER_STANDOFF` behind the line, at y = -340 in a world that stops at
+      -300. The test now checks the south end too.
+    - **It fires north and you start south, and that is a safety rule.** Nothing
+      on the range is friendly, rounds do full damage, and a scenario has no
+      round clock and therefore no respawn — walk up a lane and the demo is over
+      until you reload. The lane bushes are what mark where the lanes are.
+    - **The line is forced onto side 1**, not the sides `default_side` would have
+      alternated them onto: a middle lane that happened to be a teammate would
+      draw at full opacity under a nameplate while its neighbours faded, which is
+      three lanes differing in something other than the one variable.
+    - **No boulders** — a rock DESPAWNS a round, which would read as the grass
+      having hidden it, and that is the one confusion the scene exists to remove.
+    - `Scenario::idle_stance` had to grow a HANDLE parameter for this: one
+      shooter of each stance is the whole point, and a single answer for every
+      idle pawn cannot say that.
 - **`tools/grass-shots.sh [outdir]`** — that scene, photographed. Numbers can
   stay put while the picture rots, so this is the companion to the table above:
   it runs `grass-table.sh` first and takes both the depths AND each frame's

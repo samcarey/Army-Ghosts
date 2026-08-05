@@ -54,9 +54,11 @@ use bevy::sprite_render::{AlphaMode2d, Material2d, Material2dKey, Material2dPlug
 use bevy_ggrs::LocalPlayers;
 
 use army_ghosts_sim::{
-    Aim, Block as SimBlock, Bush, Player, Pos, Rock, Scenario, Stance, Team, ARENA_HALF_H,
+    Aim, Block as SimBlock, Bullet, Bush, Player, Pos, Rock, Scenario, Stance, Team, ARENA_HALF_H,
     ARENA_HALF_W, FP, PLAYER_R, STANCE_HEIGHT,
 };
+
+use crate::render::MuzzleLift;
 
 /// Unlit ground: dark enough to read as "no information", light enough to tell
 /// apart from the out-of-arena clear color. Authored in sRGB like every other
@@ -638,6 +640,29 @@ fn grass_conceal(
 /// [`grass_conceal`] over an arbitrary depth field, rather than whichever one
 /// the scenario supplies. `vision/strip_table.rs` is what needs it: the table
 /// sweeps depths the arena doesn't contain.
+/// [`grass_conceal`] for a small object held at `height` off the ground — a
+/// round in flight — rather than a body standing on it.
+///
+/// The difference is not a detail. A body is hidden in PROPORTION to how far up
+/// it the grass reaches; a round is either behind the blades or above them, and
+/// asking the body question about one put a phantom 44-unit column under every
+/// tracer and buried it in grass its rifle plainly cleared. It is given the
+/// bullet's own radius as its extent, so the changeover is sharp, which is what
+/// a two-unit object crossing a grass line actually does.
+fn grass_conceal_point(scenario: &Scenario, eye: Vec2, eye_h: f32, at: Vec2, height: f32) -> f32 {
+    let r = army_ghosts_sim::BULLET_R;
+    let h = height.round() as i32;
+    let block = army_ghosts_sim::grass_block_span(
+        to_pos(eye),
+        eye_h as i32,
+        to_pos(at),
+        h - r,
+        h + r,
+        |x, y| scenario.depth(x, y),
+    );
+    block.conceal() as f32 / FP as f32
+}
+
 fn grass_conceal_in(
     eye: Vec2,
     eye_h: f32,
@@ -716,6 +741,48 @@ fn eye_height(stance: &Stance) -> f32 {
 /// The grass term multiplies with that — two independent ways of not being seen,
 /// so a bush in front of a pawn already lying in deep grass compounds.
 ///
+/// **A round in flight is hidden the same way its shooter is**, by the same two
+/// terms against the same casts. It used to be exempt — the note here read "a
+/// hidden enemy's shots still show" — and that was written before `sound.rs`
+/// existed. Once gunfire got an audible bearing with honest doubt in it, a
+/// full-strength tracer out of deep grass was the same information for free and
+/// exactly: it undercut the arcs, and it undercut the concealment model those
+/// arcs were built to make survivable. A round is now the one thing a hidden
+/// shooter gives away only as far as the ground between you allows.
+///
+/// Three things about how it is asked, all different from a pawn:
+///   * **EVERY round is faded, including your own and your own side's.** The
+///     side exemption below is about pawns and does NOT transfer, and shipping
+///     it here was a real bug: lie prone in deep grass, fire, and you watched
+///     your own tracer sail to the edge of the screen through grass and bushes
+///     that stop everything else. The exemption exists because a squad whose
+///     status you cannot read is unplayable without respawns — a teammate is
+///     someone you need to KNOW ABOUT. A round is not; it is an object lying in
+///     the world, and whether you can see one is nothing but line of sight.
+///     What you see of your own fire is now what the ground in front of you
+///     allows, which is also the honest answer: a rifle fired from the dirt puts
+///     its rounds under the grass immediately, and the man firing it cannot
+///     watch his own fall of shot either.
+///   * **Its height is its [`MuzzleLift`]**, so what hides it is what the
+///     shooter's own stance put the rifle at. Prone fire skims at 3 units and
+///     nearly nothing lets it through; standing fire flies at 26 and clears the
+///     shallower half of the map. That is the stance system paying out one more
+///     time, for free, from a number the renderer already had.
+///   * **One sample point, not five.** The five across a pawn are what make
+///     someone edging out of cover fade in rather than pop; a round is a point
+///     travelling 16 units a tick, and it will have crossed the whole penumbra
+///     before anyone could see it do anything else.
+///
+/// The feedback that you FIRED does not come from the tracer and never did —
+/// the trigger bar lights up, the recoil is on the cone, and `ads.rs`'s aim line
+/// says where the barrel points. Those are statements about your own weapon, so
+/// they are not on this system's ledger at all.
+///
+/// Stir is 0 for the same reason the fog tiles pass 0: stir is a body's own
+/// movement betraying the grass it is buried in, and a round is not buried in
+/// anything — it flies over the top. What its firing costs the SHOOTER in
+/// concealment is [`Aim::flash`], charged in the sim, where both eyes can see it.
+///
 /// **Your own side is exempt.** Teammates are drawn at full opacity wherever
 /// they are, which is a deliberate departure from "you see what your pawn can
 /// see": in a game without respawns, not knowing whether the four people you are
@@ -734,11 +801,22 @@ type Faded = (
     &'static mut Sprite,
 );
 
+/// A round in flight as the fade reads it: where it is, how high it is flying,
+/// and the sprite whose alpha says how much of that reaches you.
+///
+/// It deliberately does NOT include `Bullet`. Whose round this is has no bearing
+/// on whether you can see it, and the version that asked let a prone shooter
+/// watch his own tracer cross the map through grass that stops everything else.
+/// Not querying the component is what makes that unwritable rather than merely
+/// fixed.
+type Round = (&'static Pos, &'static MuzzleLift, &'static mut Sprite);
+
 pub fn fade_hidden(
     local_players: Option<Res<LocalPlayers>>,
     rocks: Query<(&Rock, &Pos)>,
     bushes: Query<(&Bush, &Pos)>,
     mut players: Query<Faded, With<Player>>,
+    mut rounds: Query<Round, (With<Bullet>, Without<Player>)>,
     scenario: Res<Scenario>,
 ) {
     let Some(local) = local_players else { return };
@@ -789,6 +867,18 @@ pub fn fade_hidden(
             .color
             .set_alpha(((1.0 - hidden) * (1.0 - grass)).clamp(0.0, 1.0));
     }
+
+    // No exemption here — see the note above. A round is an object in the world,
+    // not a squadmate whose status you are owed.
+    for (pos, lift, mut sprite) in &mut rounds {
+        let (x, y) = pos.to_f32();
+        let round = Vec2::new(x, y);
+        let hidden = coverage_at(&casts, round);
+        let grass = grass_conceal_point(&scenario, viewer, viewer_h, round, lift.height());
+        sprite
+            .color
+            .set_alpha(((1.0 - hidden) * (1.0 - grass)).clamp(0.0, 1.0));
+    }
 }
 
 /// The concealment table generator (`tools/grass-table.sh`).
@@ -798,6 +888,128 @@ mod strip_table;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A round is hidden by the grass its SHOOTER'S STANCE put the rifle
+    /// behind — and, crucially, is NOT hidden by grass the rifle clears.
+    ///
+    /// **This test used to assert that a tracer is never plainer than the
+    /// soldier who fired it, and that was an artefact of a bug.** It held only
+    /// while a round was modelled as a column standing on the ground reaching up
+    /// to the muzzle, which put a phantom body under every tracer and drowned it
+    /// in grass the rifle plainly cleared. A round is a POINT: over blades that
+    /// stop below it, it is simply visible, while the man behind it — boots to
+    /// helmet — still has his lower half in the sward. So a tracer being plainer
+    /// than its shooter is correct, and was the whole complaint.
+    ///
+    /// What survives is what was always the real claim: **visibility follows the
+    /// rifle's height**, so the lower the stance the less of the round's flight
+    /// can be seen. Stated as an ORDER so it survives tuning.
+    #[test]
+    fn a_round_is_hidden_by_grass_that_out_tops_the_rifle_and_not_by_grass_that_does_not() {
+        let h = |level: usize| STANCE_HEIGHT[level] as f32;
+        let muzzle = crate::render::muzzle_height;
+        let viewer = Vec2::new(-150.0, 0.0);
+        let round = |height: f32, at: f32| {
+            1.0 - grass_conceal_point(&Scenario::Arena, viewer, h(0), Vec2::new(at, 0.0), height)
+        };
+
+        let ranges = [15.0, 30.0, 60.0, 120.0];
+        println!("  from (-150, 0) standing — sprite alpha at range   15    30    60   120");
+        let man: Vec<String> = ranges
+            .iter()
+            .map(|r| {
+                let at = Vec2::new(-150.0 + r, 0.0);
+                format!("{:.3}", 1.0 - grass_conceal(&Scenario::Arena, viewer, h(0), at, h(0), 0))
+            })
+            .collect();
+        println!("  the man himself   (h 64.0):            {}", man.join(" "));
+        for (what, stance) in [("standing", 0u8), ("crouching", 1), ("prone   ", 2)] {
+            let row: Vec<String> =
+                ranges.iter().map(|r| format!("{:.3}", round(muzzle(stance), -150.0 + r))).collect();
+            println!("  his {what} fire (h {:>4.1}):      {}", muzzle(stance), row.join(" "));
+        }
+
+        for range in ranges {
+            let at = -150.0 + range;
+            let (standing, crouching, prone) =
+                (round(muzzle(0), at), round(muzzle(1), at), round(muzzle(2), at));
+            assert!(
+                standing >= crouching && crouching >= prone,
+                "the lower the rifle the less of its fire shows: \
+                 {standing} / {crouching} / {prone} at {range}"
+            );
+        }
+        assert!(round(muzzle(2), -150.0 + 60.0) < 0.1, "fire from the dirt is gone by 60 units");
+        assert!(round(muzzle(0), -150.0 + 15.0) > 0.5, "a round snapping past you has to show");
+
+        // The positive half, which is the whole point of the fix: over grass the
+        // rifle out-tops, a round is plainly visible; in grass deeper than the
+        // rifle, it is not. Asked of the rig, which can be set to a known depth.
+        let over = Scenario::GrassStrip { depth: 30, east_stance: 0 };
+        let under = Scenario::GrassStrip { depth: army_ghosts_sim::GRASS_MAX_H, east_stance: 0 };
+        let across = |s: &Scenario| {
+            1.0 - grass_conceal_point(s, viewer, h(0), Vec2::new(150.0, 0.0), muzzle(0))
+        };
+        println!("  across a wall of grass: 30 deep {:.3}, deepest {:.3}",
+                 across(&over), across(&under));
+        assert_eq!(across(&over), 1.0, "grass below the muzzle must not hide a round at all");
+        assert!(across(&under) < 0.5, "grass above the muzzle must");
+    }
+
+    /// What a shooter sees of HIS OWN fire, which is the case that was reported
+    /// broken: lie prone in deep grass, fire, and the tracer used to sail to the
+    /// edge of the screen through grass and bushes that stop everything else.
+    ///
+    /// The cause was an exemption in `fade_hidden` for your own side, copied
+    /// from the rule that exempts teammate PAWNS. It does not transfer — a
+    /// teammate is someone whose status you are owed, a round is an object
+    /// lying in the world — and the loop now takes no `Bullet` at all, so there
+    /// is nothing left for it to branch on. What this test can still state is
+    /// the physical claim underneath: a rifle fired from the dirt puts its
+    /// rounds under the grass at once, and the man firing it is the one lying
+    /// lowest of all.
+    #[test]
+    fn a_prone_shooter_cannot_watch_his_own_round_leave() {
+        let h = |level: usize| STANCE_HEIGHT[level] as f32;
+        let muzzle = crate::render::muzzle_height;
+        let from = Vec2::new(-150.0, 0.0);
+        // The shooter's eye and his own round, down the same lane the table
+        // above uses.
+        let own = |stance: u8, range: f32| {
+            let at = Vec2::new(-150.0 + range, 0.0);
+            let eye = h(stance as usize);
+            1.0 - grass_conceal_point(&Scenario::Arena, from, eye, at, muzzle(stance))
+        };
+
+        // 16 is where a round is BORN — `PLAYER_R + BULLET_R + 2` down the
+        // barrel — so it is the closest a shooter ever sees his own fire, and
+        // the answer to "does pulling the trigger show me anything at all".
+        println!("  his own tracer, at range      16    30    60   120   250");
+        for (what, stance) in [("standing", 0u8), ("crouching", 1), ("prone   ", 2)] {
+            let row: Vec<String> =
+                    [16.0, 30.0, 60.0, 120.0, 250.0].iter().map(|r| format!("{:.3}", own(stance, *r))).collect();
+            println!("  {what}: {}", row.join(" "));
+        }
+
+        assert!(
+            own(2, 60.0) < 0.1,
+            "prone in this grass, your own round is gone by 60 units: {}",
+            own(2, 60.0)
+        );
+        assert!(
+            own(0, 30.0) > own(2, 30.0),
+            "standing has to see more of its own fire than prone does"
+        );
+        // Not a blindfold: on bare ground you watch your rounds go, whatever
+        // you are lying in — otherwise this reads as the tracer being broken
+        // rather than as the terrain doing something.
+        let bare = Scenario::GrassStrip { depth: 0, east_stance: 0 };
+        assert_eq!(
+            grass_conceal_point(&bare, from, h(2), Vec2::new(150.0, 0.0), muzzle(2)),
+            0.0,
+            "bare ground hides nothing, including your own fire"
+        );
+    }
 
     /// The properties the grass sight model is *for*. All of these are things a
     /// plausible-looking tweak to `GRASS_EXTINCTION` or the ray math has broken

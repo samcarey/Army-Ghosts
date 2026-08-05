@@ -43,7 +43,8 @@ use bevy_matchbox::prelude::*;
 
 use army_ghosts_sim::save::{self, Dials};
 use army_ghosts_sim::{
-    spawn_world, BotRoster, Save, Scenario, GRASS_MAX_H, MAX_PLAYERS, STANCE_STAND, TICK_HZ,
+    spawn_world, BotRoster, Save, Scenario, GRASS_MAX_H, MAX_PLAYERS, STANCE_STAND,
+    TRACER_LINE_STANCES, TICK_HZ,
 };
 
 use crate::menu::{Aggression, BotCount};
@@ -95,6 +96,10 @@ fn resolve_players(explicit: Option<usize>, has_room: bool, scenario: Scenario) 
         // about; whatever `players` said is noise.
         return 2;
     }
+    if matches!(scenario, Scenario::Tracers) {
+        // You plus one shooter per stance. Same reasoning, a wider scene.
+        return 1 + TRACER_LINE_STANCES.len();
+    }
     explicit
         .unwrap_or(if has_room { MAX_PLAYERS } else { 1 })
         .clamp(1, MAX_PLAYERS)
@@ -104,10 +109,11 @@ fn resolve_players(explicit: Option<usize>, has_room: bool, scenario: Scenario) 
 /// exceed [`MAX_PLAYERS`] — there are only that many spawn points. The rig is a
 /// fixed two-hander and takes none.
 fn resolve_bots(explicit: Option<usize>, players: usize, scenario: Scenario) -> usize {
-    if matches!(scenario, Scenario::GrassStrip { .. } | Scenario::Gunfire) {
-        // The gunfire demo takes none for a reason of its own: a bot would go
-        // hunting, and the whole point of the scene is ONE source of noise that
-        // stays where you left it.
+    if matches!(scenario, Scenario::GrassStrip { .. } | Scenario::Gunfire | Scenario::Tracers) {
+        // The gunfire demo takes none for a reason of its own, and the tracer
+        // range takes none for the same one: a bot would go hunting, and both
+        // scenes depend on the pawns staying exactly where they were put. What
+        // fires on the range is idle seats on a metronome, not a brain.
         return 0;
     }
     explicit.unwrap_or(0).min(MAX_PLAYERS.saturating_sub(players))
@@ -120,6 +126,10 @@ fn resolve_bots(explicit: Option<usize>, players: usize, scenario: Scenario) -> 
 /// * `strip:<depth>:<level>` — and the east pawn crouching (1) or prone (2)
 /// * `gunfire` — the arena with one pawn firing a round a second, for looking
 ///   at what gunfire sounds like (`client/src/sound.rs`)
+/// * `tracers` — the tracer range: a firing line of three, one per stance,
+///   shooting north across a ramp of known grass depths, for looking at what
+///   the concealment model does to a round in flight
+///   (`army_ghosts_sim::TRACER_LANE_GAP`)
 ///
 /// Ignored outright when a room is set: peers that disagree about which world
 /// they are in desync on the first tick, and nothing about this is worth that
@@ -133,6 +143,7 @@ fn parse_scenario(raw: Option<String>, has_room: bool) -> Scenario {
     match parts.next() {
         Some("strip") => {}
         Some("gunfire") => return Scenario::Gunfire,
+        Some("tracers") => return Scenario::Tracers,
         _ => return Scenario::Arena,
     }
     Scenario::GrassStrip {

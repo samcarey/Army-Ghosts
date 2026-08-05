@@ -110,12 +110,43 @@ pub fn muzzle_lift(level: u8) -> f32 {
     STANCE_MUZZLE_LIFT[(level as usize).min(STANCE_COUNT - 1)]
 }
 
+/// The rifle's PHYSICAL height for that stance, world units — the concealment
+/// model's number, not the renderer's. See [`army_ghosts_sim::STANCE_MUZZLE_H`]
+/// for why these are two constants and not one.
+pub fn muzzle_height(level: u8) -> f32 {
+    army_ghosts_sim::STANCE_MUZZLE_H[(level as usize).min(STANCE_COUNT - 1)] as f32
+}
+
 /// Render-only: the height a bullet's tracer flies at, fixed when it spawns
 /// from the stance its shooter fired in. Rollback re-spawns bullets, which
 /// re-runs `attach_sprites` against the rolled-back stance, so this stays
 /// correct through corrections.
+/// Two different numbers about one rifle, and **keeping them apart is the whole
+/// reason this is a struct**. `lift` is how far up the SCREEN to draw the
+/// tracer, foreshortened by the 3/4 projection; `height` is how high off the
+/// ground the round actually is. Using the first where the second was wanted
+/// flew every round at a little over half its true height and let grass bury
+/// shots a real rifle clears — see [`army_ghosts_sim::STANCE_MUZZLE_H`].
 #[derive(Component)]
-pub struct MuzzleLift(f32);
+pub struct MuzzleLift {
+    lift: f32,
+    height: f32,
+}
+
+impl MuzzleLift {
+    /// Screen offset, px — what `sync_transforms` draws with.
+    pub fn lift(&self) -> f32 {
+        self.lift
+    }
+
+    /// Physical height off the ground, world units — what grass has to beat, so
+    /// `vision::fade_hidden` reads this and never `lift`. A prone shooter's
+    /// rounds skim at 6 units and are buried by nearly anything; a standing
+    /// one's ride at 44 and clear most of the field.
+    pub fn height(&self) -> f32 {
+        self.height
+    }
+}
 
 /// Animation thresholds/cadence, world px/s. Full stick = 120 px/s (run);
 /// partial thumbstick deflection walks. One stride cycle per 36 px walked
@@ -251,19 +282,59 @@ const BUSH_FILL_PX: f32 = 30.0;
 /// see-through that a flat alpha used to have to do alone.
 const BUSH_ALPHA: f32 = 0.90;
 
-/// Bullet look: an elongated tracer rotated to its velocity angle.
-const BULLET_COLOR: Color = Color::srgb(1.0, 0.9, 0.4);
-const BULLET_LEN: f32 = 14.0;
-const BULLET_WIDTH: f32 = 2.0;
+/// Bullet look: `tracer.png` is a 32x8 gradient streak — bright rounded head,
+/// tail fading to nothing — stretched along the velocity to cover exactly the
+/// ground the round crossed this frame. **One sprite is the whole tracer.**
+///
+/// It used to be a short sprite plus a chain of per-frame `TrailSegment`
+/// rectangles, and that was reported exactly as it looked: *"a single shot with
+/// its trail looks like a bunch of bullets and trails lined up tip to tip"*.
+/// Three things made it read that way, and the third is the one that mattered.
+/// Each segment carried a UNIFORM alpha, so the tail was banded rather than
+/// graded. Consecutive segments stepped in brightness once per frame, and after
+/// concealment was baked into them they could even step back UP, which no single
+/// object ever does. And each segment was a frame's travel — 16 px — against a
+/// 9 px bullet, so every dash in the chain was LARGER than the round leading it.
+///
+/// The texture already did all of this properly, which is what makes deleting
+/// the chain a simplification rather than a trade: a gradient is what a capsule
+/// with a fading tail IS, and one stretched quad has no seams to band.
+const BULLET_COLOR: Color = Color::srgb(0.94, 0.70, 0.28);
+/// Narrow, because the streak is now EVENLY lit where it used to average about
+/// half its alpha down the gradient. One uniform 16x1.5 bar carries about the
+/// same total light as the old 9x1.5 bullet plus its five trail dashes did —
+/// the light is reorganised into one object rather than added to.
+const BULLET_WIDTH: f32 = 1.5;
+/// Shortest the streak is ever drawn — what a round gets on its first frame,
+/// before it has any travel to smear across.
+const BULLET_LEN_MIN: f32 = 13.0;
 
-/// Trail: each frame a bullet leaves a fading segment behind it. Render-only
-/// entities/state, never rollback-registered.
-const TRAIL_TTL: f32 = 0.15;
-const TRAIL_WIDTH: f32 = 1.25;
-const TRAIL_ALPHA: f32 = 0.45;
-/// A bullet moves 16 px/frame at 60 fps; anything much longer than a few
-/// frames' travel is a rollback teleport — skip it rather than streak it.
-const TRAIL_MAX_SEG: f32 = 48.0;
+/// How many frames' travel the streak covers. At 40, and at
+/// [`army_ghosts_sim::BULLET_SPEED`], that is about 3200 px — four times the
+/// arena, so in practice **this no longer decides anything**: the length is
+/// capped at how far the round has actually flown, and no round outlives the
+/// arena. It is the ceiling, and what is drawn is the honest muzzle-to-round
+/// distance. If a longer trail is wanted, the lever is the TAIL FADE in
+/// `gen_assets.py`, not this. A shot reads as a bolt drawn down its whole line rather
+/// than as an object travelling along it, and the tail duly reaches back past
+/// the muzzle it left — invisibly, because the sprite fades out at that end.
+///
+/// **It is coupled to the SHAPE of `tracer.png` and cannot be changed alone.**
+/// The engine lays one copy per frame spaced by a frame's travel, so a copy
+/// covering `k` frames' worth ripples the integrated image by about `2 / k`. At
+/// `k = 1` the copies abut and the sprite must be flat along its length or it
+/// reads as a row of bullets — measured at 256% ripple, and reported twice. At
+/// `k = 20` they overlap twentyfold, the ripple is nil, and the faded tip and
+/// tail this sprite now carries are affordable. Bring this back down toward 1
+/// and `gen_assets.py`'s `gen_tracer` has to go flat again.
+const STREAK_TRAVELS: f32 = 40.0;
+/// Most travel a single frame is believed to represent, as a multiple of one
+/// TICK's flight. Anything past this is a rollback teleport rather than flying —
+/// a round can be moved the width of the map between two frames — and is capped
+/// here, at the travel, rather than at the drawn length: the length is whatever
+/// [`STREAK_TRAVELS`] makes of an honest travel, so guarding the input is the
+/// only place the guard means anything.
+const STREAK_MAX_TICKS: f32 = 3.0;
 
 /// Marks a sprite that stands ON the ground, so its draw order comes from where
 /// it stands rather than from a fixed layer: `grass::y_sort` of its ground line,
@@ -286,16 +357,22 @@ pub struct Grounded {
     bias: f32,
 }
 
-/// Render-only per-bullet trail bookkeeping.
+/// Where this round was drawn last frame, so the streak can be stretched across
+/// the ground it has covered since. Render-only; never rollback-registered.
+///
+/// Stretching to the TRAVEL rather than to a fixed length is what keeps the
+/// tracer continuous at any frame rate: the streak is always exactly the smear
+/// the round made, so consecutive frames abut instead of leaving gaps at low
+/// rates or piling up at high ones.
 #[derive(Component, Default)]
-pub struct TrailState {
+pub struct Streak {
     last: Option<Vec2>,
-}
-
-/// One fading trail segment (independent entity; outlives its bullet).
-#[derive(Component)]
-pub struct TrailSegment {
-    ttl: f32,
+    /// The length last drawn, kept so a frame in which the round did not move
+    /// redraws the SAME bar rather than collapsing to the minimum. A phone
+    /// rendering above the tick rate sees no movement on half its frames, and a
+    /// streak that changed size on those would pulse at the beat between the two
+    /// clocks — the same trap `PACE_WINDOW` exists for on the walk cycle.
+    len: f32,
 }
 
 /// The tint every soldier wears, multiplied over the grayscale sheet: one bag of
@@ -358,9 +435,20 @@ const HURT_MIX: f32 = 0.65;
 
 const Z_GROUND: f32 = -10.0;
 /// Bullets and their trails ride ABOVE the y-sorted band: a round in flight is
-/// off the ground, and a tracer that disappeared behind a tuft would read as a
-/// bug rather than as cover.
-const Z_TRAIL: f32 = 1.9;
+/// off the ground, and a tracer that blinked out behind one tuft and back in
+/// after it — a round covers 16 px a frame across 4-unit bands, so four
+/// crossings every frame — would read as flicker rather than as cover.
+///
+/// **Grass hides a round by fading it, not by drawing over it**
+/// ([`crate::vision::fade_hidden`]), and that is the more honest half of the
+/// choice rather than a consolation for it: grass depth is a FIELD, so what a
+/// round crosses is the whole sight line back to your eye, not just whichever
+/// clumps happen to have been baked into a mesh in front of it. Sorting can only
+/// ever answer for the tufts that got drawn.
+///
+/// There is no separate trail layer any more — the tracer sprite IS the trail,
+/// so the round and its streak cannot come apart in the sort order the way two
+/// entities on two z's could.
 const Z_BULLET: f32 = 2.0;
 /// Cover draws *below* the fog mesh at z=5.0 (`vision.rs`) — on purpose: each
 /// shadow starts inside its own caster and rolls over its back, so the fog is
@@ -383,8 +471,10 @@ pub fn setup_scene(
     match *scenario {
         // The game: unzoomed, one world unit per pixel, following the pawn.
         // The gunfire demo is the game — walking around the noise at the scale
-        // you would actually hear it at is the whole exercise.
-        Scenario::Arena | Scenario::Gunfire => {
+        // you would actually hear it at is the whole exercise, and the tracer
+        // range is the same bargain: a round has to be judged at the size it is
+        // actually drawn, so zooming would be answering a different question.
+        Scenario::Arena | Scenario::Gunfire | Scenario::Tracers => {
             commands.spawn(Camera2d);
         }
         // The rig is a scene to be looked AT, not played: frame both pawns and
@@ -485,20 +575,30 @@ pub fn attach_sprites(
         // Fired from the shooter's rifle, wherever that was: a crawling
         // soldier's rounds skim the ground, a standing one's fly at chest
         // height. Frozen at spawn — the shooter may stand up mid-flight.
-        let lift = stances
+        let level = stances
             .iter()
             .find(|(p, _)| p.handle == bullet.owner)
-            .map(|(_, stance)| muzzle_lift(stance.level))
-            .unwrap_or(STANCE_MUZZLE_LIFT[0]);
+            .map(|(_, stance)| stance.level)
+            .unwrap_or(STANCE_STAND);
         commands.entity(entity).insert((
             Sprite {
                 image: tracer.0.clone(),
                 color: BULLET_COLOR,
-                custom_size: Some(Vec2::new(BULLET_LEN, BULLET_WIDTH)),
+                // Placeholder extent; `sync_transforms` restretches it every
+                // frame to the ground this round has actually covered.
+                custom_size: Some(Vec2::new(BULLET_LEN_MIN, BULLET_WIDTH)),
                 ..default()
             },
-            MuzzleLift(lift),
-            TrailState::default(),
+            MuzzleLift { lift: muzzle_lift(level), height: muzzle_height(level) },
+            Streak::default(),
+            // The streak is far longer than the arena and is centred half its
+            // own length BEHIND the round, so its centre is routinely off
+            // screen while most of it is not. A sprite's `Aabb` is derived from
+            // `custom_size`, which this one rewrites every frame — exactly the
+            // stale-bounds shape that blinks `vision.rs`'s fog out — so the
+            // cheapest correct answer is not to cull it at all. One short-lived
+            // quad per round in flight.
+            bevy::camera::visibility::NoFrustumCulling,
             Transform::from_xyz(0.0, 0.0, Z_BULLET)
                 .with_rotation(Quat::from_rotation_z(angle)),
         ));
@@ -647,55 +747,17 @@ pub fn update_health_visuals(
     }
 }
 
-/// Leave a fading streak behind each bullet: one segment per frame from its
-/// last rendered position, and age out old segments. Segments are independent
-/// entities so they linger (and fade) after the bullet despawns.
-pub fn bullet_trails(
-    mut commands: Commands,
-    time: Res<Time>,
-    mut bullets: Query<(&Pos, &MuzzleLift, &mut TrailState), With<Bullet>>,
-    mut segments: Query<(Entity, &mut TrailSegment, &mut Sprite)>,
-) {
-    let dt = time.delta_secs();
-    for (pos, lift, mut state) in &mut bullets {
-        let (x, y) = pos.to_f32();
-        let p = Vec2::new(x, y + lift.0); // match the lifted tracer
-        if let Some(last) = state.last {
-            let delta = p - last;
-            let len = delta.length();
-            if len > 0.5 && len <= TRAIL_MAX_SEG {
-                let mid = (p + last) / 2.0;
-                commands.spawn((
-                    // Slight overlength so consecutive segments overlap into
-                    // one continuous streak.
-                    Sprite::from_color(
-                        BULLET_COLOR.with_alpha(TRAIL_ALPHA),
-                        Vec2::new(len + 1.5, TRAIL_WIDTH),
-                    ),
-                    Transform::from_xyz(mid.x, mid.y, Z_TRAIL)
-                        .with_rotation(Quat::from_rotation_z(delta.y.atan2(delta.x))),
-                    TrailSegment { ttl: TRAIL_TTL },
-                ));
-            }
-        }
-        state.last = Some(p);
-    }
-    for (entity, mut segment, mut sprite) in &mut segments {
-        segment.ttl -= dt;
-        if segment.ttl <= 0.0 {
-            commands.entity(entity).despawn();
-        } else {
-            sprite
-                .color
-                .set_alpha(TRAIL_ALPHA * segment.ttl / TRAIL_TTL);
-        }
-    }
-}
-
 /// Mirror integer sim positions into render transforms.
+///
+/// A round is the one thing here that is not simply placed: it is SMEARED
+/// across the ground it covered since the last frame, which is what makes one
+/// stretched sprite a whole tracer (see [`BULLET_COLOR`]). The streak's bright
+/// head sits on the round's true `Pos` and its faded tail reaches back to where
+/// it was drawn last — so the sprite is centred half a frame's travel BEHIND
+/// the round, which is exactly where the light of a moving object was.
 pub fn sync_transforms(
     mut movers: Query<(&Pos, Option<&Grounded>, &mut Transform), Without<Bullet>>,
-    mut bullets: Query<(&Pos, &MuzzleLift, &mut Transform), With<Bullet>>,
+    mut bullets: Query<(&Bullet, &Pos, &MuzzleLift, &mut Streak, &mut Sprite, &mut Transform)>,
 ) {
     for (pos, grounded, mut transform) in &mut movers {
         let (x, y) = pos.to_f32();
@@ -709,10 +771,43 @@ pub fn sync_transforms(
         }
     }
     // Rounds fly at the weapon height they were fired from, not ankle height.
-    for (pos, lift, mut transform) in &mut bullets {
+    for (bullet, pos, lift, mut streak, mut sprite, mut transform) in &mut bullets {
         let (x, y) = pos.to_f32();
-        transform.translation.x = x;
-        transform.translation.y = y + lift.0;
+        let head = Vec2::new(x, y + lift.lift());
+        // The flight bearing comes off the VELOCITY rather than off the
+        // transform's own rotation, which `attach_sprites` set once at spawn:
+        // reading back the thing we are about to write is how a rounding error
+        // turns into a drift.
+        let dir = Vec2::new(bullet.vx as f32, bullet.vy as f32).normalize_or_zero();
+        // One tick's flight, which is what a round covers between two sim steps
+        // and therefore the natural unit of "how much travel is a frame worth".
+        let per_tick = (army_ghosts_sim::BULLET_SPEED / army_ghosts_sim::FP) as f32;
+        // A round's FIRST frame has no previous position to measure from, so it
+        // is credited one tick rather than nothing — otherwise every shot opened
+        // on a stub and jumped to full length a frame later.
+        let travelled = streak
+            .last
+            .map_or(per_tick, |last| (head - last).length())
+            .min(per_tick * STREAK_MAX_TICKS);
+        // **A trail cannot precede the shot.** At `STREAK_TRAVELS` frames long the
+        // streak is longer than the arena, so a round that has only just left
+        // the barrel would trail 1600 px of bolt back THROUGH its own shooter
+        // and out the far side — which reads, exactly and wrongly, as a man
+        // firing the other way. So the length is also capped at how far this
+        // round has actually flown, which the sim already tracks as its
+        // remaining `ttl`. The bolt therefore grows out of the muzzle and, since
+        // no round outlives the arena, in practice always reads as a line drawn
+        // from where the shot came from to where it has got to.
+        let flown = (army_ghosts_sim::BULLET_TTL - bullet.ttl) as f32 * per_tick;
+        if travelled > 0.5 || streak.len == 0.0 {
+            streak.len = (travelled * STREAK_TRAVELS).min(flown).max(BULLET_LEN_MIN);
+        }
+        let len = streak.len;
+        sprite.custom_size = Some(Vec2::new(len, BULLET_WIDTH));
+        let mid = head - dir * (len / 2.0);
+        transform.translation.x = mid.x;
+        transform.translation.y = mid.y;
+        streak.last = Some(head);
     }
 }
 

@@ -83,11 +83,31 @@ pub const BACKPEDAL_SPEED: i32 = FP * 9 / 16;
 /// Getting up is the slower half, as it is in life.
 pub const STANCE_DOWN_TICKS: u16 = 16;
 pub const STANCE_UP_TICKS: u16 = 26;
-/// Bullet speed, subunits per tick (16 px/tick = 960 px/s).
-pub const BULLET_SPEED: i32 = 16 * FP;
+/// Bullet speed, subunits per tick (80 px/tick = 4800 px/s — a round crosses
+/// the whole arena in about a fifth of a second).
+///
+/// Everything that cares about range reads this rather than counting ticks, so
+/// raising it does NOT quietly re-tune the damage model: `resolve_hits` works
+/// `travelled` out as `(BULLET_TTL - ttl) * BULLET_SPEED`, so `DAMAGE_NEAR` and
+/// `DAMAGE_FAR` stay the distances they say they are. `bot.rs`'s lead estimate
+/// divides by it too, so bots automatically lead a moving target LESS.
+///
+/// What it does change is the game. At this speed a round crosses `ENGAGE_RANGE`
+/// in about three ticks, so firefights are effectively hitscan: nobody dodges,
+/// and leading a target — the technique `LEAD_SKILL` gates and the harness
+/// measured `skill` on — is worth about a fifth of what it was. Re-run
+/// `tools/selfplay.sh` before trusting any dial figure in this file's notes.
+///
+/// `render::BULLET_LEN_MAX` is derived from this, and must stay derived: the
+/// tracer is stretched to a frame's travel, so a cap that failed to keep up
+/// would clamp the streak short of the ground the round covered and bring the
+/// dashed look straight back.
+pub const BULLET_SPEED: i32 = 80 * FP;
 /// Ticks between shots while holding fire (12 ticks = 5 shots/s).
 pub const FIRE_COOLDOWN: u16 = 12;
-/// Bullet lifetime in ticks.
+/// Bullet lifetime in ticks. Not the range limit it once was — at
+/// [`BULLET_SPEED`] a round leaves the arena in ten ticks and `move_bullets`
+/// despawns it at the wall, so this is only a backstop.
 pub const BULLET_TTL: u16 = 90;
 /// Collision radii, world units.
 pub const PLAYER_R: i32 = 12;
@@ -131,6 +151,27 @@ pub const STANCE_COUNT: usize = 3;
 /// buried in the grass" is one number both peers can agree on, the same way
 /// [`Bush`] is foliage the sim knows about but doesn't act on.
 pub const STANCE_HEIGHT: [i32; STANCE_COUNT] = [64, 52, 15];
+
+/// How high off the ground a pawn's RIFLE is, world units, per stance — the
+/// height grass has to stand taller than to hide a round in flight, and the
+/// companion to [`STANCE_HEIGHT`] in exactly the same units.
+///
+/// **It exists because the client had been using the wrong number.** The
+/// renderer's `STANCE_MUZZLE_LIFT` is how far up the SCREEN to draw a tracer so
+/// it does not leave the soldier's boots — a projected offset, foreshortened by
+/// `sin(tilt)` and scaled by the sprite, exactly the confusion [`STANCE_HEIGHT`]
+/// above warns about. Feeding it to the concealment model flew every round at
+/// a little over half its true height, so grass that a real rifle clears was
+/// burying rounds outright. Reported from the tracer range: standing above the
+/// bushes you could not see a standing shooter's rounds come through, and the
+/// grass there is 31 deep against a muzzle the model thought was at 26.
+///
+/// Recovered from the drawn lift rather than guessed, by undoing the projection
+/// (`lift = z * sin(40 deg) * SOLDIER_SIZE / frame + anchor`): 26.3 px drawn is
+/// 43.8 units physical, 19.9 is 27.9, 3.0 is 6.0. So a standing rifle rides at
+/// about seven tenths of eye height and a prone one all but scrapes the ground,
+/// which is what those postures do.
+pub const STANCE_MUZZLE_H: [i32; STANCE_COUNT] = [44, 28, 6];
 
 // ── How accurate the gun is ─────────────────────────────────────────────────
 //
@@ -1566,6 +1607,10 @@ pub enum Scenario {
     /// game; only who is standing where, and what the pawn nobody is driving
     /// does with its trigger, are different.
     Gunfire,
+    /// The tracer range: a firing line of three, one per stance, shooting north
+    /// across a ramp of known grass depths. See [`TRACER_LANE_GAP`] for what the
+    /// layout is doing and why it points away from you.
+    Tracers,
 }
 
 /// Half the width of the wall in [`Scenario::GrassStrip`], world units — one
@@ -1586,6 +1631,59 @@ pub const DEMO_STANDOFF: i32 = 300;
 /// differently, slow enough that they do not pile into one continuous glow.
 pub const DEMO_FIRE_TICKS: u32 = TICK_HZ as u32;
 
+/// The tracer range ([`Scenario::Tracers`]) — a firing line of three, one per
+/// stance, all pointing NORTH into ground that steps deeper the further it goes.
+///
+/// The layout is the experiment. Everything about a round's visibility that the
+/// renderer decides comes from two numbers — how high the shooter's rifle was
+/// (his stance) and how deep the grass is on the line between it and your eye —
+/// and this puts one on each axis. The three lanes differ ONLY in stance, since
+/// the depth is a function of `y` alone, so three tracers fired on the same tick
+/// die at three different distances and the distance is the whole readout.
+///
+/// **It fires north and you start south, and that is a safety rule rather than
+/// staging.** Nothing in the rig is friendly, the rounds do full damage, and
+/// there is no respawn in a scenario (`run_round` returns on anything but the
+/// arena), so walking up a lane ends the demo until you reload. The lanes are
+/// [`TRACER_LANE_GAP`] apart and each has a bush standing in it, which is what
+/// marks where they are from behind.
+pub const TRACER_LANE_GAP: i32 = 150;
+/// Where the firing line stands, world units.
+///
+/// **The arena is 600 tall and every part of this scene has to fit in it**, on
+/// BOTH sides of the line: the ramp runs north of it and you spawn
+/// [`TRACER_STANDOFF`] south of it. The first draft put the line at
+/// `-ARENA_HALF_H + 40` with 540 of ramp, which fit going north and spawned the
+/// player at y = -340 — outside the world. `the_tracer_range_ramps_from_bare_
+/// ground_to_the_deepest_grass_there_is` now checks both ends for that reason.
+///
+/// It then sat as far south as that check allows, which put the player ten units
+/// off the wall and opened the scene with half a screen of out-of-world black.
+/// The ramp fits either way; where the line sits inside the slack is a framing
+/// decision, and the framing is most of what a scene built to be looked at is.
+pub const TRACER_LINE_Y: i32 = -ARENA_HALF_H + 130;
+/// How far behind the line you spawn.
+pub const TRACER_STANDOFF: i32 = 60;
+/// The depth ramp: this many bands, each this tall, running north from the
+/// firing line. Band 0 is BARE on purpose — a round wants somewhere to be
+/// plainly visible before it starts losing itself, or there is nothing to
+/// compare the dying against.
+pub const TRACER_BAND_H: i32 = 90;
+pub const TRACER_BANDS: i32 = 5;
+/// How often the line fires. Faster than the gunfire demo's metronome because
+/// this is a scene you look AT rather than listen to: a round crosses the whole
+/// ramp in about 34 ticks, so this keeps one in the air nearly always. All three
+/// fire on the SAME tick, which is what makes the three lanes a comparison
+/// rather than three separate events.
+pub const TRACER_FIRE_TICKS: u32 = 40;
+/// A bush standing in each lane, and how far up the ramp. Deliberately in the
+/// second band rather than the first: a round should be seen entering it.
+pub const TRACER_BUSH_R: i32 = 30;
+pub const TRACER_BUSH_BAND: i32 = 2;
+/// The firing line, west to east. One of each, in the order the stances go, so
+/// the lanes read left to right the way the sheet does.
+pub const TRACER_LINE_STANCES: [u8; 3] = [STANCE_STAND, STANCE_CROUCH, STANCE_PRONE];
+
 impl Scenario {
     /// How deep the grass is at a point in this world, world units.
     pub fn depth(&self, x: i32, y: i32) -> i32 {
@@ -1598,7 +1696,23 @@ impl Scenario {
                     0
                 }
             }
+            // A ramp northward from the firing line, and BARE everywhere south
+            // of it — you and the shooters stand on bald ground, so nothing
+            // about where anybody is standing is part of what is being looked
+            // at. The last band is the deepest the field can hold, so the ramp
+            // spans the whole range a real match ever produces.
+            Scenario::Tracers => {
+                let band = ((y - TRACER_LINE_Y).max(0) / TRACER_BAND_H).min(TRACER_BANDS - 1);
+                band * GRASS_MAX_H / (TRACER_BANDS - 1)
+            }
         }
+    }
+
+    /// How deep band `k` of the tracer range is — the same arithmetic
+    /// [`Scenario::depth`] does, exposed so a caption or a test can name a band
+    /// rather than re-deriving it and drifting.
+    pub fn tracer_band_depth(band: i32) -> i32 {
+        band.clamp(0, TRACER_BANDS - 1) * GRASS_MAX_H / (TRACER_BANDS - 1)
     }
 
     /// [`grass_cover`] in this world: the fraction of a pawn in `stance` that
@@ -1614,17 +1728,31 @@ impl Scenario {
     pub fn rocks(&self) -> Vec<(i32, i32, Rock)> {
         match *self {
             Scenario::Arena | Scenario::Gunfire => rock_layout(),
-            Scenario::GrassStrip { .. } => Vec::new(),
+            // Neither rig gets boulders. On the tracer range that is not just
+            // tidiness: a rock DESPAWNS a round outright, which would read as
+            // the grass having hidden it and is the one confusion the scene
+            // exists to remove.
+            Scenario::GrassStrip { .. } | Scenario::Tracers => Vec::new(),
         }
     }
 
     /// The stance every handle *except* the first local one asks for each tick.
-    /// In the game that's just "stand"; in the rig it's how the target pawn is
-    /// posed, since nothing else can pose it.
-    pub fn idle_stance(&self) -> u8 {
+    /// In the game that's just "stand"; in a rig it's how the pawns nobody is
+    /// driving are posed, since nothing else can pose them.
+    ///
+    /// It takes the HANDLE because the tracer range needs a different answer per
+    /// seat — one shooter of each stance is the entire point of it, and a single
+    /// answer for every idle pawn cannot say that.
+    pub fn idle_stance(&self, handle: usize) -> u8 {
         match *self {
             Scenario::Arena | Scenario::Gunfire => STANCE_STAND,
             Scenario::GrassStrip { east_stance, .. } => east_stance.min(STANCE_PRONE),
+            // Handle 0 is you; the line is 1, 2, 3 — stand, crouch, prone, west
+            // to east, so the lanes read in the order the stances do.
+            Scenario::Tracers => TRACER_LINE_STANCES
+                .get(handle.wrapping_sub(1))
+                .copied()
+                .unwrap_or(STANCE_STAND),
         }
     }
 
@@ -1640,6 +1768,7 @@ impl Scenario {
     pub fn idle_fire(&self, frame: u32) -> bool {
         match *self {
             Scenario::Gunfire => frame.is_multiple_of(DEMO_FIRE_TICKS),
+            Scenario::Tracers => frame.is_multiple_of(TRACER_FIRE_TICKS),
             _ => false,
         }
     }
@@ -1817,11 +1946,38 @@ pub fn grass_block(
     target_h: i32,
     depth_at: impl Fn(i32, i32) -> i32,
 ) -> Block {
+    grass_block_span(eye, eye_h, target, 0, target_h, depth_at)
+}
+
+/// [`grass_block`] for something that occupies `lo..hi` off the ground rather
+/// than a body standing on it.
+///
+/// **A BULLET IS A POINT, NOT A COLUMN, and conflating the two was a bug.** The
+/// share a step contributes is *how much of the target that step's grass stands
+/// over*, which for a pawn means a body from its boots to `target_h`. Asked
+/// about a round at 44 units the same way, it answered "the bottom 31 of this
+/// 44-tall thing is behind grass — 70% covered", when what is actually at 44 is
+/// a single round in clear air above blades that stop at 31. Reported as
+/// *"I still can't see bullets that should be above the grass when my player's
+/// head is also above the grass unless I am right next to them"*, which is
+/// precisely what a phantom column standing under the round would do.
+///
+/// Passing `lo = 0` reproduces the body case exactly, so pawns, the fog tiles,
+/// `visible_fraction` and the strip table are untouched by this existing.
+pub fn grass_block_span(
+    eye: Pos,
+    eye_h: i32,
+    target: Pos,
+    lo: i32,
+    hi: i32,
+    depth_at: impl Fn(i32, i32) -> i32,
+) -> Block {
     let (dx, dy) = ((target.x - eye.x) as i64, (target.y - eye.y) as i64);
     let dist = isqrt(dx * dx + dy * dy);
-    if target_h <= 0 || dist < FP as i64 {
+    if hi <= 0 || hi <= lo || dist < FP as i64 {
         return Block::default();
     }
+    let span = (hi - lo) as i64;
     let fp = FP as i64;
     // One step's arc. Only `1 - t0` of the line is sampled.
     let step = dist * (T_DEN - T_BASE) / T_DEN / GRASS_SAMPLES;
@@ -1834,7 +1990,10 @@ pub fn grass_block(
         // Similar triangles, written over a common denominator so it stays one
         // exact division.
         let reaches = eye_h as i64 * t + (depth - eye_h as i64) * T_DEN;
-        let share = (reaches * fp / (t * target_h as i64)).clamp(0, fp);
+        // `reaches` is the hidden height times `t`. Measure it from the BOTTOM
+        // of the target's span rather than from the ground, so an object held
+        // clear of the grass is clear of it.
+        let share = ((reaches - lo as i64 * t) * fp / (t * span)).clamp(0, fp);
         block.covered = block.covered.max(share as i32);
         block.length += share * step / fp;
     }
@@ -2007,6 +2166,10 @@ pub fn spawn_world(commands: &mut Commands, num_players: usize, scenario: Scenar
     // (`save::restore`) does not call this and installs the round it was given,
     // which is the whole point of a resume.
     commands.insert_resource(Round::default());
+    if matches!(scenario, Scenario::Tracers) {
+        spawn_tracer_range(commands);
+        return;
+    }
     if matches!(scenario, Scenario::Gunfire) {
         spawn_gunfire_demo(commands);
     } else {
@@ -2068,6 +2231,53 @@ fn spawn_grass_strip(commands: &mut Commands, east_stance: u8) {
 /// The round clock does not run here (`run_round` returns on any scenario but
 /// the arena), which is what stops the pair being re-posted to the muster lines
 /// two minutes in.
+/// The tracer range ([`Scenario::Tracers`]): you, a firing line of three, and a
+/// bush standing in each lane. No boulders and no procedural bushes — see
+/// [`TRACER_LANE_GAP`] for what the scene is arranged to show.
+///
+/// Everything about it that is not obvious:
+///   * **The line is all on the OTHER side.** Handle 0 is you on side 0 and the
+///     three shooters are all forced onto side 1, rather than taking the sides
+///     [`default_side`] would have alternated them onto. A rig whose middle lane
+///     happened to be a teammate would draw that pawn at full opacity and put a
+///     nameplate over it while its neighbours faded — three lanes that differ in
+///     something other than the one variable they exist to isolate.
+///   * **They spawn already in their stance**, like the grass rig's east pawn,
+///     so there is no getting-down animation to sit through, and
+///     [`Scenario::idle_stance`] holds them there.
+///   * **The bushes are spawned here rather than by [`bush_layout`]**, which is
+///     seeded for the arena and would scatter them anywhere. One per lane, on
+///     the flight path, at a known band — because "my rounds are visible through
+///     bushes" is one of the two things this scene answers.
+fn spawn_tracer_range(commands: &mut Commands) {
+    // You start BETWEEN two lanes rather than behind one, so walking straight
+    // forward is neither blocked by a shooter's back nor a walk up a live lane.
+    let you = spawn_pawn(commands, 0, Team(0), 0);
+    commands.entity(you).insert((
+        Pos::from_units(-TRACER_LANE_GAP / 2, TRACER_LINE_Y - TRACER_STANDOFF),
+        Facing { x: 0, y: 127 },
+    ));
+    for (lane, level) in TRACER_LINE_STANCES.iter().enumerate() {
+        let handle = lane + 1;
+        let x = (lane as i32 - 1) * TRACER_LANE_GAP;
+        let pawn = spawn_pawn(commands, handle, Team(1), lane);
+        commands.entity(pawn).insert((
+            Pos::from_units(x, TRACER_LINE_Y),
+            Facing { x: 0, y: 127 },
+            Stance { level: *level, change: 0 },
+        ));
+        commands
+            .spawn((
+                Bush { r: TRACER_BUSH_R, seed: (lane as u32 + 1) * 7919 },
+                Pos::from_units(
+                    x,
+                    TRACER_LINE_Y + TRACER_BUSH_BAND * TRACER_BAND_H + TRACER_BAND_H / 2,
+                ),
+            ))
+            .add_rollback();
+    }
+}
+
 fn spawn_gunfire_demo(commands: &mut Commands) {
     for (handle, x, y, toward) in [
         (0, -DEMO_STANDOFF, 0, (127, 0)),
@@ -2945,6 +3155,91 @@ fn tick_health(mut players: Query<&mut Health>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tracer range has to be a range: bare where everyone is standing,
+    /// stepping up to the deepest grass the field can hold, and long enough for
+    /// each of the three stances to be buried somewhere along it.
+    ///
+    /// That last clause is the whole design and the easiest thing to break by
+    /// nudging a constant. If the ramp topped out under a standing pawn's height
+    /// the deep end would be indistinguishable from the shallow, and there would
+    /// be nothing to walk up.
+    #[test]
+    fn the_tracer_range_ramps_from_bare_ground_to_the_deepest_grass_there_is() {
+        let rig = Scenario::Tracers;
+        println!("  band depths, south to north:");
+        let mut last = -1;
+        for band in 0..TRACER_BANDS {
+            let y = TRACER_LINE_Y + band * TRACER_BAND_H + TRACER_BAND_H / 2;
+            let depth = rig.depth(0, y);
+            println!("    band {band} at y {y:>5}: depth {depth:>3}");
+            assert_eq!(depth, Scenario::tracer_band_depth(band), "band {band}");
+            assert!(depth > last, "the ramp must never step down: {depth} after {last}");
+            last = depth;
+        }
+
+        // You and the firing line stand on bald ground, so nothing about where
+        // anybody is standing is part of what is being looked at.
+        assert_eq!(rig.depth(0, TRACER_LINE_Y), 0, "the firing line stands on bare ground");
+        assert_eq!(
+            rig.depth(0, TRACER_LINE_Y - TRACER_STANDOFF),
+            0,
+            "and so do you, behind it"
+        );
+
+        // The ramp is the whole gamut and not a slice of it: bare at one end,
+        // the deepest the field can hold at the other. Anything the arena can do
+        // to a round is therefore somewhere on this range.
+        let deepest = Scenario::tracer_band_depth(TRACER_BANDS - 1);
+        assert_eq!(deepest, GRASS_MAX_H, "the deep end must be as deep as grass gets");
+
+        // It crosses the thresholds that mean something. NOT a standing pawn's,
+        // deliberately: `GRASS_MAX_H` is under `STANCE_HEIGHT[0]`, so there is
+        // nowhere in this game that buries a man on his feet, and a rig that
+        // managed it would be showing something the arena cannot.
+        assert!(
+            deepest > STANCE_HEIGHT[STANCE_CROUCH as usize],
+            "the deep end has to bury a crouching pawn, as the arena's own deep tiles do"
+        );
+        assert!(
+            deepest < STANCE_HEIGHT[STANCE_STAND as usize],
+            "and must not bury a standing one, because no ground in this game does"
+        );
+        assert!(
+            Scenario::tracer_band_depth(1) > STANCE_HEIGHT[STANCE_PRONE as usize] / 2,
+            "the shallow end still has to be grass a crawling pawn is in"
+        );
+
+        // The whole scene fits inside the arena, at BOTH ends. The south one is
+        // here because it was got wrong: the ramp fit going north and the
+        // player's own spawn, `TRACER_STANDOFF` behind the line, landed at
+        // y = -340 in a world that stops at -300.
+        let north = TRACER_LINE_Y + TRACER_BANDS * TRACER_BAND_H;
+        assert!(north <= ARENA_HALF_H, "the ramp runs off the north wall at {north}");
+        let south = TRACER_LINE_Y - TRACER_STANDOFF;
+        assert!(
+            south >= -ARENA_HALF_H,
+            "you spawn outside the world at {south}"
+        );
+        let bush_y = TRACER_LINE_Y + TRACER_BUSH_BAND * TRACER_BAND_H + TRACER_BAND_H / 2;
+        assert!(bush_y < north, "the lane bushes have to stand on the ramp");
+
+        // Lanes far enough apart that a round down one is nowhere near the
+        // shooter in the next: they all fire north, so the only thing keeping
+        // them separate is this gap. A `const` block rather than a runtime
+        // assert, the same way `RECOIL_DECAY` and `TUFT_SWAY_FRAC` guard theirs
+        // — closing the lanes up should fail the BUILD, not a test run.
+        const { assert!(TRACER_LANE_GAP > 4 * PLAYER_R) };
+
+        // Three seats, three different rifle heights — the one variable the
+        // three lanes exist to isolate.
+        let mut heights: Vec<u8> = (1..=TRACER_LINE_STANCES.len())
+            .map(|handle| rig.idle_stance(handle))
+            .collect();
+        heights.dedup();
+        assert_eq!(heights.len(), TRACER_LINE_STANCES.len(), "the lanes must differ in stance");
+        assert_eq!(rig.idle_stance(0), STANCE_STAND, "seat 0 is you, and you are not posed");
+    }
 
     /// The aggression dial spans the whole range, and its ends are the ends —
     /// the lowest position must be genuinely 0, not "nearly 0", or the menu

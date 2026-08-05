@@ -188,7 +188,6 @@ fn main() {
                 render::animate_players,
                 // Owns the pawns' rgb; `fade_hidden` below owns their alpha.
                 render::update_health_visuals,
-                render::bullet_trails,
                 // The sway rides on top of the position the sim just laid
                 // down, so it has to follow it — and being a fresh write every
                 // frame is what makes a lean that cannot accumulate. Nested
@@ -197,6 +196,7 @@ fn main() {
                 grass::update_grass_shade,
                 ads::update_aim_line,
                 vision::update_fog,
+                // Owns the alpha of every pawn AND every round in the air.
                 vision::fade_hidden,
                 // Gunfire you can hear but not see. After `fade_hidden` on
                 // purpose: they answer the same question from opposite ends —

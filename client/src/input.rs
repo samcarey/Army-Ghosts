@@ -145,7 +145,7 @@ pub fn read_local_inputs(
             // the sim stands them back up — the wire carries the level wanted,
             // not a change. Normally that's just "stand"; the grass rig uses it
             // to pose the pawn nobody is driving.
-            input.set_stance(scenario.idle_stance());
+            input.set_stance(scenario.idle_stance(*handle));
             // …and the gunfire demo uses the same seat to pull a trigger on a
             // metronome, which is the only way to look at a sound cue for long
             // enough to judge it.
